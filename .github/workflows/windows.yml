@@ -19,6 +19,9 @@ jobs:
       - run: npm run test:python
       - name: Build Windows installer
         shell: pwsh
+        timeout-minutes: 10
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         run: |
           npm run build:win 2>&1 | Tee-Object -FilePath build-win.log
           $buildExitCode = $LASTEXITCODE
