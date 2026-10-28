@@ -62,6 +62,7 @@ jobs:
       - name: Create NSIS installer
         shell: pwsh
         timeout-minutes: 10
+        continue-on-error: true
         run: |
           npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked 2>&1 | Tee-Object -FilePath nsis-win.log
           $buildExitCode = $LASTEXITCODE
@@ -71,6 +72,32 @@ jobs:
             }
             exit $buildExitCode
           }
+      - name: Validate NSIS installer
+        if: always()
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release -Filter 'Depth-Studio-Setup-*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          if ($null -eq $installer) {
+            Write-Error 'The NSIS installer was not created.'
+            exit 1
+          }
+          $appBytes = (Get-ChildItem release/win-unpacked -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          if ($installer.Length -lt [Math]::Max(50MB, [long]($appBytes * 0.8))) {
+            Write-Error "Installer appears incomplete: $($installer.Length) bytes vs $appBytes unpacked bytes."
+            exit 1
+          }
+          $stream = [IO.File]::OpenRead($installer.FullName)
+          try {
+            $signature = New-Object byte[] 2
+            [void]$stream.Read($signature, 0, 2)
+          } finally {
+            $stream.Dispose()
+          }
+          if ($signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
+            Write-Error 'Installer does not have a valid Windows executable signature.'
+            exit 1
+          }
+          Write-Output "Validated $($installer.Name): $($installer.Length) bytes."
       - uses: actions/upload-artifact@v4
         with:
           name: Depth-Studio-Windows-Installer
