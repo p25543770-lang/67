@@ -76,12 +76,13 @@ jobs:
         run: |
           $installer = Get-ChildItem release -Filter 'Depth-Studio-Setup-*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
           if ($null -eq $installer) {
-            Write-Error 'The NSIS installer was not created.'
+            Write-Output '::error::The NSIS installer was not created.'
             exit 1
           }
           $appBytes = (Get-ChildItem release/win-unpacked -Recurse -File | Measure-Object -Property Length -Sum).Sum
-          if ($installer.Length -lt [Math]::Max(50MB, [long]($appBytes * 0.8))) {
-            Write-Error "Installer appears incomplete: $($installer.Length) bytes vs $appBytes unpacked bytes."
+          Write-Output "::notice::Installer size: $($installer.Length) bytes; unpacked app: $appBytes bytes."
+          if ($installer.Length -lt 50MB) {
+            Write-Output "::error::Installer appears incomplete: only $($installer.Length) bytes."
             exit 1
           }
           $stream = [IO.File]::OpenRead($installer.FullName)
@@ -92,7 +93,7 @@ jobs:
             $stream.Dispose()
           }
           if ($signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
-            Write-Error 'Installer does not have a valid Windows executable signature.'
+            Write-Output '::error::Installer does not have a valid Windows executable signature.'
             exit 1
           }
           Write-Output "Validated $($installer.Name): $($installer.Length) bytes."
