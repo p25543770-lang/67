@@ -17,3 +17,12 @@ test("FPS displays measured capture and processing values, not the target", () =
   assert.equal(metrics.formatFps(null), "—");
   assert.equal(metrics.formatFps(Infinity), "—");
 });
+
+test("corroboration counters and configured OpenMP threads are honest and resettable", () => {
+  assert.equal(metrics.formatFrameChecks({ frameChecksPassed: 3, frameChecks: 5 }), "3 / 5");
+  assert.equal(metrics.formatFrameChecks({ frameChecksPassed: -1, frameChecks: Infinity }), "— / —");
+  assert.equal(metrics.formatFrameChecks(null), "— / —");
+  assert.equal(metrics.formatCpu({ logicalCpus: 16, openmpThreads: "4" }), "16 / 4");
+  assert.equal(metrics.formatCpu({ logicalCpus: 8, openmpThreads: "4,2" }), "8 / 4,2");
+  assert.equal(metrics.formatCpu(null), "— / —");
+});

@@ -10,3 +10,17 @@ export function formatFps(value) {
     ? value.toFixed(1)
     : "—";
 }
+
+export function formatFrameChecks(quality) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 ? String(value) : "—";
+  return `${count(quality?.frameChecksPassed)} / ${count(quality?.frameChecks)}`;
+}
+
+export function formatCpu(cpu) {
+  const logical = Number.isSafeInteger(cpu?.logicalCpus) && cpu.logicalCpus > 0 ? cpu.logicalCpus : "—";
+  // OpenMP supports a comma-separated list for nested levels; show the
+  // configured value rather than implying these are measured active threads.
+  const omp = typeof cpu?.openmpThreads === "string" && cpu.openmpThreads.trim()
+    ? cpu.openmpThreads.trim() : "—";
+  return `${logical} / ${omp}`;
+}

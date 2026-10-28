@@ -362,6 +362,19 @@ jobs:
             if (-not $json) { Write-Output '::error::Синтетический тест не вернул результат.'; exit 1 }
             Write-Output "::notice title=Windows synthetic OMP $($threads)::$json"
           }
+          foreach ($threads in @('2', '4')) {
+            $env:OMP_NUM_THREADS = $threads
+            $results = & $python $bench --frames 75 --profiles max_fps
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Синтетический поток OMP=$threads завершился ошибкой."; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Синтетический поток не вернул результат.'; exit 1 }
+            Write-Output "::notice title=Windows simulated realtime OMP $($threads)::$json"
+          }
+          try {
+            $ciCpu = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()
+            $ciRam = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+            Write-Output "::notice title=Windows CI host::$ciCpu; $ciRam GiB RAM (not the user's PC)."
+          } catch { Write-Output '::notice::Windows CI host details unavailable.' }
           $env:OMP_NUM_THREADS = '2'
           Write-Output '::notice::Установленный процесс Open3D, синтетическая скорость и .NET-буферы проверены без физического Kinect.'
 

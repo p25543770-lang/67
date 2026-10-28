@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from "./readiness.js";
 import { apiRequest } from "./api.js";
-import { formatFps, formatSpeed } from "./metrics.js";
+import { formatCpu, formatFps, formatFrameChecks, formatSpeed } from "./metrics.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import Box from "lucide/dist/esm/icons/box.js";
 import Radio from "lucide/dist/esm/icons/radio.js";
@@ -815,6 +815,8 @@ function setTracking(status, speed, warning, title = "", text = "") {
     $("activeProfileMetric").textContent = "—";
     $("trackedFpsMetric").textContent = "— / —";
     $("acceptedMetric").textContent = "—";
+    $("frameChecksMetric").textContent = formatFrameChecks(null);
+    $("cpuMetric").textContent = formatCpu(null);
   }
   $("warningBox").hidden = !warning;
   if (warning) $("warningText").textContent = warning;
@@ -1440,10 +1442,8 @@ async function refreshScan() {
     $("trackedFpsMetric").textContent = `${formatFps(performance?.trackingFps)} / ${formatFps(performance?.integrationFps)}`;
     $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
       ? `${Math.round(data.quality.acceptedRatio * 100)}%` : "—";
-    const checks = data.quality?.frameChecks, checksPassed = data.quality?.frameChecksPassed;
-    $("frameChecksMetric").textContent = `${Number.isFinite(checksPassed) ? checksPassed : "—"} / ${Number.isFinite(checks) ? checks : "—"}`;
-    const cpu = data.pipeline?.cpu;
-    $("cpuMetric").textContent = `${Number.isFinite(cpu?.logicalCpus) ? cpu.logicalCpus : "—"} / ${cpu?.openmpThreads || "—"}`;
+    $("frameChecksMetric").textContent = formatFrameChecks(data.quality);
+    $("cpuMetric").textContent = formatCpu(data.pipeline?.cpu);
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
     const tracking = data.tracking || (isScanning ? "tracking" : "stopped");
