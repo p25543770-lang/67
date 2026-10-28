@@ -25,6 +25,7 @@ Python and avoids leaking event handlers.
 from __future__ import annotations
 
 import array
+import ctypes
 import importlib
 import importlib.util
 import os
@@ -186,8 +187,9 @@ def depth_and_color_to_frame(
     color_height: int | None,
     *,
     captured_at: float | None = None,
+    include_points: bool = True,
 ) -> SensorFrame:
-    """Pure conversion step, kept separate so it can be tested without a sensor."""
+    """Convert SDK images; scan capture can omit the unused preview cloud."""
     import numpy as np
 
     if isinstance(depth_raw, (bytes, bytearray, memoryview)):
@@ -213,24 +215,26 @@ def depth_and_color_to_frame(
             # ColorImageFrame даёт BGRA; приложению нужен RGB.
             color_rgb = np.ascontiguousarray(bgra[:, :, 2::-1])
 
-    sampled_mm = depth_mm[::4, ::4]
-    sampled_z = sampled_mm.astype(np.float32) / 1000.0
-    v, u = np.indices(sampled_z.shape, dtype=np.float32)
-    u = u * 4
-    v = v * 4
-    fx = FX_640 * (width / float(DEFAULT_WIDTH))
-    fy = FY_640 * (height / float(DEFAULT_HEIGHT))
-    cx = (width - 1.0) / 2.0
-    cy = (height - 1.0) / 2.0
-    valid = (
-        (sampled_mm > 0)
-        & np.isfinite(sampled_z)
-        & (sampled_z >= MIN_DEPTH_M)
-        & (sampled_z <= MAX_DEPTH_M)
-    )
-    x = (u - cx) * sampled_z / fx
-    y = -(v - cy) * sampled_z / fy
-    points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
+    points = None
+    if include_points:
+        sampled_mm = depth_mm[::4, ::4]
+        sampled_z = sampled_mm.astype(np.float32) / 1000.0
+        v, u = np.indices(sampled_z.shape, dtype=np.float32)
+        u = u * 4
+        v = v * 4
+        fx = FX_640 * (width / float(DEFAULT_WIDTH))
+        fy = FY_640 * (height / float(DEFAULT_HEIGHT))
+        cx = (width - 1.0) / 2.0
+        cy = (height - 1.0) / 2.0
+        valid = (
+            (sampled_mm > 0)
+            & np.isfinite(sampled_z)
+            & (sampled_z >= MIN_DEPTH_M)
+            & (sampled_z <= MAX_DEPTH_M)
+        )
+        x = (u - cx) * sampled_z / fx
+        y = -(v - cy) * sampled_z / fy
+        points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
 
     return SensorFrame(
         color_rgb,
@@ -289,27 +293,40 @@ class _SdkSession:
     def _copy_pixels(frame: Any, item_size: int, expected_length: int) -> bytes:
         """Copy pixels before Dispose using the actual Kinect SDK 1.8 API.
 
-        DepthImageFrame accepts System.Int16[] (packed depth/player bits),
-        ColorImageFrame accepts System.Byte[] (BGRA). Neither frame exposes a
-        GetPixels() method in SDK 1.8. A managed array also disambiguates the
-        overload from the IntPtr overload when called through pythonnet.
+        SDK 1.8 offers a native-buffer overload as well as managed arrays.
+        Passing an IntPtr avoids iterating hundreds of thousands of CLR values
+        in Python. The length is *elements*, not bytes (including for Int16).
+        The ctypes buffer stays alive until after the SDK copy and bytes copy.
         """
         count = int(getattr(frame, "PixelDataLength", expected_length))
         if count != expected_length:
             raise RuntimeError(f"Некорректная длина кадра SDK: {count}, ожидалось {expected_length}.")
         system = importlib.import_module("System")
+        if count > 0 and hasattr(system, "IntPtr") and hasattr(system, "Int64"):
+            buffer = ctypes.create_string_buffer(count * item_size)
+            address = system.IntPtr(system.Int64(ctypes.addressof(buffer)))
+            try:
+                frame.CopyPixelDataTo(address, count)
+            except TypeError:
+                # Some test doubles/SDK variants only implement the managed
+                # overload. Real copy errors are not silently swallowed.
+                pass
+            else:
+                return bytes(buffer)
         element_type = system.Int16 if item_size == 2 else system.Byte
         pixels = system.Array.CreateInstance(element_type, count)
         frame.CopyPixelDataTo(pixels)
         return _pixels_to_bytes(pixels, item_size)
 
-    def grab_depth(self, timeout: float) -> tuple[int, int, bytes] | None:
+    def grab_depth(self, timeout: float) -> tuple[int, int, bytes, int | None] | None:
         frame = self._read_frame(self.sensor.DepthStream, timeout)
         if frame is None:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, self._copy_pixels(frame, 2, width * height)
+            number = getattr(frame, "FrameNumber", None)
+            number = int(number) if number is not None else None
+            return width, height, self._copy_pixels(frame, 2, width * height), number
         finally:
             _dispose(frame)
 
@@ -555,6 +572,11 @@ class KinectSdkV1Adapter(SensorAdapter):
             return self._session
 
     def _throttle(self) -> None:
+        # The 30-FPS SDK stream already blocks until a new depth frame exists.
+        # An extra 33-ms sleep at that cap can make a slightly late reader miss
+        # a frame. Preserve the software limiter for explicitly lower limits.
+        if self.max_fps >= DEFAULT_MAX_FPS:
+            return
         interval = 1.0 / self.max_fps
         if self._last_capture is None:
             self._last_capture = self._clock()
@@ -584,6 +606,15 @@ class KinectSdkV1Adapter(SensorAdapter):
             pass
 
     def capture(self) -> SensorFrame:
+        return self._capture(include_points=True)
+
+    def capture_for_scan(self) -> SensorFrame:
+        # ScanEngine builds its own point cloud from depth. Computing a second
+        # preview cloud for every captured frame wastes time, especially when a
+        # later frame replaces it in the mailbox.
+        return self._capture(include_points=False)
+
+    def _capture(self, *, include_points: bool) -> SensorFrame:
         try:
             session = self._session_for_capture()
             self._throttle()
@@ -594,7 +625,7 @@ class KinectSdkV1Adapter(SensorAdapter):
                     "Kinect не вернул кадр глубины за отведённое время.",
                     "Проверьте питание и USB, закройте другие Kinect-приложения и повторите.",
                 )
-            width, height, depth_bytes = depth
+            width, height, depth_bytes, frame_number = depth
             # Measure the depth instant, not the later RGB wait/conversion time.
             captured_at = self._clock()
             color = None
@@ -619,8 +650,10 @@ class KinectSdkV1Adapter(SensorAdapter):
                 color[0] if color else None,
                 color[1] if color else None,
                 captured_at=captured_at,
+                include_points=include_points,
             )
             frame.warning = color_warning
+            frame.sequence_number = frame_number
             return frame
         except KinectSdkUnavailable as exc:
             # Таймаут кадра не повод переоткрывать сенсор: следующая попытка может удаться.

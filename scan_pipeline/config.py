@@ -10,6 +10,9 @@ VERIFIED_ON_HARDWARE = False
 TARGET_FPS = 30.0
 FRAME_BUDGET_MS = 1000.0 / TARGET_FPS
 
+STANDARD_PROFILE = "standard"
+MAX_FPS_PROFILE = "max_fps"
+
 # Приближённые интринсики Kinect v1 при 640x480 (совпадают с адаптером SDK 1.8).
 KINECT_V1_FX = 594.2
 KINECT_V1_FY = 591.0
@@ -27,6 +30,7 @@ TRACKING_STATES = (
 class ScanSettings:
     """Параметры одного прохода. Значения по умолчанию соответствуют разделу README."""
 
+    profile: str = STANDARD_PROFILE  # saved passes without this field keep the previous dense profile
     voxel_mm: float = 8.0            # 5–8 мм по ТЗ; 8 мм — граница бюджета интеграции на 2-ядерной машине
     trunc_voxels: float = 3.0        # truncation ≈ 3 вокселя
     volume_budget_mb: float = 1024.0  # явный бюджет: оценка по числу поверхностных вокселей
@@ -49,6 +53,21 @@ class ScanSettings:
     model_refresh_every: int = 8         # дорогое извлечение TSDF-модели выполняется реже
     texture_max_keyframes: int = 60      # сколько кадров использовать для проекции цвета
 
+    @classmethod
+    def for_profile(cls, profile: str = MAX_FPS_PROFILE) -> "ScanSettings":
+        """Presets apply only to new passes; resuming keeps the saved settings.
+
+        Max-FPS still tracks every processed frame but integrates fewer nearby
+        poses into TSDF. This speeds up CPU scanning at the cost of denser
+        fusion, noise averaging and potentially tracking stability.
+        """
+        if profile == MAX_FPS_PROFILE:
+            return cls(profile=profile, keyframe_translation_m=0.075,
+                       keyframe_rotation_deg=5.0, model_refresh_every=4)
+        if profile == STANDARD_PROFILE:
+            return cls(profile=profile)
+        raise ValueError("Неизвестный профиль сканирования. Выберите «Максимум FPS» или «Стандарт».")
+
     @property
     def voxel_m(self) -> float:
         return self.voxel_mm / 1000.0
@@ -58,6 +77,8 @@ class ScanSettings:
         return self.voxel_m * self.trunc_voxels
 
     def validate(self) -> "ScanSettings":
+        if self.profile not in (STANDARD_PROFILE, MAX_FPS_PROFILE):
+            raise ValueError("Неизвестный профиль сканирования.")
         if not (4.0 <= self.voxel_mm <= 12.0):
             raise ValueError("Размер вокселя должен быть в пределах 4–12 мм (рекомендуется 5–8 мм).")
         if self.depth_stride not in (1, 2):

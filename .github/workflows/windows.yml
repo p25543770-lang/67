@@ -187,7 +187,10 @@ jobs:
             'resources\python-wheels',
             'resources\python-lock.json',
             'resources\requirements-scan.lock.txt',
-            'resources\server.py'
+            'resources\server.py',
+            'resources\scan_pipeline\process_engine.py',
+            'resources\scripts\benchmark-synthetic-fps.py',
+            'resources\tests\synthetic_room.py'
           )
           foreach ($relative in $required) {
             if (-not (Test-Path (Join-Path 'release/win-unpacked' $relative))) {
@@ -328,11 +331,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка установленного Open3D-конвейера на синтетическом кадре.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_process_replays_saved_keyframes -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка продолжения прохода в отдельном процессе Open3D.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_worker_crash -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка освобождения ресурсов после сбоя процесса Open3D.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка синтетических тестов скорости, пропусков или потери трекинга.'; exit 1 }
           & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
-          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами через pythonnet.'; exit 1 }
-          Write-Output '::notice::Установленный конвейер, синтетическая скорость и .NET-массивы проверены без физического Kinect.'
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами и IntPtr через pythonnet.'; exit 1 }
+          $bench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-synthetic-fps.py'
+          & $python $bench --frames 12 --profiles max_fps
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Не удалось запустить установленный синтетический FPS-тест.'; exit 1 }
+          Write-Output '::notice::Установленный процесс Open3D, синтетическая скорость и .NET-буферы проверены без физического Kinect.'
 
       - name: Second launch reuses the prepared environment
         shell: pwsh

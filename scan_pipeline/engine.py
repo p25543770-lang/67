@@ -69,6 +69,7 @@ class ScanEngine:
         self.last_quality = quality
         if not quality.usable:
             self.last_speed_mps = None
+            self.tracker.note_input_rejection()
             self.rejected[quality.state] = self.rejected.get(quality.state, 0) + 1
             self._set_state(quality.state, quality.state)
             return self._event(False, quality.state)
@@ -84,7 +85,8 @@ class ScanEngine:
             depth_m, color, self.intrinsics, stride=self.settings.tracking_stride)
 
         dt = self._dt(captured_at)
-        result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt)
+        result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt,
+                                    observation=(depth, color if color_rgb is not None else None))
         self.last_step = (result.step_m, result.step_deg)
         self.last_speed_mps = (result.step_m / dt if dt and result.state in ("ok", "too_fast")
                                and result.reason not in ("first_frame", "return_to_last_pose") else None)
@@ -264,6 +266,9 @@ class ScanEngine:
         return {
             "method": "KinectFusion: TSDF-объём + frame-to-model " +
                       ("цветной ICP" if self.settings.use_color_icp else "геометрический ICP"),
+            "profile": self.settings.profile,
+            "keyframeTranslationM": self.settings.keyframe_translation_m,
+            "keyframeRotationDeg": self.settings.keyframe_rotation_deg,
             "voxelMm": self.settings.voxel_mm,
             "truncMm": round(self.settings.sdf_trunc_m * 1000.0, 2),
             "resolution": [self.intrinsics.width, self.intrinsics.height],

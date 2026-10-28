@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -130,6 +131,8 @@ class ScanApiTests(unittest.TestCase):
         self.env_patch.start()
         self.engine_patch = mock.patch.object(runner_module, "ScanEngine", FakeEngine)
         self.engine_patch.start()
+        self.factory_patch = mock.patch.object(server, "_scan_engine_factory", return_value=None)
+        self.factory_patch.start()
         self.modules_patch = mock.patch.object(server, "_require_scan_modules")
         self.modules_patch.start()
         server.connected_source = None
@@ -154,6 +157,7 @@ class ScanApiTests(unittest.TestCase):
         server.scan_start_pending = None
         server.probe_results.clear()
         self.modules_patch.stop()
+        self.factory_patch.stop()
         self.engine_patch.stop()
         self.env_patch.stop()
         self.registry_patch.stop()
@@ -214,6 +218,37 @@ class ScanApiTests(unittest.TestCase):
         self.assertEqual(self.request("/api/frame?source=" + self.sensor.id)[0], 200)
         self.assertEqual(self.request("/api/devices/disconnect", {"source": self.sensor.id})[0], 200)
         self.assertEqual(self.request("/api/frame?source=" + self.sensor.id)[0], 503)
+
+    def test_profile_is_saved_and_resume_keeps_the_original_profile(self):
+        self.connect()
+        before = self.sensor.captures
+        status, response = self.request("/api/scan/start", {"source": self.sensor.id, "profile": "invalid"})
+        self.assertEqual(status, 400, response)
+        self.assertEqual(self.sensor.captures, before)  # rejected before touching the sensor
+        self.assertEqual(self.request("/api/scan/passes")[1]["passes"], [])
+
+        with mock.patch.object(self.sensor, "capture_for_scan", wraps=self.sensor.capture_for_scan) as scan_capture:
+            started = self.start(profile="standard")
+            self.wait_for(lambda data: data["keyframes"] >= 1)
+            self.assertGreater(scan_capture.call_count, 0)
+        manifest = server._runner().storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["settings"]["profile"], "standard")
+        self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+        self.wait_for(lambda data: data["phase"] == "ready")
+        self.connect()
+        self.start(resumePassId=started["passId"], profile="max_fps")
+        self.wait_for(lambda data: data["keyframes"] >= 1)
+        resumed = server._runner().storage.store(started["passId"]).manifest()
+        self.assertEqual(resumed["settings"]["profile"], "standard")
+        self.assertEqual(resumed["settings"]["keyframe_translation_m"], 0.015)
+
+    def test_new_pass_defaults_to_max_fps_profile(self):
+        self.connect()
+        started = self.start()
+        self.wait_for(lambda data: data["keyframes"] >= 1)
+        manifest = server._runner().storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["settings"]["profile"], "max_fps")
+        self.assertEqual(manifest["settings"]["keyframe_translation_m"], 0.075)
 
     def test_selected_alternative_is_connected_without_reprobing_sdk(self):
         alternative = FakeAlternative()
@@ -466,12 +501,15 @@ class ScanApiTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_OPEN3D, "нужен импортируемый Open3D")
     def test_http_path_integrates_actual_tsdf_and_exports_mesh(self):
-        # Only the sensor is fake; ScanRunner, ScanEngine and Open3D are real.
+        # Only the sensor is fake; the production process, ScanEngine and Open3D are real.
         self.engine_patch.stop()
+        self.factory_patch.stop()
         self.connect()
         started = self.start()
         live = self.wait_for(lambda s: s["keyframes"] >= 1, timeout=20)
         self.assertIn("TSDF", live["pipeline"]["method"])
+        self.assertEqual(live["pipeline"]["processingIsolation"], "process")
+        self.assertNotEqual(server.scan_runner.active["engine"]._process.pid, os.getpid())
         self.assertFalse(live["verifiedOnHardware"])
         self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
         final = self.wait_for(lambda s: s["phase"] in ("ready", "error"), timeout=30)
@@ -522,6 +560,54 @@ class ScanApiTests(unittest.TestCase):
         self.assertEqual(result[0][0], 200, result)
         self.assertIsNone(server.scan_start_pending)
         self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+
+    @unittest.skipUnless(HAS_OPEN3D, "нужен импортируемый Open3D")
+    def test_isolated_process_replays_saved_keyframes_on_resume(self):
+        self.engine_patch.stop()
+        self.factory_patch.stop()
+        self.connect()
+        started = self.start(profile="standard")
+        self.wait_for(lambda data: data["keyframes"] >= 1, timeout=25)
+        self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+        final = self.wait_for(lambda data: data["phase"] in ("ready", "error"), timeout=30)
+        self.assertEqual(final["phase"], "ready", final["error"])
+        self.assertGreaterEqual(final["resultMetrics"]["textureKeyframes"], 1)
+        self.connect()
+        resumed = self.start(resumePassId=started["passId"], profile="max_fps")
+        self.assertGreaterEqual(resumed["replayedKeyframes"], 1)
+        live = self.wait_for(lambda data: data["keyframes"] >= 1, timeout=25)
+        self.assertEqual(live["pipeline"]["profile"], "standard")
+        self.assertEqual(live["pipeline"]["processingIsolation"], "process")
+        status, result = self.request("/api/scan/cancel", {})
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["keptPass"])
+        manifest = server.scan_runner.storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["state"], "interrupted")
+        self.assertEqual(manifest["settings"]["profile"], "standard")
+
+    @unittest.skipUnless(HAS_OPEN3D, "нужен импортируемый Open3D")
+    def test_isolated_worker_crash_interrupts_pass_and_releases_sensor(self):
+        self.engine_patch.stop()
+        self.factory_patch.stop()
+        self.connect()
+        started = self.start()
+        self.wait_for(lambda data: data["keyframes"] >= 1, timeout=25)
+        worker = server.scan_runner.active["engine"]._process
+        worker.terminate()
+        worker.join(5)
+        deadline = time.monotonic() + 15
+        final = None
+        while time.monotonic() < deadline:
+            status, data = self.request("/api/scan")
+            if status == 200 and data["phase"] == "error" and not data["running"]:
+                final = data
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(final, "worker crash must not leave capture active")
+        self.assertIn("Open3D", final["error"])
+        self.assertGreaterEqual(self.sensor.closes, 1)
+        manifest = server.scan_runner.storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["state"], "interrupted")
 
     def test_slow_processing_drops_frames_reports_both_rates_and_warns(self):
         class SlowEngine(FakeEngine):

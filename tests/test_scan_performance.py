@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 from scan_pipeline.camera import Intrinsics, invert_pose, pose_error
-from scan_pipeline.config import ScanSettings, TARGET_FPS, VERIFIED_ON_HARDWARE
+from scan_pipeline.config import MAX_FPS_PROFILE, STANDARD_PROFILE, ScanSettings, TARGET_FPS, VERIFIED_ON_HARDWARE
 from scan_pipeline.performance import FrameMailbox
 from scan_pipeline.storage import AsyncPassStore, ScanStorage
 from sensor_drivers.kinect_sdk_v1 import DEFAULT_MAX_FPS, KinectSdkV1Adapter
@@ -34,6 +34,90 @@ class FrameRateTests(unittest.TestCase):
         self.assertAlmostEqual(settings.max_speed_mps * 3.6, 7.0)
         self.assertEqual(settings.depth_stride, 2)
         self.assertFalse(VERIFIED_ON_HARDWARE)
+
+    def test_profiles_track_every_processed_frame_but_fuse_at_different_spacing(self):
+        standard = ScanSettings.for_profile(STANDARD_PROFILE).validate()
+        fast = ScanSettings.for_profile().validate()
+        self.assertEqual(fast.profile, MAX_FPS_PROFILE)
+        self.assertEqual(standard.profile, STANDARD_PROFILE)
+        self.assertEqual(standard.tracking_stride, fast.tracking_stride)
+        self.assertGreater(fast.keyframe_translation_m, standard.keyframe_translation_m)
+        self.assertGreater(fast.keyframe_rotation_deg, standard.keyframe_rotation_deg)
+        self.assertLess(fast.model_refresh_every, standard.model_refresh_every)
+        self.assertEqual(fast.depth_stride, standard.depth_stride)
+        with self.assertRaises(ValueError):
+            ScanSettings.for_profile("unknown")
+
+    def test_recovery_view_requires_matching_depth_and_available_rgb(self):
+        from scan_pipeline.tracking import _recovery_view_matches, _view_signature
+
+        depth = np.full((240, 320), 1500, dtype=np.uint16)
+        color = np.full((240, 320, 3), 50, dtype=np.uint8)
+        reference = _view_signature(depth, color)
+        self.assertTrue(_recovery_view_matches(reference, _view_signature(depth + 5, color + 4)))
+        self.assertFalse(_recovery_view_matches(reference, _view_signature(depth + 500, color)))
+        self.assertFalse(_recovery_view_matches(reference, _view_signature(depth, color + 100)))
+        self.assertFalse(_recovery_view_matches(reference, None))
+        # Missing RGB is allowed, but the depth check still has to pass.
+        self.assertTrue(_recovery_view_matches(reference, _view_signature(depth, None)))
+        self.assertFalse(_recovery_view_matches(reference, _view_signature(depth + 500, None)))
+
+    def test_preview_preserves_coordinate_convention_rounding_and_empty_input(self):
+        from scan_pipeline.runner import _preview
+
+        points = np.array([[1.23456, -2.34567, 3.45678], [-0.123456, 0.333333, -0.666666]])
+        expected = [[round(float(p[0]), 4), round(-float(p[1]), 4), round(-float(p[2]), 4),
+                     round(float(np.linalg.norm(p)), 3)] for p in points]
+        self.assertEqual(_preview(points), expected)
+        self.assertEqual(_preview(np.empty((0, 3))), [])
+        self.assertEqual(_preview(None), [])
+
+    def test_sensor_sequence_gaps_are_separate_from_mailbox_drops(self):
+        from types import SimpleNamespace
+
+        mailbox = FrameMailbox(clock=lambda: 0.0)
+        stop = threading.Event()
+        for number in (100, 101, 104):
+            mailbox.put(SimpleNamespace(sequence_number=number))
+            mailbox.take(stop)
+        self.assertEqual(mailbox.snapshot()["sensorDroppedFrames"], 2)
+        self.assertEqual(mailbox.snapshot()["droppedFrames"], 0)
+        mailbox.put(SimpleNamespace(sequence_number=105))
+        mailbox.put(SimpleNamespace(sequence_number=106))
+        self.assertEqual(mailbox.snapshot()["sensorDroppedFrames"], 2)
+        self.assertEqual(mailbox.snapshot()["droppedFrames"], 1)
+        # Missing/reset sequence numbers mean the sensor gap total is unknown.
+        mailbox.put(SimpleNamespace(sequence_number=None))
+        self.assertIsNone(mailbox.snapshot()["sensorDroppedFrames"])
+
+        wrapped = FrameMailbox(clock=lambda: 0.0)
+        for number in (2147483647, -2147483648, -2147483646):
+            wrapped.put(SimpleNamespace(sequence_number=number))
+            wrapped.take(stop)
+        self.assertEqual(wrapped.snapshot()["sensorDroppedFrames"], 1)
+        wrapped.put(SimpleNamespace(sequence_number=42))  # discontinuity, not billions of missing frames
+        self.assertIsNone(wrapped.snapshot()["sensorDroppedFrames"])
+
+    def test_tracked_and_integrated_rates_do_not_count_rejected_frames(self):
+        clock = [0.0]
+        mailbox = FrameMailbox(clock=lambda: clock[0])
+        stop = threading.Event()
+        for timestamp, tracked, integrated in [(0.0, True, True), (0.1, False, False),
+                                               (0.2, True, False), (0.3, True, True)]:
+            clock[0] = timestamp
+            mailbox.put(timestamp)
+            _, received = mailbox.take(stop)
+            mailbox.processed(received, tracked=tracked, integrated=integrated)
+        data = mailbox.snapshot()
+        self.assertEqual(data["processedFrames"], 4)
+        self.assertEqual(data["trackedFrames"], 3)
+        self.assertEqual(data["integratedFrames"], 2)
+        self.assertEqual(data["processingFps"], 10.0)
+        self.assertEqual(data["trackingFps"], 6.7)
+        self.assertEqual(data["integrationFps"], 3.3)
+        clock[0] = 4.0
+        self.assertEqual(mailbox.snapshot()["trackingFps"], 0.0)
+        self.assertEqual(mailbox.snapshot()["integrationFps"], 0.0)
 
     def test_latest_frame_drops_old_frames_and_measures_real_rolling_rates(self):
         clock = [0.0]
@@ -247,6 +331,62 @@ class SyntheticFastMotionTests(unittest.TestCase):
         # This particular path becomes ambiguous as the camera leaves the
         # textured geometry: accepting everything would silently drift badly.
         self.assertIsNotNone(rejected)
+
+    def test_max_fps_profile_rejects_ambiguous_fast_motion_after_drops(self):
+        self.engine.release()
+        self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: 0.0)
+        lost = False
+        for index in (0, 2, 4, 6, 8, 10, 12, 14, 16):
+            timestamp = index / 30.0
+            pose, depth, color = self.frame_at((7 / 3.6) * timestamp, index)
+            before = self.engine.integrated
+            previous_pose = None if self.engine.last_pose is None else self.engine.last_pose.copy()
+            event = self.engine.process(depth, color, timestamp)
+            if event["state"] == "tracking":
+                self.assertFalse(lost, (index, "false re-lock after losing textured geometry"))
+                error_mm, _ = pose_error(self.engine.last_pose, invert_pose(self.pose0) @ pose)
+                self.assertLess(error_mm, 50.0, (index, error_mm))
+            else:
+                lost = True
+                self.assertIn(event["state"], ("lost", "too_fast"))
+                self.assertFalse(event["integrated"])
+                self.assertEqual(before, self.engine.integrated)
+                np.testing.assert_array_equal(previous_pose, self.engine.last_pose)
+        self.assertTrue(lost, "the trajectory becomes geometrically ambiguous")
+
+    def test_max_fps_profile_tracks_a_longer_synthetic_orbit(self):
+        self.engine.release()
+        self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: 0.0)
+        trajectory = sr.orbit(frames=330, look="inward")
+        count = 60
+        for index, pose in enumerate(trajectory.poses[:count]):
+            depth, color, _ = sr.render(pose, self.intr, noise=True, seed=index)
+            self.engine.process(depth, color, index / 15.0)
+        expected = invert_pose(trajectory.poses[0]) @ trajectory.poses[count - 1]
+        error_mm, _ = pose_error(self.engine.last_pose, expected)
+        self.assertGreaterEqual(self.engine.frames_tracked, count * 0.9)
+        self.assertLess(error_mm, 20.0)
+        self.assertLess(self.engine.integrated, self.engine.frames_tracked // 2)
+        self.assertFalse(self.engine.pipeline_info()["verifiedOnHardware"])
+
+    def test_repeated_bad_frames_require_a_return_to_the_trusted_view(self):
+        _, depth, color = self.frame_at(0.0, 0)
+        self.engine.process(depth, color, 0.0)
+        rng = np.random.default_rng(21)
+        for timestamp in (0.05, 0.1):
+            bad = rng.integers(500, 3900, size=(480, 640), dtype=np.uint16)
+            event = self.engine.process(bad, color, timestamp)
+            self.assertEqual(event["state"], "lost")
+        self.assertEqual(self.engine.tracker._recovery_state, "lost")
+        before = self.engine.integrated
+        _, far_depth, far_color = self.frame_at(0.6, 50)
+        event = self.engine.process(far_depth, far_color, 0.4)
+        self.assertNotEqual(event["state"], "tracking")
+        self.assertEqual(self.engine.integrated, before)
+        _, depth, color = self.frame_at(0.0, 111)
+        event = self.engine.process(depth, color, 0.5)
+        self.assertEqual(event["state"], "tracking", self.engine.tracker.last_result.reason)
+        self.assertIsNone(self.engine.tracker._recovery_state)
 
     def test_lost_frame_uses_time_since_last_accepted_pose(self):
         _, depth, color = self.frame_at(0.0, 0)

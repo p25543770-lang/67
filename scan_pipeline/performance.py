@@ -22,9 +22,16 @@ class FrameMailbox:
         self._closed = False
         self._capture_times = deque(maxlen=2048)
         self._processed_times = deque(maxlen=2048)
+        self._tracked_times = deque(maxlen=2048)
+        self._integrated_times = deque(maxlen=2048)
         self._started = clock()
         self._captured = 0
+        self._sensor_dropped = 0
+        self._sensor_gaps_available = True
+        self._last_sensor_sequence = None
         self._processed = 0
+        self._tracked = 0
+        self._integrated = 0
         self._first_taken = False
         self._dropped = 0
         self._last_latency_ms = None
@@ -36,6 +43,20 @@ class FrameMailbox:
                 return
             self._captured += 1
             self._capture_times.append(now)
+            sequence = getattr(frame, "sequence_number", None)
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                if self._last_sensor_sequence is not None:
+                    # SDK exposes a signed 32-bit frame number. Handle wrap,
+                    # but don't invent a huge drop count on device reset.
+                    delta = (sequence - self._last_sensor_sequence) & 0xFFFFFFFF
+                    if 0 < delta <= 1_000_000:
+                        self._sensor_dropped += delta - 1
+                    else:
+                        self._sensor_gaps_available = False
+                self._last_sensor_sequence = sequence
+            else:
+                self._sensor_gaps_available = False
+                self._last_sensor_sequence = None
             if self._latest is not None:
                 self._dropped += 1
             self._latest = (frame, now)
@@ -59,11 +80,17 @@ class FrameMailbox:
             while not self._first_taken and not self._closed and not stop.is_set():
                 self._condition.wait(timeout=0.1)
 
-    def processed(self, received_at):
+    def processed(self, received_at, *, tracked=False, integrated=False):
         now = self.clock()
         with self._condition:
             self._processed += 1
             self._processed_times.append(now)
+            if tracked:
+                self._tracked += 1
+                self._tracked_times.append(now)
+            if integrated:
+                self._integrated += 1
+                self._integrated_times.append(now)
             self._last_latency_ms = max(0.0, (now - received_at) * 1000.0)
 
     def close(self):
@@ -91,8 +118,15 @@ class FrameMailbox:
             return {
                 "captureFps": self._rate(self._capture_times, now),
                 "processingFps": self._rate(self._processed_times, now),
+                "trackingFps": self._rate(self._tracked_times, now),
+                "integrationFps": self._rate(self._integrated_times, now),
                 "capturedFrames": self._captured,
                 "processedFrames": self._processed,
+                "trackedFrames": self._tracked,
+                "integratedFrames": self._integrated,
+                # Only known when every captured frame had a reliable sequence.
+                "sensorDroppedFrames": (self._sensor_dropped if self._captured and
+                                        self._sensor_gaps_available else None),
                 "droppedFrames": self._dropped,
                 "latencyMs": None if self._last_latency_ms is None else round(self._last_latency_ms),
                 "elapsedSeconds": round(max(0.0, now - self._started), 1),

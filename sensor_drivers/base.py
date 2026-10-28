@@ -11,8 +11,11 @@ class SensorFrame:
 
     ``color_rgb`` is an optional HxWx3 uint8 array. ``depth_mm`` is an optional
     HxW uint16 depth image in millimetres. ``points`` is an Nx3 float array in
-    metres, with +Y up and the camera looking down -Z. ``warning`` describes
-    non-fatal issues such as a missing RGB frame, even when depth is usable.
+    metres, with +Y up and the camera looking down -Z. Scan-only captures may
+    omit ``points`` because the scanning engine builds its own cloud. ``warning``
+    describes non-fatal issues such as a missing RGB frame. ``sequence_number``
+    is optional: only drivers exposing a sensor frame number can report gaps
+    that occurred before Python received the frame.
     """
 
     color_rgb: Any
@@ -21,6 +24,7 @@ class SensorFrame:
     captured_at: float
     calibration: str = ""
     warning: str = ""
+    sequence_number: int | None = None
 
 
 REQUIREMENT_KINDS = ("driver", "python")
@@ -70,6 +74,10 @@ class SensorAdapter:
 
     def capture(self) -> SensorFrame:
         raise NotImplementedError
+
+    def capture_for_scan(self) -> SensorFrame:
+        """Capture for the engine; adapters may skip the unused preview cloud."""
+        return self.capture()
 
     def close(self) -> None:
         """Release the device. Adapters without a persistent handle do nothing."""

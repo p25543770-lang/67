@@ -80,6 +80,8 @@ test("деморежим остаётся доступным без Python и д
 test("конвейер попадает в состав Windows-сборки, без новых зависимостей", () => {
   const pkg = require("../../package.json");
   assert.ok(pkg.build.extraResources.some((entry) => entry.from === "scan_pipeline" && entry.to === "scan_pipeline"));
+  assert.ok(pkg.build.extraResources.some((entry) => entry.to === "scripts/benchmark-synthetic-fps.py"));
+  assert.ok(pkg.build.extraResources.some((entry) => entry.to === "tests/synthetic_room.py"));
   assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["lucide", "three"]);
 });
 

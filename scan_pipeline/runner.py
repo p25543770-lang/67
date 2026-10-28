@@ -32,10 +32,13 @@ PREVIEW_POINTS = 14000
 
 class ScanRunner:
     def __init__(self, storage: ScanStorage, capture_lock: threading.Lock | None = None,
-                 on_sensor_release=None):
+                 on_sensor_release=None, engine_factory=None):
         self.storage = storage
         self.capture_lock = capture_lock or threading.Lock()
         self.on_sensor_release = on_sensor_release
+        # The desktop bridge uses an isolated worker; tests and direct callers
+        # can still supply the deterministic in-process engine.
+        self.engine_factory = engine_factory
         self.lock = threading.RLock()
         self.active = None           # dict: pass_id, name, engine, store, adapter, thread, stop, source
         self.phase = "idle"          # idle | capturing | finalizing | merging | ready | error
@@ -83,9 +86,15 @@ class ScanRunner:
                         saved.depth_stride = settings.depth_stride
                         saved.tracking_stride = settings.tracking_stride
                         saved.max_speed_mps = settings.max_speed_mps
-                        saved.model_refresh_every = settings.model_refresh_every
-                    engine = ScanEngine(saved.validate(), saved_intrinsics, store=None, clock=time.monotonic)
-                    replayed = engine.resume_from(store.load_keyframes())
+                        # Legacy passes have the dense standard profile, even
+                        # when the selector currently points to max FPS.
+                        saved.model_refresh_every = ScanSettings().model_refresh_every
+                    engine = (self.engine_factory or ScanEngine)(saved.validate(), saved_intrinsics,
+                                                                  store=None, clock=time.monotonic)
+                    if hasattr(engine, "resume_from_path"):
+                        replayed = engine.resume_from_path(store.directory)
+                    else:
+                        replayed = engine.resume_from(store.load_keyframes())
                     pass_id = resume_pass_id
                     name = manifest.get("name", name)
                     store.update_manifest(state="running", error="", resumes=manifest.get("resumes", 0) + 1,
@@ -96,7 +105,7 @@ class ScanRunner:
                     if self.storage.free_mb() < 512:
                         raise RuntimeError("Мало места на диске для сохранения прохода (нужно не меньше 512 МБ).")
                     # Не оставлять пустой проход на диске, если Open3D не загрузился.
-                    engine = ScanEngine(settings, intrinsics, store=None, clock=time.monotonic)
+                    engine = (self.engine_factory or ScanEngine)(settings, intrinsics, store=None, clock=time.monotonic)
                     name = name or f"Проход {len(self.storage_list_ids()) + 1}"
                     store.create(pass_id, name, settings, intrinsics, source, up_world=up_world)
                     replayed = 0
@@ -168,12 +177,14 @@ class ScanRunner:
         consecutive = 0
         first = True
         try:
+            # Third-party adapters without the optional method retain the old path.
+            capture = getattr(adapter, "capture_for_scan", None) or adapter.capture
             while not stop.is_set():
                 try:
                     with self.capture_lock:
                         if stop.is_set():
                             break
-                        frame = adapter.capture()
+                        frame = capture()
                     if stop.is_set():
                         break
                     if consecutive:
@@ -215,7 +226,8 @@ class ScanRunner:
                     event = engine.process(frame.depth_mm, frame.color_rgb, frame.captured_at)
                     warning = engine.warning
                     frames_seen = engine.frames_seen
-                mailbox.processed(received_at)
+                mailbox.processed(received_at, tracked=event.get("state") in ("tracking", "memory_budget_reached"),
+                                  integrated=bool(event.get("integrated")))
                 with self.lock:
                     self.last_event = event
                     self.last_preview = {"color": frame.color_rgb, "depth": frame.depth_mm}
@@ -303,8 +315,12 @@ class ScanRunner:
 
     def _save_manifest_progress(self, engine, store):
         try:
-            store.update_manifest(frames=engine.frames_seen, keyframes=engine.integrated,
-                                  quality=engine.quality_summary())
+            quality = engine.quality_summary()
+        except Exception as exc:  # the isolated worker may have exited unexpectedly
+            quality = {"framesSeen": engine.frames_seen, "keyframesIntegrated": engine.integrated,
+                       "processingError": str(exc)}
+        try:
+            store.update_manifest(frames=engine.frames_seen, keyframes=engine.integrated, quality=quality)
         except OSError:
             pass
 
@@ -696,9 +712,11 @@ def _summary(metrics):
 def _preview(points_world):
     if points_world is None or len(points_world) == 0:
         return []
-    v, _ = mesh_io.to_export_frame(points_world, np.zeros_like(points_world))
-    return [[round(float(x), 4), round(float(y), 4), round(float(z), 4), round(float(np.linalg.norm(p)), 3)]
-            for p, (x, y, z) in zip(points_world, v)]
+    # snapshot() holds the engine lock here. Vectorize distance and rounding so
+    # UI polling doesn't stall capture/ICP for tens of milliseconds per poll.
+    points = np.asarray(points_world, dtype=np.float64)
+    vertices, _ = mesh_io.to_export_frame(points, np.zeros_like(points))
+    return np.column_stack((np.round(vertices, 4), np.round(np.linalg.norm(points, axis=1), 3))).tolist()
 
 
 def _preview_mesh(vertices, limit):

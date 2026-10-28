@@ -107,6 +107,12 @@ class KinectV1Adapter(SensorAdapter):
         return result
 
     def capture(self) -> SensorFrame:
+        return self._capture(include_points=True)
+
+    def capture_for_scan(self) -> SensorFrame:
+        return self._capture(include_points=False)
+
+    def _capture(self, *, include_points: bool) -> SensorFrame:
         try:
             import freenect
             import numpy as np
@@ -141,23 +147,25 @@ class KinectV1Adapter(SensorAdapter):
 
             depth_raw = raw_depth.astype(np.float32, copy=False)
             depth_m = 0.1236 * np.tan(depth_raw / 2842.5 + 1.1863)
-            height, width = depth_raw.shape
-            # Subsample before constructing the point cloud to keep preview and ICP bounded.
-            step = 4 if max(height, width) >= 480 else 2
-            sampled_raw = depth_raw[::step, ::step]
-            sampled_z = depth_m[::step, ::step]
-            v, u = np.indices(sampled_z.shape, dtype=np.float32)
-            u = u * step
-            v = v * step
-            fx = 594.2 * (width / 640.0)
-            fy = 591.0 * (height / 480.0)
-            cx = (width - 1.0) / 2.0
-            cy = (height - 1.0) / 2.0
-            valid = ((sampled_raw < 2047) & np.isfinite(sampled_z) &
-                     (sampled_z >= 0.45) & (sampled_z <= 4.0))
-            x = (u - cx) * sampled_z / fx
-            y = -(v - cy) * sampled_z / fy
-            points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
+            points = None
+            if include_points:
+                height, width = depth_raw.shape
+                # Subsample before constructing the independent preview cloud.
+                step = 4 if max(height, width) >= 480 else 2
+                sampled_raw = depth_raw[::step, ::step]
+                sampled_z = depth_m[::step, ::step]
+                v, u = np.indices(sampled_z.shape, dtype=np.float32)
+                u = u * step
+                v = v * step
+                fx = 594.2 * (width / 640.0)
+                fy = 591.0 * (height / 480.0)
+                cx = (width - 1.0) / 2.0
+                cy = (height - 1.0) / 2.0
+                valid = ((sampled_raw < 2047) & np.isfinite(sampled_z) &
+                         (sampled_z >= 0.45) & (sampled_z <= 4.0))
+                x = (u - cx) * sampled_z / fx
+                y = -(v - cy) * sampled_z / fy
+                points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
 
             # The stream image is downsampled in the HTTP layer. Keep the native
             # depth values in millimetres for a meaningful depth preview.

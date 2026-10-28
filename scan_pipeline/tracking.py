@@ -35,7 +35,10 @@ from .config import ScanSettings, TARGET_FPS
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
 MAX_TARGET_POINTS = 8000           # ограничение цели на масштаб: стоимость растёт с ней
 INLIER_DISTANCE_M = 0.012          # соответствия ближе 1.2 см — «внутренние» для RMS и гессиана
-DEGENERACY_RATIO = 1e-3            # λmin/λmax гессиана ниже — ICP скользит (вырождение)
+# Reject a little more aggressively near poorly constrained planes. The
+# faster profile keeps fewer keyframes, which can otherwise re-lock on a wall
+# with a deceptively good residual after tracking has already been lost.
+DEGENERACY_RATIO = 2e-3            # λmin/λmax гессиана ниже — ICP скользит (вырождение)
 MIN_MODEL_POINTS = 500
 MIN_SOURCE_POINTS = 400
 MAX_SOURCE_POINTS = 6000
@@ -48,6 +51,53 @@ RECOVERY_RADIUS_M = 0.05
 RECOVERY_ROTATION_DEG = 5.0
 PREDICTION_CORRECTION_MIN_M = 0.025
 PREDICTION_CORRECTION_RATIO = 0.35
+# Once tracking is repeatedly lost, automatic re-lock requires a similar view
+# near the last trusted pose. This cannot prove correctness on repeated walls.
+RECOVERY_SIGNATURE_HEIGHT = 30
+RECOVERY_SIGNATURE_WIDTH = 40
+RECOVERY_DEPTH_TOLERANCE_MM = 80
+RECOVERY_MIN_DEPTH_INLIERS = 0.70
+RECOVERY_MAX_COLOR_MEDIAN = 35.0
+RECOVERY_MIN_COLOR_INLIERS = 0.65
+
+
+def _view_signature(depth_mm, color_rgb=None):
+    if depth_mm is None:
+        return None
+    depth = np.asarray(depth_mm)
+    if depth.ndim != 2 or not depth.size:
+        return None
+    rows = np.linspace(0, depth.shape[0] - 1, min(RECOVERY_SIGNATURE_HEIGHT, depth.shape[0])).astype(int)
+    cols = np.linspace(0, depth.shape[1] - 1, min(RECOVERY_SIGNATURE_WIDTH, depth.shape[1])).astype(int)
+    sampled_depth = np.asarray(depth[np.ix_(rows, cols)], dtype=np.int32).copy()
+    sampled_color = None
+    if color_rgb is not None:
+        color = np.asarray(color_rgb)
+        if color.ndim == 3 and color.shape[:2] == depth.shape and color.shape[2] >= 3:
+            sampled_color = np.asarray(color[rows][:, cols, :3], dtype=np.int16).copy()
+    return sampled_depth, sampled_color
+
+
+def _recovery_view_matches(reference, current):
+    """Conservative image-space check in addition to ICP's last-pose radius."""
+    if reference is None or current is None:
+        return False
+    old_depth, old_color = reference
+    depth, color = current
+    if old_depth.shape != depth.shape:
+        return False
+    valid = (old_depth > 0) & (depth > 0)
+    if np.count_nonzero(valid) < max(12, int(old_depth.size * 0.2)):
+        return False
+    depth_delta = np.abs(old_depth[valid] - depth[valid])
+    if float(np.mean(depth_delta <= RECOVERY_DEPTH_TOLERANCE_MM)) < RECOVERY_MIN_DEPTH_INLIERS:
+        return False
+    if old_color is not None and color is not None:
+        color_delta = np.mean(np.abs(old_color[valid] - color[valid]), axis=1)
+        if (float(np.median(color_delta)) > RECOVERY_MAX_COLOR_MEDIAN or
+                float(np.mean(color_delta <= 60.0)) < RECOVERY_MIN_COLOR_INLIERS):
+            return False
+    return True
 
 
 @dataclass
@@ -138,6 +188,8 @@ class FrameToModelTracker:
         self._previous_pose: np.ndarray | None = None
         self._last_accepted_dt: float | None = None
         self._recovery_state: str | None = None
+        self._consecutive_rejections = 0
+        self._last_view = None
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
         self.last_result: TrackResult | None = None
@@ -147,6 +199,8 @@ class FrameToModelTracker:
         self._previous_pose = None
         self._last_accepted_dt = None
         self._recovery_state = None
+        self._consecutive_rejections = 0
+        self._last_view = None
         self._prepared = None
         self.last_result = None
 
@@ -161,7 +215,7 @@ class FrameToModelTracker:
 
     def _predict(self, dt: float) -> np.ndarray:
         predicted = np.eye(4) if self.pose is None else self.pose.copy()
-        if (self.pose is None or self._previous_pose is None or not self._last_accepted_dt or
+        if (self.pose is None or self._previous_pose is None or not self._last_accepted_dt or self._recovery_state or
                 (self.last_result is not None and self.last_result.state != "ok")):
             return predicted
         if dt > PREDICT_MAX_SECONDS:
@@ -176,7 +230,8 @@ class FrameToModelTracker:
         predicted[:3, 3] += direction * min(speed, self.settings.max_speed_mps) * horizon
         return predicted
 
-    def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None) -> TrackResult:
+    def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None,
+              observation=None) -> TrackResult:
         """Оценить позу кадра относительно подготовленной модели.
 
         Побочные эффекты только при принятии кадра: обновляются поза и скорость.
@@ -190,6 +245,8 @@ class FrameToModelTracker:
             # Первый кадр прохода: модели ещё нет, поза задаёт начало координат.
             base = self.pose if self.pose is not None else np.eye(4)
             self._accept(base)
+            self._last_view = _view_signature(*observation) if observation is not None else None
+            self._consecutive_rejections = 0
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
 
@@ -260,6 +317,11 @@ class FrameToModelTracker:
         if self._recovery_state and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
             return self._reject(self._recovery_state, predicted, "return_to_last_pose", fitness, rmse,
                                 step_m, step_deg, method=method)
+        if self._recovery_state and self._last_view is not None:
+            current_view = _view_signature(*observation) if observation is not None else None
+            if not _recovery_view_matches(self._last_view, current_view):
+                return self._reject(self._recovery_state, predicted, "return_to_last_view", fitness, rmse,
+                                    step_m, step_deg, method=method, extra={"eigenRatio": ratio})
         if step_m > self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M or angular > self.settings.max_angular_rps:
             self._recovery_state = "too_fast"
             return self._reject("too_fast", predicted, "speed_limit", fitness, rmse, step_m, step_deg,
@@ -276,14 +338,26 @@ class FrameToModelTracker:
                                 method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
 
         self._recovery_state = None
+        self._consecutive_rejections = 0
         self._accept(candidate)
+        self._last_view = _view_signature(*observation) if observation is not None else None
         self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
                                        method=method, extra={"viewPoints": view_size})
         return self.last_result
 
+    def note_input_rejection(self) -> None:
+        """After repeated bad frames, require a return to the last trusted view."""
+        if self.pose is None:
+            return
+        self._consecutive_rejections += 1
+        if self._consecutive_rejections >= 2 and self._recovery_state is None:
+            self._recovery_state = "lost"
+
     def _reject(self, state, predicted, reason, fitness=0.0, rmse=0.0, step_m=0.0, step_deg=0.0,
                 method="", extra=None) -> TrackResult:
+        if state in ("lost", "too_fast"):
+            self.note_input_rejection()
         result = TrackResult(state, self.pose, predicted, fitness, rmse, step_m, step_deg,
                              reason=reason, method=method, extra=extra or {})
         self.last_result = result

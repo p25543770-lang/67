@@ -157,9 +157,9 @@ def _frame_response(frame, source_id="kinect_v1"):
     if len(xyz) > MAX_PREVIEW_POINTS:
         stride = int(math.ceil(len(xyz) / MAX_PREVIEW_POINTS))
         xyz = xyz[::stride]
-    points = [[round(float(x), 4), round(float(y), 4), round(float(z), 4),
-               round(float(math.sqrt(x * x + y * y + z * z)), 3)]
-              for x, y, z in xyz]
+    # Use float64 for rounded JSON numbers, and avoid a Python loop per point.
+    xyz64 = xyz.astype(np.float64, copy=False)
+    points = np.column_stack((np.round(xyz64, 4), np.round(np.linalg.norm(xyz64, axis=1), 3))).tolist()
     return {
         "source": source_id,
         "capturedAt": frame.captured_at,
@@ -191,6 +191,13 @@ def _sensor_released(source_id, error):
         }
 
 
+def _scan_engine_factory():
+    # Open3D native calls can hold the GIL for hundreds of milliseconds; keep
+    # them in a process that cannot stall the Python SDK capture thread.
+    from scan_pipeline.process_engine import IsolatedScanEngine
+    return IsolatedScanEngine
+
+
 def _runner():
     global scan_runner
     with state_lock:
@@ -198,7 +205,8 @@ def _runner():
             # Imports are deliberately lazy: /api/health must not need NumPy/Open3D.
             from scan_pipeline.runner import ScanRunner
             from scan_pipeline.storage import ScanStorage
-            scan_runner = ScanRunner(ScanStorage(_scan_root()), capture_lock, _sensor_released)
+            scan_runner = ScanRunner(ScanStorage(_scan_root()), capture_lock, _sensor_released,
+                                     engine_factory=_scan_engine_factory())
         return scan_runner
 
 
@@ -435,8 +443,10 @@ def _start_scan(payload):
         raise RuntimeError("Источник не подключён. Сначала подключите выбранный датчик.")
     _require_scan_modules()
     from scan_pipeline.camera import Intrinsics
-    from scan_pipeline.config import ScanSettings
+    from scan_pipeline.config import MAX_FPS_PROFILE, ScanSettings
 
+    # Reject invalid profiles before grabbing a frame or creating a pass.
+    settings = ScanSettings.for_profile(payload.get("profile", MAX_FPS_PROFILE))
     runner = _runner()
     with runner.lock:
         if runner.active is not None or runner._working():
@@ -449,7 +459,7 @@ def _start_scan(payload):
             _record_sensor_error(source_id, "Запуск сканирования", exc)
             _close_adapter(adapter)
             raise
-    result = runner.start(adapter, source=source_id, settings=ScanSettings(),
+    result = runner.start(adapter, source=source_id, settings=settings,
                           intrinsics=Intrinsics.kinect_v1(width, height),
                           name=str(payload.get("name", ""))[:120],
                           resume_pass_id=payload.get("resumePassId") or None)

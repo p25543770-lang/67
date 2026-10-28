@@ -1,6 +1,6 @@
 {
   "name": "depth-studio",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "description": "Experimental depth-camera room scanning and point-cloud viewer.",
   "author": "Depth Studio contributors",
@@ -51,7 +51,19 @@
       {
         "from": "scan_pipeline",
         "to": "scan_pipeline",
-        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "scripts/benchmark-synthetic-fps.py",
+        "to": "scripts/benchmark-synthetic-fps.py"
+      },
+      {
+        "from": "tests/synthetic_room.py",
+        "to": "tests/synthetic_room.py"
       },
       {
         "from": "requirements-scan.txt",

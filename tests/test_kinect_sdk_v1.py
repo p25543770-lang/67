@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import ctypes
 import io
 import importlib.machinery
 import os
@@ -226,6 +227,26 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(all(value == 0 for value in sensor.DepthStream.timeouts))
         self.assertIn("Microsoft.Kinect", env.calls)
 
+    def test_sdk_frame_number_survives_dispose_for_sensor_gap_metrics(self):
+        depth = FakeFrame(depth_pixels(1200))
+        depth.FrameNumber = 12345
+        with AdapterEnvironment(depth_frames=[depth], color_frames=[FakeFrame(color_pixels())]) as env:
+            frame = env.adapter.capture_for_scan()
+        self.assertTrue(depth.disposed)
+        self.assertEqual(frame.sequence_number, 12345)
+
+    def test_scan_capture_skips_only_the_unused_preview_cloud(self):
+        with AdapterEnvironment(
+            depth_frames=[FakeFrame(depth_pixels(1200)), FakeFrame(depth_pixels(1200))],
+            color_frames=[FakeFrame(color_pixels()), FakeFrame(color_pixels())],
+        ) as env:
+            scan_frame = env.adapter.capture_for_scan()
+            preview_frame = env.adapter.capture()
+        self.assertIsNone(scan_frame.points)
+        self.assertGreater(len(preview_frame.points), 0)
+        np.testing.assert_array_equal(scan_frame.depth_mm, preview_frame.depth_mm)
+        np.testing.assert_array_equal(scan_frame.color_rgb, preview_frame.color_rgb)
+
     def test_packed_depth_is_exact_integer_millimetres(self):
         raw = np.array([999 << 3, (1001 << 3) | 3, 1501 << 3, 1999 << 3], dtype=np.uint16)
         frame = sdk.depth_and_color_to_frame(raw, 4, 1, None, None, None, captured_at=5.0)
@@ -328,6 +349,18 @@ class SensorLifecycleTests(unittest.TestCase):
             frame = env.adapter.capture()
             self.assertEqual(int(frame.depth_mm[0, 0]), 1500)
             self.assertEqual(sensor.DepthStream.timeouts.count(0) > 1, True)
+
+    def test_default_capture_does_not_add_a_33ms_sleep_at_hardware_cap(self):
+        slept = []
+        with AdapterEnvironment(
+            depth_frames=[FakeFrame(depth_pixels(1000)), FakeFrame(depth_pixels(1000))],
+            color_frames=[FakeFrame(color_pixels()), FakeFrame(color_pixels())],
+        ) as env:
+            env.adapter._clock = lambda: 0.0
+            env.adapter._sleep = slept.append
+            env.adapter.capture()
+            env.adapter.capture()
+        self.assertEqual(slept, [])  # the real SDK stream supplies its own 30-FPS cadence
 
     def test_frame_rate_is_limited(self):
         slept: list[float] = []
@@ -464,6 +497,47 @@ class ConversionTests(unittest.TestCase):
 
     def test_pixels_to_bytes_reads_color_as_single_bytes(self):
         self.assertEqual(sdk._pixels_to_bytes([0, 128, 255], 1), bytes([0, 128, 255]))
+
+    def test_native_copy_uses_element_count_and_keeps_exact_bytes(self):
+        system = make_module("System", IntPtr=int, Int64=int)
+
+        class PointerFrame:
+            def __init__(self, data, count):
+                self.data, self.PixelDataLength = data, count
+                self.calls = []
+
+            def CopyPixelDataTo(self, address, count):
+                self.calls.append(count)
+                ctypes.memmove(address, self.data, len(self.data))
+
+        with mock.patch.dict(sys.modules, {"System": system}):
+            depth = PointerFrame(b"\x20\x03\x00\xfa\x00\x00", 3)
+            self.assertEqual(sdk._SdkSession._copy_pixels(depth, 2, 3), depth.data)
+            self.assertEqual(depth.calls, [3])  # Int16 elements, not six bytes
+            color = PointerFrame(bytes([0, 128, 255, 42]), 4)
+            self.assertEqual(sdk._SdkSession._copy_pixels(color, 1, 4), color.data)
+            self.assertEqual(color.calls, [4])
+
+    def test_native_copy_falls_back_to_the_managed_overload_when_missing(self):
+        class FakeArray:
+            @staticmethod
+            def CreateInstance(element_type, count):
+                return array.array("h", [0]) * count
+
+        system = make_module("System", IntPtr=int, Int64=int, Array=FakeArray, Int16="Int16", Byte="Byte")
+        frame = FakeFrame([800, -1536, 0], width=3, height=1)
+        with mock.patch.dict(sys.modules, {"System": system}):
+            raw = sdk._SdkSession._copy_pixels(frame, 2, 3)
+        self.assertEqual(raw, b"\x20\x03\x00\xfa\x00\x00")
+        self.assertTrue(frame.copied)
+
+    def test_native_copy_does_not_mask_a_real_sdk_error(self):
+        system = make_module("System", IntPtr=int, Int64=int)
+        frame = types.SimpleNamespace(PixelDataLength=2, CopyPixelDataTo=mock.Mock(side_effect=RuntimeError("SDK copy failed")))
+        with mock.patch.dict(sys.modules, {"System": system}):
+            with self.assertRaisesRegex(RuntimeError, "SDK copy failed"):
+                sdk._SdkSession._copy_pixels(frame, 2, 2)
+        frame.CopyPixelDataTo.assert_called_once()
 
     def test_dispose_never_raises(self):
         class Broken:

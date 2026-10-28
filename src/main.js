@@ -176,11 +176,18 @@ document.querySelector("#app").innerHTML = `
           <div class="tracking-metrics">
             <div><span>СКОРОСТЬ · ОЦЕНКА</span><strong id="speedMetric">— км/ч</strong></div>
             <div><span>FPS · ЗАХВАТ / ОБРАБОТКА</span><strong id="fpsMetric">— / —</strong></div>
-            <div><span>ПРОПУЩЕНО КАДРОВ</span><strong id="droppedMetric">—</strong></div>
+            <div><span>ПРОПУСКИ · ОЧЕРЕДЬ</span><strong id="droppedMetric">—</strong></div>
+            <div><span>ПРОПУСКИ · ДО ЧТЕНИЯ SDK</span><strong id="sensorDroppedMetric">—</strong></div>
             <div><span>СОСТОЯНИЕ</span><strong id="stateMetric">Демо</strong></div>
+            <div><span>КЛЮЧЕВЫХ КАДРОВ · ВСЕГО</span><strong id="keyframesMetric">—</strong></div>
+            <div><span>ПРОФИЛЬ ПРОХОДА</span><strong id="activeProfileMetric">—</strong></div>
+            <div><span>FPS · ТРЕКИНГ / TSDF</span><strong id="trackedFpsMetric">— / —</strong></div>
+            <div><span>ПРИНЯТО ДЛЯ ТРЕКИНГА</span><strong id="acceptedMetric">—</strong></div>
           </div>
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
-          <p class="movement-hint">Цель — до <b>7 км/ч</b> при плавном движении и перекрытии кадров. Kinect v1 даёт до 30 FPS; обработка может быть медленнее. Новые проходы обрабатывают глубину 320×240 вместо 640×480. Скорость не гарантируется.</p>
+          <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
+          <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
+          <p class="movement-hint" id="scanProfileHint">«Максимум FPS» объединяет меньше ключевых кадров: может быть больше шума и хуже детали или трекинг. Продолжение сохраняет профиль исходного прохода. Оба режима: глубина 320×240; Kinect v1 — до 30 FPS, обработка может быть медленнее. Цель до 7 км/ч не гарантируется.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
@@ -801,6 +808,11 @@ function setTracking(status, speed, warning, title = "", text = "") {
   if (status === "demo") {
     $("fpsMetric").textContent = "— / —";
     $("droppedMetric").textContent = "—";
+    $("sensorDroppedMetric").textContent = "—";
+    $("keyframesMetric").textContent = "—";
+    $("activeProfileMetric").textContent = "—";
+    $("trackedFpsMetric").textContent = "— / —";
+    $("acceptedMetric").textContent = "—";
   }
   $("warningBox").hidden = !warning;
   if (warning) $("warningText").textContent = warning;
@@ -1187,6 +1199,7 @@ function updateExportButtons() {
   $("exportGlb").disabled = activeSource === "demo" || !actions.export;
   $("cancelScanButton").hidden = activeSource === "demo" || !isScanning;
   $("cancelScanButton").disabled = !actions.cancel;
+  $("scanProfile").disabled = isScanning || scanActionBusy || ["starting", "stopping", "finalizing", "merging"].includes(scanPhase);
   const reason = $("scanActionReason");
   reason.textContent = actions.reason;
   reason.hidden = !actions.reason;
@@ -1286,7 +1299,8 @@ async function startPhysicalScan(resumePassId = null) {
   updateExportButtons();
   try {
     await apiRequest("/api/scan/start", {
-      method: "POST", body: { source: activeSource, ...(resumePassId ? { resumePassId } : {}) },
+      method: "POST", body: { source: activeSource, profile: $("scanProfile").value,
+        ...(resumePassId ? { resumePassId } : {}) },
     });
     hasScan = false;
     isScanning = true;
@@ -1417,6 +1431,13 @@ async function refreshScan() {
     const performance = data.performance;
     $("fpsMetric").textContent = `${formatFps(performance?.captureFps)} / ${formatFps(performance?.processingFps)}`;
     $("droppedMetric").textContent = Number.isFinite(performance?.droppedFrames) ? String(performance.droppedFrames) : "—";
+    $("sensorDroppedMetric").textContent = Number.isFinite(performance?.sensorDroppedFrames) ? String(performance.sensorDroppedFrames) : "—";
+    $("keyframesMetric").textContent = Number.isFinite(data.keyframes) ? String(data.keyframes) : "—";
+    $("activeProfileMetric").textContent = data.pipeline?.profile === "max_fps" ? "Максимум FPS"
+      : data.pipeline?.profile === "standard" ? "Стандарт" : "—";
+    $("trackedFpsMetric").textContent = `${formatFps(performance?.trackingFps)} / ${formatFps(performance?.integrationFps)}`;
+    $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
+      ? `${Math.round(data.quality.acceptedRatio * 100)}%` : "—";
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
     const tracking = data.tracking || (isScanning ? "tracking" : "stopped");
