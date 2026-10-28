@@ -47,6 +47,23 @@ document.querySelector("#app").innerHTML = `
   </header>
 
   <main class="app-shell">
+    <section class="setup-banner" id="setupBanner" data-phase="idle" hidden>
+      <div class="setup-banner-main">
+        <span class="setup-banner-dot"></span>
+        <div class="setup-banner-copy">
+          <strong id="setupTitle">Среда Depth Studio не настроена</strong>
+          <p id="setupText"></p>
+          <div class="setup-banner-progress" id="setupProgressWrap" hidden>
+            <div class="setup-banner-fill" id="setupProgressFill"></div>
+          </div>
+        </div>
+      </div>
+      <div class="setup-banner-actions">
+        <button class="setup-action" id="setupRetryBtn">Повторить</button>
+        <button class="setup-action" id="setupRepairBtn">Восстановить среду</button>
+        <button class="setup-action ghost" id="setupLogBtn">Журнал установки</button>
+      </div>
+    </section>
     <div class="page-heading">
       <div>
         <div class="eyebrow"><span class="eyebrow-mark"></span> DEPTH STUDIO <span class="eyebrow-separator">/</span> ПРОСТРАНСТВО</div>
@@ -165,6 +182,12 @@ document.querySelector("#app").innerHTML = `
         <tr><td><strong>Intel RealSense</strong></td><td><span class="status-tag unavailable">Не реализован</span></td><td>Для будущей интеграции: Windows 10/11 x64, совместимая с моделью версия RealSense SDK 2.0 и USB 3.x.</td><td>Приложение не обнаруживает устройство. Дальность и точность зависят от модели, прошивки и условий сцены.</td></tr>
         <tr><td><strong>Другие датчики</strong></td><td><span class="status-tag unavailable">Только после проверки</span></td><td>Нужны совместимые драйверы/SDK и отдельный модуль для конкретного устройства.</td><td>Обычная RGB-веб-камера не является датчиком глубины и не определяется как совместимая.</td></tr>
       </tbody></table></div>
+      <div class="env-block" id="envBlock">
+        <h3>Среда Python</h3>
+        <p id="envSummary">Среда Depth Studio расположена в %LOCALAPPDATA%\DepthStudio. Пакеты не устанавливаются глобально.</p>
+        <p class="env-detail" id="envDetail"></p>
+        <div class="env-actions"><button class="setup-action" id="envRetryBtn">Проверить и повторить настройку</button><button class="setup-action ghost" id="envLogBtn">Журнал установки</button></div>
+      </div>
       <div class="modal-columns"><div><h3>Запуск демо</h3><p>Демо работает без датчика и Python-моста. Кнопки сканирования и экспорта в демо-режиме используют синтетическую комнату.</p></div><div><h3>Реальное устройство</h3><p>Для Kinect v1 установите Python, NumPy, Open3D, libfreenect и его Python-привязки. В Windows этот набор не проверен; инструкции и диагностика находятся в README.</p></div></div>
       <button class="button-primary modal-done" id="modalDone"><i data-lucide="check"></i> Понятно</button>
     </div>
@@ -391,7 +414,7 @@ async function apiRequest(path, options = {}) {
     });
   } catch (error) {
     throw new Error(
-      "Локальный мост датчика недоступен. Демо работает без него; для Kinect запустите server.py.",
+      "Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio.",
     );
   }
   let payload;
@@ -409,7 +432,7 @@ async function apiRequest(path, options = {}) {
     const message =
       payload.error ||
       (response.status >= 500
-        ? "Локальный мост датчика недоступен. Демо работает без него; для Kinect запустите server.py."
+        ? "Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio."
         : `Ошибка локального моста (${response.status}).`);
     throw new Error(message);
   }
@@ -426,7 +449,7 @@ function fallbackDevices() {
       dependenciesAvailable: false,
       state: "driver_missing",
       connected: null,
-      error: "Локальный мост не запущен или драйверы не установлены.",
+      error: "Python-мост не запущен: среда Depth Studio не готова или датчик не подключён.",
       windows: "Windows 10/11 x64 — не проверено.",
       driver: "libfreenect и Python-модуль freenect.",
       limitations: "Экспериментальный, не проверен на физическом устройстве.",
@@ -498,8 +521,12 @@ async function loadDevices() {
       apiRequest("/api/devices"),
     ]);
     devices = response.devices || fallbackDevices();
-    $("serverNote").innerHTML =
-      `<span class="server-note-dot online"></span><span>Локальный мост запущен · Python ${escapeHtml(health.python || "")}</span>`;
+    const env = health.environment || null;
+    const envText = env
+      ? `Python ${escapeHtml(env.version || health.python || "")} · ${env.isolated ? "среда Depth Studio" : "системный интерпретатор"}`
+      : `Python ${escapeHtml(health.python || "")}`;
+    $("serverNote").innerHTML = `<span class="server-note-dot online"></span><span>Локальный мост запущен · ${envText}</span>`;
+    renderEnvironmentSummary({ ...(setupState || {}), environment: env, bridge: { ready: true } });
   } catch {
     devices = fallbackDevices();
     $("serverNote").innerHTML =
@@ -1439,9 +1466,170 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeHelp();
 });
 
+/* --- Среда Depth Studio: экран настройки, прогресс и журнал --------------- */
+let setupState = null;
+let setupPollTimer = null;
+let setupPollAttempts = 0;
+
+async function fetchSetupState() {
+  try {
+    const response = await fetch("/app/setup", { cache: "no-store" });
+    const type = response.headers.get("content-type") || "";
+    if (!response.ok || !type.includes("application/json")) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function setupHeadline(state) {
+  if (state.phase === "ready") return "Среда Depth Studio готова";
+  if (state.phase === "failed") return "Настройка среды не завершена — доступен деморежим";
+  if (state.phase === "running") return "Настройка среды выполняется…";
+  return "Среда Depth Studio ещё не настроена";
+}
+
+function renderEnvironmentSummary(state) {
+  const summary = $("envSummary");
+  const detail = $("envDetail");
+  if (!summary || !detail) return;
+  const environment = state?.environment;
+  const python = state?.python;
+  const packages = state?.packages || {};
+  const numpyVersion = packages.numpy?.version || environment?.packages?.numpy || null;
+  const open3dVersion = packages.open3d?.version || environment?.packages?.open3d || null;
+  const envDir = state?.envDir || "%LOCALAPPDATA%\\DepthStudio";
+  if (!state || (!environment && state.phase === undefined)) {
+    summary.textContent =
+      "Среда Python настраивается установщиком Windows в %LOCALAPPDATA%\\DepthStudio. Веб-версия работает в деморежиме.";
+    detail.textContent = "";
+    return;
+  }
+  const isolated = environment?.isolated ?? Boolean(python?.executable);
+  const headline = state.phase ? setupHeadline(state) : "Python-мост Depth Studio запущен";
+  summary.textContent = `${state.phase === "ready" ? "Среда готова" : headline} · ${envDir}`;
+  const pieces = [
+    python?.version ? `Python ${python.version}` : null,
+    numpyVersion ? `NumPy ${numpyVersion}` : "NumPy не проверен",
+    open3dVersion ? `Open3D ${open3dVersion}` : "Open3D недоступен",
+    isolated ? "изолированная среда" : "интерпретатор не изолирован",
+  ].filter(Boolean);
+  detail.textContent = pieces.join(" · ");
+}
+
+function renderSetupBanner(state) {
+  const banner = $("setupBanner");
+  if (!banner) return;
+  if (!state) {
+    banner.hidden = true;
+    renderEnvironmentSummary(null);
+    return;
+  }
+  setupState = state;
+  const ready = state.phase === "ready";
+  const bridgeReady = Boolean(state.bridge?.ready);
+  const open3dMissing = state.packages?.open3d?.available === false;
+  renderEnvironmentSummary(state);
+  if (ready && bridgeReady && !open3dMissing) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  banner.dataset.phase = ready && !open3dMissing ? "bridge" : ready ? "warning" : state.phase || "idle";
+  $("setupTitle").textContent =
+    ready && open3dMissing ? "Open3D недоступен: сканирование с датчиком выключено" : setupHeadline(state);
+  const parts = [];
+  if (state.phase === "failed" && state.error?.message) parts.push(state.error.message);
+  if (state.phase === "failed" && state.error?.hint) parts.push(state.error.hint);
+  if (ready && !bridgeReady) {
+    parts.push(state.bridge?.error || "Python-мост запускается; деморежим уже доступен.");
+  }
+  if (ready && open3dMissing) {
+    parts.push(
+      "Совмещение кадров и сканирование с датчиком требуют Open3D. Обычно не хватает Microsoft Visual C++ 2015–2022 Redistributable (x64) — установите его вручную, затем нажмите «Повторить». Деморежим и экспорт работают.",
+    );
+  }
+  if (!ready) {
+    parts.push("Деморежим работает сразу: 3D-сцена, синтетический поток и экспорт PLY/OBJ доступны без датчика.");
+  }
+  $("setupText").textContent = parts.join(" ");
+  const running = state.phase === "running";
+  $("setupProgressWrap").hidden = !running;
+  $("setupProgressFill").style.width = `${Math.max(0, Math.min(100, state.progress || 0))}%`;
+  $("setupRetryBtn").hidden = ready;
+  $("setupRetryBtn").disabled = running;
+  $("setupRepairBtn").disabled = running;
+}
+
+function scheduleSetupPoll(delay = 1500) {
+  clearTimeout(setupPollTimer);
+  if (setupPollAttempts > 240) return;
+  setupPollTimer = setTimeout(async () => {
+    setupPollAttempts += 1;
+    const state = await fetchSetupState();
+    renderSetupBanner(state);
+    const settled = state && state.phase === "ready" && state.bridge?.ready;
+    if (!settled) {
+      scheduleSetupPoll(setupState?.phase === "running" ? 1200 : 3000);
+    } else {
+      loadDevices();
+    }
+  }, delay);
+}
+
+async function runSetupAction(mode) {
+  try {
+    const response = await fetch("/app/setup/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || "Не удалось запустить настройку среды.");
+    if (payload.started === false) {
+      showToast(payload.reason || "Настройка уже выполняется.", "info");
+    } else {
+      showToast(
+        mode === "repair"
+          ? "Восстановление среды запущено. Прогресс — в этом окне и в журнале установки."
+          : "Повторная настройка среды запущена.",
+        "success",
+      );
+    }
+    setupPollAttempts = 0;
+    renderSetupBanner(payload.state || setupState);
+    scheduleSetupPoll(700);
+  } catch (error) {
+    showToast(error.message, "warning");
+  }
+}
+
+async function revealSetupLog() {
+  try {
+    const response = await fetch("/app/setup/reveal", { method: "POST" });
+    if (!response.ok) throw new Error("Журнал доступен только в установленном приложении.");
+    showToast("Открываю папку журнала установки.", "info");
+  } catch (error) {
+    showToast(error.message, "warning");
+  }
+}
+
+$("setupRetryBtn").onclick = () => runSetupAction("retry");
+$("setupRepairBtn").onclick = () => runSetupAction("repair");
+$("setupLogBtn").onclick = revealSetupLog;
+$("envRetryBtn").onclick = () => runSetupAction("retry");
+$("envLogBtn").onclick = revealSetupLog;
+
+async function initEnvironmentUi() {
+  const state = await fetchSetupState();
+  renderSetupBanner(state);
+  if (state && !(state.phase === "ready" && state.bridge?.ready)) scheduleSetupPoll(1200);
+}
+
 // Demo is immediately usable without Python, a camera, or a depth sensor.
 originalPoints = demoPoints.slice();
 renderPoints();
 renderDemoFeeds();
 updateSourcePanel();
 loadDevices();
+initEnvironmentUi();

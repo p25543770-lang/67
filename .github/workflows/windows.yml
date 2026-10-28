@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, "arena/**"]
+
 jobs:
   renderer:
     runs-on: ubuntu-latest
@@ -21,8 +22,46 @@ jobs:
           path: dist/
           retention-days: 1
 
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - name: Install lock validator dependency
+        run: python -m pip install --quiet packaging
+      - name: Windows dependency lock is complete and installable
+        run: npm run check:python-lock
+      - name: Python bridge tests
+        run: npm run test:python
+      - name: First-run environment tests (repeat run, repair, failure)
+        run: npm run test:desktop
+      - name: Lock file matches declared requirements
+        run: |
+          node -e "
+          const lock = require('./python-lock.json');
+          const lines = require('node:fs').readFileSync('requirements-scan.txt', 'utf8')
+            .split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+          for (const line of lines) {
+            const [name, version] = line.split('==');
+            const entry = lock.packages.find((pkg) => pkg.name === name);
+            if (!entry) throw new Error('package ' + name + ' is not pinned in python-lock.json');
+            if (entry.version !== version) throw new Error(name + ': requirements-scan.txt pins ' + version + ' but python-lock.json pins ' + entry.version);
+          }
+          for (const pkg of lock.packages.filter((pkg) => pkg.direct)) {
+            if (!lines.includes(pkg.name + '==' + pkg.version)) throw new Error(pkg.name + ' is missing from requirements-scan.txt');
+          }
+          console.log('requirements-scan.txt and python-lock.json agree.');
+          "
+
   build:
-    needs: renderer
+    needs: [renderer, unit-tests]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,11 +73,38 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
+      - run: python -m pip install --quiet packaging
+      - run: npm run check:python-lock
       - run: npm run test:python
+      - run: npm run test:desktop
       - uses: actions/download-artifact@v4
         with:
           name: depth-studio-renderer
           path: dist/
+
+      - name: Cache bundled Python runtime and wheels
+        uses: actions/cache@v4
+        with:
+          path: |
+            python-bundle/cache
+            python-bundle/wheels
+          key: python-runtime-${{ hashFiles('python-lock.json') }}
+
+      - name: Bundle Python 3.11 and pinned wheels into the installer
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          npm run prepare:python
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Не удалось собрать встроенную среду Python.'; exit 1 }
+          $manifest = Get-Content python-bundle/manifest.json -Raw | ConvertFrom-Json
+          Write-Output "::notice::Bundled Python $($manifest.python.version); pinned SHA-256: $($manifest.python.pinned); wheels: $($manifest.wheels.count)"
+          Write-Output "::notice::python.org archive SHA-256: $($manifest.python.archiveSha256)"
+          $size = (Get-ChildItem python-bundle -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          Write-Output "::notice::Python bundle size: $([math]::Round($size / 1MB, 1)) MiB"
+          if (-not $manifest.python.pinned) {
+            Write-Output '::warning::SHA-256 архива python.org ещё не закреплён в python-lock.json — резервная загрузка Python отключена до закрепления.'
+          }
+
       - id: electron-cache
         uses: actions/cache/restore@v4
         with:
@@ -47,7 +113,7 @@ jobs:
           restore-keys: ${{ runner.os }}-electron-builder-
       - name: Package Windows application
         shell: pwsh
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
@@ -61,7 +127,7 @@ jobs:
           }
       - name: Create NSIS installer
         shell: pwsh
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked --publish never 2>&1 | Tee-Object -FilePath nsis-win.log
           $buildExitCode = $LASTEXITCODE
@@ -71,7 +137,7 @@ jobs:
             }
             exit $buildExitCode
           }
-      - name: Validate NSIS installer
+      - name: Validate NSIS installer and bundled runtime
         shell: pwsh
         run: |
           $installer = Get-ChildItem release -Filter 'Depth-Studio-Setup-*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
@@ -96,7 +162,33 @@ jobs:
             Write-Output '::error::Installer does not have a valid Windows executable signature.'
             exit 1
           }
+          $required = @(
+            'resources\python-runtime\python.exe',
+            'resources\python-runtime\python311._pth',
+            'resources\python-wheels',
+            'resources\python-lock.json',
+            'resources\requirements-scan.lock.txt',
+            'resources\server.py'
+          )
+          foreach ($relative in $required) {
+            if (-not (Test-Path (Join-Path 'release/win-unpacked' $relative))) {
+              Write-Output "::error::В установщике нет обязательного компонента: $relative"
+              exit 1
+            }
+          }
+          $pth = Get-Content 'release/win-unpacked/resources/python-runtime/python311._pth' -Raw
+          if ($pth -notmatch 'site-packages' -or $pth -notmatch 'import site') {
+            Write-Output '::error::python311._pth не подключает site-packages — встроенный Python не увидит пакеты.'
+            exit 1
+          }
+          $wheels = (Get-ChildItem 'release/win-unpacked/resources/python-wheels' -Filter '*.whl' -File).Count
+          Write-Output "::notice::Bundled wheels: $wheels"
+          if ($wheels -lt 10) {
+            Write-Output "::error::Слишком мало колёс в установщике: $wheels"
+            exit 1
+          }
           Write-Output "Validated $($installer.Name): $($installer.Length) bytes."
+
       - uses: actions/upload-artifact@v4
         with:
           name: Depth-Studio-Windows-Installer
@@ -110,3 +202,183 @@ jobs:
         with:
           path: ~\AppData\Local\electron-builder\Cache
           key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
+
+  verify-installer:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Depth-Studio-Windows-Installer
+          path: installer
+
+      - name: Install silently as the current user (no administrator rights)
+        id: install
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem installer -Filter 'Depth-Studio-Setup-*.exe' -File | Select-Object -First 1
+          if ($null -eq $installer) { Write-Output '::error::Установщик не найден.'; exit 1 }
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\DepthStudioCleanTest'
+          if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+          Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'DepthStudio') -ErrorAction SilentlyContinue
+          Start-Process -FilePath $installer.FullName -ArgumentList '/S', "/D=$installDir" -Wait
+          Start-Sleep -Seconds 5
+          $exe = Join-Path $installDir 'Depth Studio.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Output "::error::Установка не создала $exe"
+            exit 1
+          }
+          "installDir=$installDir" >> $env:GITHUB_OUTPUT
+          Write-Output "::notice::Installed to $installDir"
+
+      - name: Simulate a Windows installation without Python
+        shell: pwsh
+        run: |
+          $tripwire = Join-Path $env:RUNNER_TEMP 'path-tripwire'
+          New-Item -ItemType Directory -Force $tripwire | Out-Null
+          # Любой запуск python из PATH завершится явной ошибкой.
+          Set-Content -Path (Join-Path $tripwire 'python.bat') -Value '@echo off & echo PYTHON FROM PATH WAS USED 1>&2 & exit /b 42'
+          Copy-Item (Join-Path $tripwire 'python.bat') (Join-Path $tripwire 'py.bat')
+          Set-Content -Path (Join-Path $tripwire 'python3.bat') -Value '@echo off & echo PYTHON3 FROM PATH WAS USED 1>&2 & exit /b 42'
+          # GITHUB_ENV не заменяет PATH, поэтому сохраняем очищенное значение в файл
+          # и подставляем его в каждом шаге, который запускает приложение.
+          $clean = "$tripwire;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Value $clean -NoNewline
+          $tripwire | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = $clean
+          if ($env:PATH -match 'hostedtoolcache') {
+            Write-Output "::error::PATH не очищен от Python: $env:PATH"
+            exit 1
+          }
+          Write-Output "::notice::Sanitized PATH: $env:PATH"
+
+      - name: First launch on a machine without Python
+        shell: pwsh
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
+          $report = Join-Path $env:RUNNER_TEMP 'selftest-first.json'
+          $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
+          if (-not (Test-Path $report)) { Write-Output '::error::Самопроверка не создала отчёт.'; exit 1 }
+          Get-Content $report -Raw | Write-Output
+          $data = Get-Content $report -Raw | ConvertFrom-Json
+          $failures = @()
+          if ($process.ExitCode -ne 0) { $failures += "код выхода $($process.ExitCode)" }
+          if (-not $data.setup.ok) { $failures += "setup: $($data.setup.error.code) $($data.setup.error.message)" }
+          if (-not $data.bridge.ok) {
+            $failures += "bridge: $($data.bridge.error)"
+            if ($data.bridge.logTail) {
+              Write-Output "::error::bridge.log: $((($data.bridge.logTail) -join ' / ').Substring(0, [Math]::Min(1200, (($data.bridge.logTail) -join ' / ').Length)))"
+            }
+          }
+          $expectedEnv = Join-Path $env:LOCALAPPDATA 'DepthStudio'
+          if ($data.envDir -ne $expectedEnv) { $failures += "envDir=$($data.envDir), ожидался $expectedEnv" }
+          if (-not ("$($data.pythonExe)".StartsWith($expectedEnv))) { $failures += "python.exe вне среды: $($data.pythonExe)" }
+          if ($data.environment.python.version -ne '3.11.9') { $failures += "версия Python: $($data.environment.python.version)" }
+          if (-not $data.environment.packages.numpy.available) { $failures += 'NumPy недоступен' }
+          if (-not $data.environment.packages.open3d.available) { $failures += "Open3D недоступен: $($data.environment.packages.open3d.error)" }
+          if (-not $data.bridge.environment.isolated) { $failures += 'мост запущен не из среды Depth Studio' }
+          if ($data.setup.cached) { $failures += 'первый запуск не должен считаться кэшированным' }
+          if ($data.systemPathPython.Count -gt 0) { $failures += "в PATH приложения остались каталоги Python: $($data.systemPathPython -join ', ')" }
+          if ($failures.Count -gt 0) {
+            foreach ($failure in $failures) { Write-Output "::error::$failure" }
+            Write-Output "::error::$($data.setup.error.code): $($data.setup.error.message) | $((($data.setup.error.details) -replace '\r?\n', ' / ').Substring(0, [Math]::Min(900, ($data.setup.error.details).Length)))"
+            $logPath = Join-Path $env:LOCALAPPDATA 'DepthStudio\logs\setup.log'
+            if (Test-Path $logPath) {
+              Write-Output "::error::Журнал установки: $((Get-Content $logPath -Raw) -replace '\r?\n', ' | ')"
+            }
+            exit 1
+          }
+          $sizeMb = [math]::Round($data.environment.envSizeBytes / 1MB, 1)
+          Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version); среда занимает $sizeMb MiB"
+
+      - name: Second launch reuses the prepared environment
+        shell: pwsh
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
+          $report = Join-Path $env:RUNNER_TEMP 'selftest-second.json'
+          $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
+          $data = Get-Content $report -Raw | ConvertFrom-Json
+          if ($process.ExitCode -ne 0 -or -not $data.ok) { Write-Output "::error::Повторный запуск завершился ошибкой: $($process.ExitCode)"; Get-Content $report -Raw | Write-Output; exit 1 }
+          if (-not $data.setup.cached) { Write-Output '::error::Повторный запуск должен использовать готовую среду (cached=true).'; exit 1 }
+          Write-Output '::notice::Повторный запуск использовал готовую среду без переустановки.'
+
+      - name: Corrupted environment is repaired on the next launch
+        shell: pwsh
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
+          Remove-Item -Recurse -Force (Join-Path $envRoot 'runtime\python\Lib\site-packages\numpy')
+          $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
+          $report = Join-Path $env:RUNNER_TEMP 'selftest-repair.json'
+          $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
+          $data = Get-Content $report -Raw | ConvertFrom-Json
+          if ($process.ExitCode -ne 0 -or -not $data.setup.ok) {
+            Write-Output "::error::Повреждённая среда не была восстановлена: $((Get-Content $report -Raw) -replace '\r?\n', ' ')"
+            exit 1
+          }
+          if ($data.setup.cached) { Write-Output '::error::Повреждённая среда не должна считаться готовой.'; exit 1 }
+          Write-Output '::notice::Повреждённая среда восстановлена автоматически.'
+
+      - name: Failed setup still leaves demo mode available
+        shell: pwsh
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
+          $env:DEPTH_STUDIO_ALLOW_TEST_HOOKS = '1'
+          $env:DEPTH_STUDIO_TEST_FAIL_STEP = 'packages'
+          $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
+          $report = Join-Path $env:RUNNER_TEMP 'selftest-failure.json'
+          $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report, '--repair' -Wait -PassThru
+          $data = Get-Content $report -Raw | ConvertFrom-Json
+          if ($process.ExitCode -eq 0) { Write-Output '::error::Смоделированный сбой установки не отразился в коде выхода.'; exit 1 }
+          if ($data.setup.error.code -ne 'packages_failed') { Write-Output "::error::Ожидался код packages_failed, получено $($data.setup.error.code): $($data.setup.error.message)"; exit 1 }
+          if (-not $data.demoAvailable) { Write-Output '::error::При ошибке установки деморежим должен оставаться доступным.'; exit 1 }
+          $logPath = Join-Path $envRoot 'logs\setup.log'
+          if (-not (Test-Path $logPath)) { Write-Output '::error::Журнал установки не создан.'; exit 1 }
+          if (-not (Select-String -Path $logPath -Pattern 'ERROR' -Quiet)) { Write-Output '::error::В журнале установки нет записи об ошибке.'; exit 1 }
+          Write-Output '::notice::Сбой установки обработан: код packages_failed, журнал создан, деморежим доступен.'
+          Remove-Item Env:DEPTH_STUDIO_TEST_FAIL_STEP
+          Remove-Item Env:DEPTH_STUDIO_ALLOW_TEST_HOOKS
+
+      - name: Restore environment and uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
+          $installDir = '${{ steps.install.outputs.installDir }}'
+          $uninstaller = Join-Path $installDir 'Uninstall Depth Studio.exe'
+          if (Test-Path $uninstaller) {
+            Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait
+            # NSIS-деинсталлятор перезапускается из временного каталога, поэтому
+            # ждём фактического удаления, а не только завершения процесса.
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Test-Path $envRoot) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+            if (Test-Path $envRoot) {
+              Write-Output "::error::После удаления остался каталог среды: $envRoot"
+              exit 1
+            }
+            Write-Output '::notice::Удаление приложения очистило изолированную среду.'
+          }
+
+      - name: Collect diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'diagnostics'
+          New-Item -ItemType Directory -Force $diagnostics | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'selftest-*.json') $diagnostics -ErrorAction SilentlyContinue
+          $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
+          if (Test-Path (Join-Path $envRoot 'logs')) {
+            Copy-Item (Join-Path $envRoot 'logs\*.log') $diagnostics -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Depth-Studio-Clean-Install-Reports
+          path: ${{ runner.temp }}/diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

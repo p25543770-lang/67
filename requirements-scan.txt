@@ -1,4 +1,15 @@
-# Optional Python dependencies for point-cloud registration and export.
-# Install with the same Python interpreter that runs server.py.
-numpy>=1.24,<2.3
-open3d>=0.18,<0.20
+# Runtime dependencies of the Depth Studio Python bridge (Windows x64, CPython 3.11).
+#
+# The application installs these versions itself, into its own isolated
+# environment (%LOCALAPPDATA%\DepthStudio). Global installation is neither
+# required nor recommended.
+#
+# Exact versions are pinned here and additionally locked, with SHA-256 hashes for
+# every transitive package, in python-lock.json / requirements-scan.lock.txt:
+#   python -m pip install --only-binary=:all: --require-hashes -r requirements-scan.lock.txt
+numpy==1.26.4
+open3d==0.18.0
+
+# freenect (libfreenect Python binding) is intentionally NOT listed: it is a
+# native binding that needs a matching USB driver. Depth Studio never installs
+# USB drivers, SDKs or system sensor components without explicit consent.
