@@ -218,6 +218,10 @@ function createRunner(options = {}) {
       };
     }
     if (args[0] === "-m" && args[1] === "pip" && args.includes("install")) {
+      if (options.requireForceReinstall && !args.includes("--force-reinstall")) {
+        // Как настоящий pip: пакет «уже установлен», хотя файлов нет.
+        return { code: 0, stdout: "Requirement already satisfied: numpy==1.26.4\n", stderr: "" };
+      }
       if (options.failPip) {
         return {
           code: 1,
@@ -482,6 +486,17 @@ test("extractZip отвергает пути вне каталога назна�
     (error) => error.code === "unpack_failed",
   );
   assert.equal(fs.existsSync(path.join(root, "escape.txt")), false);
+});
+
+test("частично повреждённая среда лечится принудительной переустановкой", async () => {
+  const context = setupOptions({ runner: { requireForceReinstall: true } });
+  const result = await bootstrap.runSetup(context.options);
+
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+  assert.ok(result.warnings.some((warning) => warning.code === "packages_force_reinstalled"));
+  const reinstallCalls = context.calls.filter((call) => call.args.includes("--force-reinstall"));
+  assert.equal(reinstallCalls.length, 1);
+  assert.ok(fs.existsSync(path.join(context.envPaths.sitePackages, "numpy")));
 });
 
 test("без закреплённого SHA-256 архив Python не загружается", async () => {

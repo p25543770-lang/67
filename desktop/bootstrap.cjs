@@ -841,31 +841,9 @@ async function runSetup(rawOptions = {}) {
       if (pipLines.length > 4000) pipLines.shift();
       logger.line(`pip: ${line}`);
     };
-    currentStepFraction(0.15, "установка NumPy и Open3D");
-    const useBundle = lock.packages.every((pkg) => bundleWheels.has(pkg.filename));
-    let installResult;
-    if (useBundle) {
-      installResult = await opts.runCommand(
-        paths.pythonExe,
-        [
-          "-m",
-          "pip",
-          "install",
-          "--no-index",
-          "--find-links",
-          bundle.wheelsDir,
-          "--only-binary=:all:",
-          "--no-warn-script-location",
-          "--no-cache-dir",
-          "--disable-pip-version-check",
-          ...requiredPackages,
-        ],
-        {
-          env: childEnvironment(opts.env),
-          timeoutMs: 30 * 60 * 1000,
-          onLine: collectPipLine,
-        },
-      );
+    let remoteLockPath = null;
+    if (lock.packages.every((pkg) => bundleWheels.has(pkg.filename))) {
+      installSource = "bundled";
     } else {
       installSource = "download";
       if (!opts.allowNetwork) {
@@ -887,37 +865,67 @@ async function runSetup(rawOptions = {}) {
       const lockFile = await fsp
         .readFile(path.join(opts.resourcesRoot, "requirements-scan.lock.txt"), "utf8")
         .catch(async () => fsp.readFile(path.join(opts.resourcesRoot, "..", "requirements-scan.lock.txt"), "utf8"));
-      const lockPath = path.join(paths.downloadsDir, "requirements-scan.lock.txt");
-      await fsp.writeFile(lockPath, lockFile, "utf8");
-      installResult = await opts.runCommand(
-        paths.pythonExe,
-        [
-          "-m",
-          "pip",
-          "install",
-          "--only-binary=:all:",
-          "--require-hashes",
-          "--no-warn-script-location",
-          "--no-cache-dir",
-          "--disable-pip-version-check",
-          "-r",
-          lockPath,
-        ],
-        {
-          env: childEnvironment(opts.env),
-          timeoutMs: 60 * 60 * 1000,
-          onLine: (line) => {
-            collectPipLine(line);
-            if (/Collecting |Downloading |Installing collected/i.test(line)) {
-              currentStepFraction(0.3, line.slice(0, 120));
-            }
-          },
-        },
-      );
+      remoteLockPath = path.join(paths.downloadsDir, "requirements-scan.lock.txt");
+      await fsp.writeFile(remoteLockPath, lockFile, "utf8");
     }
 
-    if (opts.testHooks.failStep === "packages") {
-      installResult = { code: 1, stdout: "", stderr: "Смоделированный сбой установки пакетов." };
+    currentStepFraction(0.3, installSource === "bundled" ? "установка NumPy и Open3D" : "загрузка NumPy и Open3D с PyPI");
+    const runInstall = (extraArgs = []) => {
+      const args =
+        installSource === "bundled"
+          ? [
+              "-m",
+              "pip",
+              "install",
+              ...extraArgs,
+              "--no-index",
+              "--find-links",
+              bundle.wheelsDir,
+              "--only-binary=:all:",
+              "--no-warn-script-location",
+              "--no-cache-dir",
+              "--disable-pip-version-check",
+              ...requiredPackages,
+            ]
+          : [
+              "-m",
+              "pip",
+              "install",
+              ...extraArgs,
+              "--only-binary=:all:",
+              "--require-hashes",
+              "--no-warn-script-location",
+              "--no-cache-dir",
+              "--disable-pip-version-check",
+              "-r",
+              remoteLockPath,
+            ];
+      return opts.runCommand(paths.pythonExe, args, {
+        env: childEnvironment(opts.env),
+        timeoutMs: 60 * 60 * 1000,
+        onLine: (line) => {
+          collectPipLine(line);
+          if (/Collecting |Downloading |Installing collected/i.test(line)) {
+            currentStepFraction(0.3, line.slice(0, 120));
+          }
+        },
+      });
+    };
+
+    let installResult = opts.testHooks.failStep === "packages"
+      ? { code: 1, stdout: "", stderr: "Смоделированный сбой установки пакетов." }
+      : await runInstall();
+
+    if (installResult.code === 0 && !(await pathExists(path.join(paths.sitePackages, "numpy")))) {
+      // pip считает пакет установленным, если остался только dist-info, —
+      // при повреждённой среде помогае�� только принудительная переустановка.
+      logger.warn("NumPy отсутствует после установки: повтор с --force-reinstall.");
+      warnings.push({
+        code: "packages_force_reinstalled",
+        message: "Среда была повреждена: пакеты установлены заново с --force-reinstall.",
+        hint: "Это нормально после ручного удаления файлов среды или сбоя установки.",
+      });
+      installResult = await runInstall(["--force-reinstall"]);
     }
     if (installResult.code !== 0) {
       const pipLog = path.join(paths.logsDir, "pip-install.log");
@@ -936,6 +944,18 @@ async function runSetup(rawOptions = {}) {
         ),
       );
     }
+    if (!(await pathExists(path.join(paths.sitePackages, "numpy")))) {
+      return await fail(
+        "packages",
+        new SetupError(
+          "numpy_missing_after_install",
+          "NumPy не появился в среде после установки, хотя pip сообщил об успехе.",
+          "Нажмите «Восстановить среду». Если ошибка повторяется, проверьте антивирус: он может блокировать установку файлов .pyd.",
+          tailText(installResult),
+        ),
+      );
+    }
+
     logger.info(`Зависимости установлены (источник: ${installSource}).`);
     updateStep("packages", {
       status: "done",
