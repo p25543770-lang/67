@@ -17,7 +17,17 @@ jobs:
           python-version: "3.11"
       - run: npm ci
       - run: npm run test:python
-      - run: npm run build:win
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          npm run build:win 2>&1 | Tee-Object -FilePath build-win.log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            Get-Content build-win.log | Select-Object -Last 40 | ForEach-Object {
+              Write-Output "::error::$_"
+            }
+            exit $buildExitCode
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: Depth-Studio-Windows-Installer
