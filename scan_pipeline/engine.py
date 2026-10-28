@@ -17,7 +17,8 @@ from .camera import Intrinsics, depth_to_points_rgb, invert_pose
 from .config import FRAME_BUDGET_MS, TARGET_FPS, DegradationNote, ScanSettings
 from .fusion import TsdfFusion
 from .quality import HINTS, assess_frame
-from .tracking import FrameToModelTracker, KeyframePolicy
+from .runtime import thread_info
+from .tracking import MAX_SOURCE_POINTS, FrameToModelTracker, KeyframePolicy
 
 TIMING_WINDOW = 10
 
@@ -82,7 +83,7 @@ class ScanEngine:
             color = color[::stride, ::stride]
         depth_m = depth.astype(np.float32) / 1000.0
         cam_points, cam_colors = depth_to_points_rgb(
-            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride)
+            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS)
 
         dt = self._dt(captured_at)
         result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt,
@@ -253,6 +254,9 @@ class ScanEngine:
         return {
             "framesSeen": self.frames_seen,
             "framesTracked": self.frames_tracked,
+            "frameChecks": self.tracker.frame_checks,
+            "frameChecksPassed": self.tracker.frame_checks_passed,
+            "framesRescued": self.tracker.frames_rescued,
             "keyframesIntegrated": self.integrated,
             "skippedRedundant": self.policy.skipped_redundant,
             "rejected": dict(self.rejected),
@@ -280,6 +284,7 @@ class ScanEngine:
             "memoryEstimateMb": round(self.fusion.memory_estimate_mb(), 1),
             "memoryBudgetMb": self.settings.volume_budget_mb,
             "timings": self.fusion.timing_summary(),
+            "cpu": thread_info(),
             "verifiedOnHardware": False,
         }
 

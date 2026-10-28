@@ -134,6 +134,10 @@ class IsolatedScanEngine:
     """ScanEngine-compatible parent-side proxy with explicit worker cleanup."""
 
     def __init__(self, settings, intrinsics, store=None, clock=None):
+        # Ensure the spawned worker inherits thread settings even when the
+        # library is used without starting server.py first.
+        from .runtime import configure_threads
+        configure_threads()
         # The child uses monotonic time like the real runner. The unused clock
         # argument keeps the ScanEngine constructor contract for the runner.
         self.settings = settings

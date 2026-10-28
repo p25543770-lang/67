@@ -61,18 +61,26 @@ def depth_to_points(depth_m, intrinsics: Intrinsics, *, stride: int = 1, mask=No
     return np.column_stack((x, y, z))
 
 
-def depth_to_points_rgb(depth_m, color_rgb, intrinsics: Intrinsics, *, stride: int = 1):
-    """Точки камеры и их цвет в [0, 1] для валидных пикселей (цвет нужен цветному ICP)."""
+def depth_to_points_rgb(depth_m, color_rgb, intrinsics: Intrinsics, *, stride: int = 1,
+                        max_points: int | None = None):
+    """Project valid pixels; optional cap preserves the tracker's old sampling order.
+
+    Select indices before constructing XYZ/RGB arrays, avoiding allocation and
+    projection of tens of thousands of points that ICP would immediately drop.
+    """
     depth = np.asarray(depth_m, dtype=np.float64)[::stride, ::stride]
-    h, w = depth.shape
-    v, u = np.indices((h, w), dtype=np.float64)
-    u = u * stride
-    v = v * stride
-    valid = np.isfinite(depth) & (depth > 0)
-    z = depth[valid]
-    points = np.column_stack(((u[valid] - intrinsics.cx) * z / intrinsics.fx,
-                              (v[valid] - intrinsics.cy) * z / intrinsics.fy, z))
-    colors = np.asarray(color_rgb)[::stride, ::stride][valid].astype(np.float64) / 255.0
+    _, width = depth.shape
+    flat = depth.ravel()
+    indices = np.flatnonzero(np.isfinite(flat) & (flat > 0))
+    if max_points is not None and max_points > 0 and len(indices) > max_points:
+        every = int(np.ceil(len(indices) / max_points))
+        indices = indices[::every]
+    row, col = np.divmod(indices, width)
+    z = flat[indices]
+    points = np.column_stack((((col * stride) - intrinsics.cx) * z / intrinsics.fx,
+                              ((row * stride) - intrinsics.cy) * z / intrinsics.fy, z))
+    sampled_color = np.asarray(color_rgb)[::stride, ::stride]
+    colors = sampled_color.reshape(-1, sampled_color.shape[-1])[indices].astype(np.float64) / 255.0
     return points, colors
 
 

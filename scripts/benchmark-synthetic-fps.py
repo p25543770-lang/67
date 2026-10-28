@@ -23,9 +23,6 @@ import threading
 import time
 from pathlib import Path
 
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -44,6 +41,14 @@ def main() -> None:
     # against a previous checkout without changing its code.
     sys.path.insert(0, str(ROOT / "tests"))
     sys.path.insert(0, str(args.package_root.resolve()))
+    # Resolve the requested checkout before importing any of its modules.
+    try:
+        from scan_pipeline.runtime import configure_threads
+        configure_threads()
+    except ImportError:  # older checkouts used a fixed two-thread default
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
     import numpy as np
     import synthetic_room as room
     from scan_pipeline.camera import Intrinsics, invert_pose, pose_error
@@ -176,6 +181,8 @@ def main() -> None:
                 "integrationFpsRolling": performance.get("integrationFps"),
                 "elapsedSeconds": performance["elapsedSeconds"],
                 "framesTracked": quality["framesTracked"],
+                "frameChecks": quality.get("frameChecks"),
+                "framesRescued": quality.get("framesRescued"),
                 "keyframesIntegrated": quality["keyframesIntegrated"],
                 "rejected": quality["rejected"],
                 "lastAcceptedFrame": last_index,
@@ -183,6 +190,7 @@ def main() -> None:
                 "worstIntegratedPoseErrorMm": None if worst_error is None else round(worst_error, 2),
                 "worstIntegratedFrame": worst_index,
                 "uiPollMedianMs": round(statistics.median(poll_times), 2) if poll_times else None,
+                "openmpThreadsRequested": os.environ.get("OMP_NUM_THREADS"),
                 "hardwareVerified": False,
             }
             print(json.dumps(result, ensure_ascii=False), flush=True)

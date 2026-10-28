@@ -189,7 +189,10 @@ jobs:
             'resources\requirements-scan.lock.txt',
             'resources\server.py',
             'resources\scan_pipeline\process_engine.py',
+            'resources\scan_pipeline\frame_validation.py',
+            'resources\scan_pipeline\runtime.py',
             'resources\scripts\benchmark-synthetic-fps.py',
+            'resources\scripts\benchmark-tracking-stability.py',
             'resources\tests\synthetic_room.py'
           )
           foreach ($relative in $required) {
@@ -342,6 +345,17 @@ jobs:
           $bench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-synthetic-fps.py'
           & $python $bench --frames 12 --profiles max_fps
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Не удалось запустить установленный синтетический FPS-тест.'; exit 1 }
+          $trackingBench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-tracking-stability.py'
+          Write-Output "::notice::Windows CI logical processors: $([Environment]::ProcessorCount); synthetic results are not Kinect or i5-13400 measurements."
+          foreach ($threads in @('2', '4')) {
+            $env:OMP_NUM_THREADS = $threads
+            $results = & $python $trackingBench --frames 75 --steps 3
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Синтетический тест отслеживания OMP=$threads завершился ошибкой."; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Синтетический тест не вернул результат.'; exit 1 }
+            Write-Output "::notice title=Windows synthetic OMP $($threads)::$json"
+          }
+          $env:OMP_NUM_THREADS = '2'
           Write-Output '::notice::Установленный процесс Open3D, синтетическая скорость и .NET-буферы проверены без физического Kinect.'
 
       - name: Second launch reuses the prepared environment

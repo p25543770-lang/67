@@ -18,11 +18,11 @@ from importlib.util import find_spec
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-# Avoid oversubscribing small ICP/TSDF workloads and starving sensor capture.
-# Respect an explicit user setting; this runs before NumPy/Open3D are imported.
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Set the OpenMP/BLAS defaults before NumPy/Open3D are imported. An explicit
+# user setting is preserved; larger CPUs no longer inherit a fixed two-thread cap.
+from scan_pipeline.runtime import configure_threads
+
+configure_threads()
 
 from sensor_drivers.registry import ADAPTERS, catalog, device_family, get_adapter, preferred_source
 

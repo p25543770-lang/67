@@ -183,11 +183,13 @@ document.querySelector("#app").innerHTML = `
             <div><span>ПРОФИЛЬ ПРОХОДА</span><strong id="activeProfileMetric">—</strong></div>
             <div><span>FPS · ТРЕКИНГ / TSDF</span><strong id="trackedFpsMetric">— / —</strong></div>
             <div><span>ПРИНЯТО ДЛЯ ТРЕКИНГА</span><strong id="acceptedMetric">—</strong></div>
+            <div><span>СВЕРКА · ПРОШЛИ / ПРОВЕРОК</span><strong id="frameChecksMetric">— / —</strong></div>
+            <div title="Логические процессоры / запрошенное число потоков OpenMP"><span>CPU · ЛОГИЧ. / OMP</span><strong id="cpuMetric">— / —</strong></div>
           </div>
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
           <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
           <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
-          <p class="movement-hint" id="scanProfileHint">«Максимум FPS» объединяет меньше ключевых кадров: может быть больше шума и хуже детали или трекинг. Продолжение сохраняет профиль исходного прохода. Оба режима: глубина 320×240; Kinect v1 — до 30 FPS, обработка может быть медленнее. Цель до 7 км/ч не гарантируется.</p>
+          <p class="movement-hint" id="scanProfileHint">«Максимум FPS» объединяет меньше ключевых кадров: может быть больше шума и хуже детали или трекинг. Неоднозначные позы дополнительно сверяются с последним надёжным кадром, когда подходит RGB. На i5‑13400 автоматически запрашиваются до 4 потоков OpenMP; продолжение сохраняет профиль прохода. 320×240, Kinect v1 — до 30 FPS; обработка и цель 7 км/ч не гарантируются.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
@@ -1438,6 +1440,10 @@ async function refreshScan() {
     $("trackedFpsMetric").textContent = `${formatFps(performance?.trackingFps)} / ${formatFps(performance?.integrationFps)}`;
     $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
       ? `${Math.round(data.quality.acceptedRatio * 100)}%` : "—";
+    const checks = data.quality?.frameChecks, checksPassed = data.quality?.frameChecksPassed;
+    $("frameChecksMetric").textContent = `${Number.isFinite(checksPassed) ? checksPassed : "—"} / ${Number.isFinite(checks) ? checks : "—"}`;
+    const cpu = data.pipeline?.cpu;
+    $("cpuMetric").textContent = `${Number.isFinite(cpu?.logicalCpus) ? cpu.logicalCpus : "—"} / ${cpu?.openmpThreads || "—"}`;
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
     const tracking = data.tracking || (isScanning ? "tracking" : "stopped");

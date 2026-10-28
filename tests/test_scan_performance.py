@@ -79,6 +79,55 @@ class FrameRateTests(unittest.TestCase):
         fast[0, 3] = 0.05  # fast movement is handled by the existing prediction guard
         self.assertIsNone(_slow_motion_disagreement(previous, fast, implausible, 0.1, 1 / 30))
 
+    def test_cpu_policy_scales_for_i5_without_overriding_user_settings(self):
+        from scan_pipeline.runtime import configure_threads
+
+        expected = {1: "1", 2: "2", 8: "3", 16: "4", 64: "4"}
+        for logical, threads in expected.items():
+            env = {}
+            info = configure_threads(env, logical_cpus=logical)
+            self.assertEqual(env["OMP_NUM_THREADS"], threads)
+            self.assertEqual(env["OPENBLAS_NUM_THREADS"], "1")
+            self.assertEqual(info["logicalCpus"], logical)
+        env = {"OMP_NUM_THREADS": "6", "OPENBLAS_NUM_THREADS": "2"}
+        configure_threads(env, logical_cpus=16)
+        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertEqual(env["OPENBLAS_NUM_THREADS"], "2")
+
+    def test_point_cap_preserves_existing_icp_samples_with_invalid_depth(self):
+        from scan_pipeline.camera import depth_to_points_rgb
+
+        rng = np.random.default_rng(71)
+        depth = rng.uniform(0.4, 4.0, size=(240, 320)).astype(np.float32)
+        depth[::13] = 0
+        depth[5, 9] = np.nan
+        depth[10, 10] = np.inf
+        color = rng.integers(0, 256, size=(240, 320, 3), dtype=np.uint8)
+        intrinsics = Intrinsics.kinect_v1(320, 240)
+        for stride in (1, 2, 4):
+            points, rgb = depth_to_points_rgb(depth, color, intrinsics, stride=stride)
+            every = int(np.ceil(len(points) / 6000)) if len(points) > 6000 else 1
+            limited_points, limited_rgb = depth_to_points_rgb(depth, color, intrinsics, stride=stride, max_points=6000)
+            np.testing.assert_array_equal(limited_points, points[::every])
+            np.testing.assert_array_equal(limited_rgb, rgb[::every])
+
+    def test_reference_frame_owns_its_data_and_rejects_textureless_rgb(self):
+        from scan_pipeline.frame_validation import ReferenceFrame, has_usable_texture
+
+        depth = np.full((48, 64), 1800, dtype=np.uint16)
+        color = np.full((48, 64, 3), 127, dtype=np.uint8)
+        pose = np.eye(4)
+        reference = ReferenceFrame.capture((depth, color), pose)
+        depth[:] = 0
+        color[:] = 0
+        pose[0, 3] = 2
+        self.assertEqual(reference.depth[0, 0], 1800)
+        self.assertEqual(reference.color[0, 0, 0], 127)
+        self.assertEqual(reference.pose[0, 3], 0)
+        self.assertFalse(has_usable_texture(reference.color))
+        self.assertFalse(has_usable_texture(None))
+        self.assertFalse(has_usable_texture(np.ones((5, 5))))
+
     def test_preview_preserves_coordinate_convention_rounding_and_empty_input(self):
         from scan_pipeline.runner import _preview
 
@@ -386,6 +435,74 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertLess(self.engine.integrated, self.engine.frames_tracked // 2)
         self.assertFalse(self.engine.pipeline_info()["verifiedOnHardware"])
 
+    def test_raw_frame_confirmation_rejects_wrong_or_missing_views(self):
+        from scan_pipeline.frame_validation import ReferenceFrame, confirm_model_pose
+
+        trajectory = sr.orbit(frames=330, look="inward")
+        d0, c0, _ = sr.render(trajectory.poses[0], self.intr, noise=True, seed=0)
+        d3, c3, _ = sr.render(trajectory.poses[3], self.intr, noise=True, seed=3)
+        intr = self.intr.downscaled(2)
+        # A simple pixel offset exercises tolerance of imperfect color alignment;
+        # it is not a calibration or a test of Kinect's real RGB/depth mapping.
+        reference = ReferenceFrame.capture((d0[::2, ::2], np.roll(c0[::2, ::2], 4, axis=1)), np.eye(4))
+        depth, color = d3[::2, ::2], np.roll(c3[::2, ::2], 4, axis=1)
+        truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[3]
+        self.assertTrue(confirm_model_pose(depth, color, intr, truth, reference))
+        self.assertIsNotNone(reference._cloud)  # reused if the next frame also needs checking
+        wrong = truth.copy()
+        wrong[0, 3] += 0.25
+        self.assertFalse(confirm_model_pose(depth, color, intr, wrong, reference))
+        self.assertFalse(confirm_model_pose(depth, None, intr, truth, reference))
+        self.assertFalse(confirm_model_pose(depth, np.full_like(color, 100), intr, truth, reference))
+        self.assertFalse(confirm_model_pose(depth, color, intr, truth, None))
+        # Repetitive texture on a flat wall must not turn a geometrically
+        # unconstrained pose into a trusted one.
+        flat = np.full((intr.height, intr.width), 2000, dtype=np.uint16)
+        v, u = np.indices(flat.shape)
+        checker = ((((u // 16) + (v // 16)) % 2) * 180 + 30).astype(np.uint8)
+        checker = np.repeat(checker[:, :, None], 3, axis=2)
+        planar = ReferenceFrame.capture((flat, checker), np.eye(4))
+        self.assertFalse(confirm_model_pose(flat, checker, intr, np.eye(4), planar))
+
+    def test_skipped_frames_use_confirmation_without_fusing_large_errors(self):
+        self.engine.release()
+        trajectory = sr.orbit(frames=330, look="inward")
+        scenarios = (range(0, 120, 3), range(0, 95, 5))
+        needed = sorted(set(scenarios[0]) | set(scenarios[1]))
+        frames = {k: sr.render(trajectory.poses[k], self.intr, noise=True, seed=k)[:2] for k in needed}
+        for indices, minimum, last_min in ((scenarios[0], 38, 114), (scenarios[1], 14, 65)):
+            clock = [0.0]
+            self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: clock[0])
+            errors, accepted = [], []
+            for k in indices:
+                clock[0] = k / 30.0
+                depth, color = frames[k]
+                event = self.engine.process(depth, color, clock[0])
+                if event["state"] == "tracking":
+                    accepted.append(k)
+                    truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
+                    errors.append(pose_error(self.engine.last_pose, truth)[0])
+            self.assertGreaterEqual(len(accepted), minimum)
+            self.assertGreaterEqual(accepted[-1], last_min)
+            self.assertLess(max(errors), 50.0)
+            self.assertGreater(self.engine.tracker.frames_rescued, 0)
+            self.assertGreaterEqual(self.engine.tracker.frame_checks, self.engine.tracker.frames_rescued)
+            self.engine.release()
+        self.engine = ScanEngine(ScanSettings(), self.intr, clock=lambda: 0.0)
+
+    def test_nonfinite_registration_is_never_integrated(self):
+        _, depth, color = self.frame_at(0.0, 0)
+        self.engine.process(depth, color, 0.0)
+        previous_pose, before = self.engine.last_pose.copy(), self.engine.integrated
+        _, depth, color = self.frame_at(0.02, 1)
+        with mock.patch("scan_pipeline.tracking.registration_diagnostics", return_value=(float("nan"), 0.01)):
+            event = self.engine.process(depth, color, 1 / 30)
+        self.assertEqual(event["state"], "lost")
+        self.assertEqual(self.engine.tracker.last_result.reason, "invalid_registration")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        np.testing.assert_array_equal(self.engine.last_pose, previous_pose)
+
     def test_long_gap_does_not_silently_integrate_a_large_jump(self):
         _, depth, color = self.frame_at(0.0, 0)
         self.engine.process(depth, color, 0.0)
@@ -408,7 +525,8 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertEqual(self.engine.process(depth, color, 1 / 30)["state"], "tracking")
         previous_pose, before = self.engine.last_pose.copy(), self.engine.integrated
         _, depth, color = self.frame_at(0.16, 10)
-        with mock.patch("scan_pipeline.tracking._slow_motion_disagreement", return_value=(0.2, 0.05)):
+        with mock.patch("scan_pipeline.tracking._slow_motion_disagreement", return_value=(0.2, 0.05)), \
+                mock.patch("scan_pipeline.tracking.confirm_model_pose", return_value=False):
             event = self.engine.process(depth, color, 10 / 30)
         self.assertEqual(event["state"], "lost", self.engine.tracker.last_result.reason)
         self.assertEqual(self.engine.tracker.last_result.reason, "slow_motion_inconsistent")

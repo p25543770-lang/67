@@ -31,6 +31,7 @@ import numpy as np
 
 from .camera import Intrinsics, invert_pose, relative_motion
 from .config import ScanSettings, TARGET_FPS
+from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture
 
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
 MAX_TARGET_POINTS = 8000           # ограничение цели на масштаб: стоимость растёт с ней
@@ -39,6 +40,10 @@ INLIER_DISTANCE_M = 0.012          # соответствия ближе 1.2 с�
 # faster profile keeps fewer keyframes, which can otherwise re-lock on a wall
 # with a deceptively good residual after tracking has already been lost.
 DEGENERACY_RATIO = 2e-3            # λmin/λmax гессиана ниже — ICP скользит (вырождение)
+# Only a narrow borderline band can be rescued by the independent raw-frame
+# check. Near-degenerate frames above the cutoff are cross-checked as well.
+FRAME_RESCUE_MIN_RATIO = 1.5e-3
+FRAME_CROSSCHECK_RATIO = 3.5e-3
 MIN_MODEL_POINTS = 500
 MIN_SOURCE_POINTS = 400
 MAX_SOURCE_POINTS = 6000
@@ -175,8 +180,13 @@ def registration_diagnostics(source, target, transform, max_distance: float) -> 
         return rmse, 0.0
     points = np.asarray(src.points)[pairs[:, 0]]
     normals = np.asarray(target.normals)[pairs[:, 1]]
+    if not (np.isfinite(points).all() and np.isfinite(normals).all()):
+        return float("inf"), 0.0
     jac = np.hstack((np.cross(points, normals), normals))
-    eig = np.linalg.eigvalsh(jac.T @ jac)
+    try:
+        eig = np.linalg.eigvalsh(jac.T @ jac)
+    except np.linalg.LinAlgError:
+        return float("inf"), 0.0
     ratio = float(max(eig[0], 0.0) / eig[-1]) if eig[-1] > 0 else 0.0
     return rmse, ratio
 
@@ -216,6 +226,10 @@ class FrameToModelTracker:
         self._recovery_state: str | None = None
         self._consecutive_rejections = 0
         self._last_view = None
+        self._last_reference: ReferenceFrame | None = None
+        self.frame_checks = 0
+        self.frame_checks_passed = 0
+        self.frames_rescued = 0
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
         self.last_result: TrackResult | None = None
@@ -227,6 +241,8 @@ class FrameToModelTracker:
         self._recovery_state = None
         self._consecutive_rejections = 0
         self._last_view = None
+        self._last_reference = None
+        self.frame_checks = self.frame_checks_passed = self.frames_rescued = 0
         self._prepared = None
         self.last_result = None
 
@@ -272,6 +288,7 @@ class FrameToModelTracker:
             base = self.pose if self.pose is not None else np.eye(4)
             self._accept(base)
             self._last_view = _view_signature(*observation) if observation is not None else None
+            self._last_reference = ReferenceFrame.capture(observation, base)
             self._consecutive_rejections = 0
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
@@ -329,17 +346,48 @@ class FrameToModelTracker:
             fitness = float(icp.fitness)
             finest_source, finest_target = source, target
         # Одни и те же соответствия используются для RMS и проверки вырождения.
+        if not (np.isfinite(transform).all() and np.isfinite(fitness)):
+            return self._reject("lost", predicted, "invalid_registration", method=method)
         rmse, ratio = registration_diagnostics(finest_source, finest_target, transform, INLIER_DISTANCE_M)
         candidate = transform @ predicted
+        if not (np.isfinite(candidate).all() and np.isfinite(fitness) and np.isfinite(rmse) and np.isfinite(ratio)):
+            return self._reject("lost", predicted, "invalid_registration", method=method)
         if fitness < self.settings.icp_max_fitness_loss or rmse > self.settings.icp_max_rmse_m:
             return self._reject("lost", predicted, "icp_residual", fitness, rmse, method=method,
                                 extra={"eigenRatio": ratio})
-        if ratio < DEGENERACY_RATIO:
-            return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
-                                extra={"eigenRatio": ratio})
-
         step_m, step_deg = relative_motion(self.pose, candidate)
         angular = np.radians(step_deg) / dt
+        physically_plausible = (step_m <= self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M and
+                                angular <= self.settings.max_angular_rps and dt <= MAX_RELIABLE_FRAME_GAP_S)
+        checked = confirmed = rescued = False
+
+        def confirm_once():
+            nonlocal checked, confirmed
+            if not checked:
+                checked = True
+                self.frame_checks += 1
+                confirmed = bool(observation is not None and confirm_model_pose(
+                    observation[0], observation[1], intrinsics, candidate, self._last_reference))
+                if confirmed:
+                    self.frame_checks_passed += 1
+            return confirmed
+
+        if ratio < DEGENERACY_RATIO:
+            can_check = (ratio >= FRAME_RESCUE_MIN_RATIO and physically_plausible and not self._recovery_state)
+            if not can_check or not confirm_once():
+                return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
+                                    extra={"eigenRatio": ratio})
+            rescued = True
+        elif (ratio < FRAME_CROSSCHECK_RATIO and physically_plausible and not self._recovery_state and
+              observation is not None and self._last_reference is not None and
+              has_usable_texture(observation[1]) and has_usable_texture(self._last_reference.color)):
+            # A weakly constrained model estimate can have good ICP residuals
+            # while sliding along a wall. The extra raw-frame check also guards
+            # against accepting a false positive immediately after a rescue.
+            if not confirm_once():
+                return self._reject("lost", predicted, "frame_disagreement", fitness, rmse, step_m, step_deg,
+                                    method=method, extra={"eigenRatio": ratio})
+
         if self._recovery_state and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
             return self._reject(self._recovery_state, predicted, "return_to_last_pose", fitness, rmse,
                                 step_m, step_deg, method=method)
@@ -361,28 +409,36 @@ class FrameToModelTracker:
                 self.last_result is not None and self.last_result.state == "ok" and dt <= MAX_RELIABLE_FRAME_GAP_S):
             mismatch = _slow_motion_disagreement(self._previous_pose, self.pose, candidate, dt, self._last_accepted_dt)
             if mismatch is not None:
-                self._recovery_state = "lost"
-                return self._reject("lost", predicted, "slow_motion_inconsistent", fitness, rmse, step_m, step_deg,
-                                    method=method, extra={"motionDisagreementM": mismatch[0],
-                                                          "motionAllowedM": mismatch[1], "eigenRatio": ratio})
+                if not confirm_once():
+                    self._recovery_state = "lost"
+                    return self._reject("lost", predicted, "slow_motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                        method=method, extra={"motionDisagreementM": mismatch[0],
+                                                              "motionAllowedM": mismatch[1], "eigenRatio": ratio})
+                rescued = True
         predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
         correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
         if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
                                                       predicted_step * PREDICTION_CORRECTION_RATIO):
             # A sudden stop/turn or weak geometry can make ICP confidently slide
-            # along a wall. Refuse to fuse the ambiguous frame rather than turn a
-            # large prediction disagreement into a silently corrupted mesh.
-            self._recovery_state = "lost"
-            return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
-                                method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
+            # along a wall. Only keep the estimate if the independent raw frame
+            # and its RGB-D view corroborate it; the speed limit still applies.
+            if not confirm_once():
+                self._recovery_state = "lost"
+                return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                    method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
+            rescued = True
 
         self._recovery_state = None
         self._consecutive_rejections = 0
         self._accept(candidate)
         self._last_view = _view_signature(*observation) if observation is not None else None
+        self._last_reference = ReferenceFrame.capture(observation, candidate)
+        if rescued:
+            self.frames_rescued += 1
         self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
-                                       method=method, extra={"viewPoints": view_size})
+                                       method=method, extra={"viewPoints": view_size,
+                                                             "frameConfirmed": confirmed, "rescued": rescued})
         return self.last_result
 
     def note_input_rejection(self) -> None:
