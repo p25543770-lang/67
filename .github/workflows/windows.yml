@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "arena/**"]
 
+permissions:
+  contents: read
+
 jobs:
   renderer:
     runs-on: ubuntu-latest
@@ -382,3 +385,53 @@ jobs:
           path: ${{ runner.temp }}/diagnostics/
           if-no-files-found: warn
           retention-days: 14
+
+  release:
+    needs: verify-installer
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Depth-Studio-Windows-Installer
+          path: installer
+
+      - name: Publish the verified installer as a download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          installer=$(find installer -name 'Depth-Studio-Setup-*.exe' -type f | head -1)
+          if [ -z "$installer" ]; then echo "::error::Установщик не найден в артефактах"; exit 1; fi
+          name=$(basename "$installer")
+          size=$(stat -c %s "$installer")
+          sum=$(sha256sum "$installer" | cut -d' ' -f1)
+          url="https://github.com/${REPO}/releases/download/installer-latest/${name}"
+
+          {
+            echo "Установщик Depth Studio для Windows x64, собранный из коммита \`${SHA}\`."
+            echo
+            echo "**Скачать:** [${name}](${url})"
+            echo
+            echo "- Размер: ${size} байт"
+            echo "- SHA-256: \`${sum}\`"
+            echo "- Права администратора не нужны: установка идёт в профиль пользователя."
+            echo "- SmartScreen может предупредить: установщик не подписан сертификатом."
+            echo
+            echo "Python 3.11.9 и все пакеты входят в установщик. При первом запуске среда готовится автоматически, экран настройки показывает этапы и прогресс. Деморежим доступен всегда."
+            echo
+            echo "Этот релиз перезаписывается каждой успешной сборкой ветки \`main\` после проверки установщика в чистой среде, поэтому ссылка постоянная, а SHA-256 в описании относится только к текущему файлу."
+          } > notes.md
+
+          if gh release view installer-latest --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit installer-latest --repo "$REPO" --notes-file notes.md --latest
+          else
+            gh release create installer-latest --repo "$REPO" --title "Depth Studio: установщик (последняя проверенная сборка)" --notes-file notes.md --latest
+          fi
+          gh release upload installer-latest --repo "$REPO" "$installer" --clobber
+          echo "::notice::Скачать установщик: ${url}"
+          echo "::notice::SHA-256 установщика: ${sum}"
