@@ -28,6 +28,7 @@ const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
 const https = require("node:https");
+const zlib = require("node:zlib");
 const { spawn } = require("node:child_process");
 
 const APP_FOLDER_NAME = "DepthStudio";
@@ -371,6 +372,101 @@ function childEnvironment(env = process.env) {
   result.PIP_NO_INPUT = "1";
   result.PIP_PROGRESS_BAR = "off";
   return result;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* Распаковка ZIP без внешних утилит.                                        */
+/* Встроенный Python и pip — обычные zip-архивы, поэтому распаковка не должна */
+/* зависеть от PowerShell (её могут блокировать политики предприятия).       */
+/* ------------------------------------------------------------------------- */
+
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+
+function findEndOfCentralDirectory(buffer) {
+  const minOffset = Math.max(0, buffer.length - 66_000);
+  for (let offset = buffer.length - 22; offset >= minOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === ZIP_EOCD_SIGNATURE) return offset;
+  }
+  return -1;
+}
+
+/** List ZIP entries: name, sizes, compression method and data offset. */
+function listZipEntries(buffer) {
+  const eocd = findEndOfCentralDirectory(buffer);
+  if (eocd < 0) throw new SetupError("unpack_failed", "Архив повреждён: не найден заголовок ZIP.");
+  const total = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  if (offset === 0xffffffff) {
+    throw new SetupError("unpack_failed", "Архивы ZIP64 не поддерживаются встроенным распаковщиком.");
+  }
+  const entries = [];
+  for (let index = 0; index < total; index += 1) {
+    if (buffer.readUInt32LE(offset) !== ZIP_CENTRAL_SIGNATURE) {
+      throw new SetupError("unpack_failed", "Архив повреждён: неверный заголовок каталога.");
+    }
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    entries.push({ name, method, compressedSize, uncompressedSize, localOffset });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function readZipEntryData(buffer, entry) {
+  const local = entry.localOffset;
+  if (buffer.readUInt32LE(local) !== ZIP_LOCAL_SIGNATURE) {
+    throw new SetupError("unpack_failed", `Архив повреждён: запись ${entry.name}.`);
+  }
+  const nameLength = buffer.readUInt16LE(local + 26);
+  const extraLength = buffer.readUInt16LE(local + 28);
+  const start = local + 30 + nameLength + extraLength;
+  const raw = buffer.subarray(start, start + entry.compressedSize);
+  if (entry.method === 0) return raw;
+  if (entry.method === 8) {
+    try {
+      return zlib.inflateRawSync(raw);
+    } catch (error) {
+      throw new SetupError("unpack_failed", `Не удалось распаковать ${entry.name}.`, "", String(error.message || error));
+    }
+  }
+  throw new SetupError("unpack_failed", `Неподдерживаемый метод сжатия ${entry.method} (${entry.name}).`);
+}
+
+/**
+ * Extract a ZIP archive into `destination` (created if needed).
+ * Path traversal entries are rejected; no external tools are used.
+ */
+async function extractZip(archivePath, destination, options = {}) {
+  const buffer = await fsp.readFile(archivePath);
+  const entries = listZipEntries(buffer);
+  await fsp.mkdir(destination, { recursive: true });
+  let written = 0;
+  for (const entry of entries) {
+    const isDirectory = entry.name.endsWith("/") || entry.name.endsWith("\\");
+    const target = path.resolve(destination, entry.name);
+    if (!isInside(destination, target)) {
+      throw new SetupError("unpack_failed", `Архив содержит недопустимый путь: ${entry.name}`);
+    }
+    if (isDirectory) {
+      await fsp.mkdir(target, { recursive: true });
+      continue;
+    }
+    const data = readZipEntryData(buffer, entry);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, data);
+    written += 1;
+    if (options.onEntry && written % 50 === 0) options.onEntry(written, entries.length);
+  }
+  return { files: written, entries: entries.length };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -976,28 +1072,45 @@ async function runSetup(rawOptions = {}) {
  * from the wheel through PYTHONPATH. Both stay inside the managed environment.
  */
 async function installPip(paths, pipWheelPath, opts, logger) {
-  const installArgs = ["install", "--no-index", "--no-warn-script-location", pipWheelPath];
+  // pip защищает себя от установки «из zip» (To modify pip, please run ... -m pip),
+  // поэтому колёса pip распаковываются прямо в Lib\site-packages — так же, как это
+  // сделала бы установка из колеса, но без запуска pip до его установки.
   const attempts = [
     {
-      args: [`${pipWheelPath}/pip`, ...installArgs],
-      env: childEnvironment(opts.env),
-      note: "запуск pip из колеса",
+      note: "распаковка колеса pip",
+      run: async () => {
+        const extracted = await extractZip(pipWheelPath, paths.sitePackages);
+        return { code: 0, stdout: `Распаковано файлов: ${extracted.files}`, stderr: "" };
+      },
     },
     {
-      args: ["-m", "pip", ...installArgs],
-      env: { ...childEnvironment(opts.env), PYTHONPATH: pipWheelPath },
-      note: "запуск pip через PYTHONPATH",
+      note: "запуск pip из колеса",
+      run: () =>
+        opts.runCommand(paths.pythonExe, [`${pipWheelPath}/pip`, "install", "--no-index", "--no-warn-script-location", pipWheelPath], {
+          env: childEnvironment(opts.env),
+          timeoutMs: 5 * 60 * 1000,
+          onLine: (line) => logger.line(`pip: ${line}`),
+        }),
     },
   ];
   let lastResult = null;
   for (const attempt of attempts) {
-    lastResult = await opts.runCommand(paths.pythonExe, attempt.args, {
-      env: attempt.env,
-      timeoutMs: 5 * 60 * 1000,
-      onLine: (line) => logger.line(`pip(${attempt.note}): ${line}`),
+    try {
+      lastResult = await attempt.run();
+    } catch (error) {
+      lastResult = { code: -1, stdout: "", stderr: String(error?.message || error) };
+    }
+    const check = await opts.runCommand(paths.pythonExe, ["-m", "pip", "--version"], {
+      env: childEnvironment(opts.env),
+      timeoutMs: 120_000,
+      onLine: (line) => logger.line(`pip: ${line}`),
     });
-    if (lastResult.code === 0) return { ok: true, result: lastResult, method: attempt.note };
-    logger.warn(`Не удалось установить pip (${attempt.note}), код ${lastResult.code}.`);
+    if (check.code === 0) {
+      logger.info(`pip доступен (${attempt.note}): ${check.stdout.trim()}`);
+      return { ok: true, result: check, method: attempt.note };
+    }
+    logger.warn(`Способ «${attempt.note}» не дал рабочего pip, код ${lastResult.code}.`);
+    lastResult = check;
   }
   return { ok: false, result: lastResult, method: null };
 }
@@ -1142,31 +1255,9 @@ function tailText(result, limit = 1200) {
 }
 
 async function defaultUnpack(archivePath, destination, options = {}) {
-  if ((options.platform || process.platform) === "win32") {
-    const result = await runStreaming(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        `Expand-Archive -LiteralPath '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destination.replace(/'/g, "''")}' -Force`,
-      ],
-      { timeoutMs: 5 * 60 * 1000, env: process.env },
-    );
-    if (result.code !== 0) {
-      throw new SetupError(
-        "unpack_failed",
-        "Не удалось распаковать архив Python.",
-        "Проверьте свободное место и права на каталог %LOCALAPPDATA%\\DepthStudio.",
-        tailText(result),
-      );
-    }
-    return;
-  }
-  const result = await runStreaming("unzip", ["-q", "-o", archivePath, "-d", destination], {
-    timeoutMs: 5 * 60 * 1000,
+  return extractZip(archivePath, destination, {
+    onEntry: options.onEntry,
   });
-  if (result.code !== 0) throw new SetupError("unpack_failed", "Не удалось распаковать архив Python.", "", tailText(result));
 }
 
 /** Remove the managed environment. Used by repair and uninstall flows. */
@@ -1201,5 +1292,7 @@ module.exports = {
   downloadFromPyPI,
   collectBundledWheels,
   defaultUnpack,
+  extractZip,
+  listZipEntries,
   installPip,
 };

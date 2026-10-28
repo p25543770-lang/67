@@ -26,6 +26,72 @@ function sha256(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Минимальный ZIP-писатель для тестов (Node не умеет создавать архивы).     */
+/* ------------------------------------------------------------------------- */
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function makeZip(entries) {
+  const zlib = require("node:zlib");
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, "utf8");
+    const deflated = entry.store ? data : zlib.deflateRawSync(data);
+    const method = entry.store ? 0 : 8;
+    const name = Buffer.from(entry.name, "utf8");
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(0, 10);
+    local.writeUInt32LE(crc32(data), 14);
+    local.writeUInt32LE(deflated.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    locals.push(local, name, deflated);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(0, 12);
+    central.writeUInt32LE(crc32(data), 16);
+    central.writeUInt32LE(deflated.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, name);
+    offset += local.length + name.length + deflated.length;
+  }
+  const centralSize = centrals.reduce((total, part) => total + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, ...centrals, end]);
+}
+
+function writeZip(file, entries) {
+  fs.writeFileSync(file, makeZip(entries));
+}
+
 function makeTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `depth-studio-${prefix}-`));
 }
@@ -55,14 +121,20 @@ function makeResources(options = {}) {
       content,
     });
   }
-  const pipContent = "wheel pip 24.2";
   const pipWheel = {
     name: "pip",
     version: "24.2",
     filename: "pip-24.2-py3-none-any.whl",
-    sha256: sha256(pipContent),
-    content: pipContent,
   };
+  // pip — единственное колесо, которое распаковывается при установке,
+  // поэтому в тестах оно должно быть настоящим zip-архивом.
+  const pipZip = makeZip([
+    { name: "pip/__init__.py", data: "__version__ = '24.2'\n" },
+    { name: "pip/__main__.py", data: "print('pip')\n" },
+    { name: "pip-24.2.dist-info/METADATA", data: "Metadata-Version: 2.1\nName: pip\nVersion: 24.2\n" },
+  ]);
+  pipWheel.sha256 = sha256(pipZip);
+  pipWheel.content = pipZip;
 
   const lock = {
     schemaVersion: 1,
@@ -91,9 +163,10 @@ function makeResources(options = {}) {
   if (options.withWheels !== false) {
     const wheelDir = path.join(root, "python-wheels");
     fs.mkdirSync(wheelDir, { recursive: true });
-    for (const wheel of [...wheels, pipWheel]) {
+    for (const wheel of wheels) {
       fs.writeFileSync(path.join(wheelDir, wheel.filename), wheel.content);
     }
+    fs.writeFileSync(path.join(wheelDir, pipWheel.filename), pipWheel.content);
   }
 
   return { root, lock, wheels, pipWheel };
@@ -128,12 +201,21 @@ function createRunner(options = {}) {
       const data = typeof probe === "function" ? probe() : probe;
       return { code: 0, stdout: `DEPTH_STUDIO_PROBE=${JSON.stringify(data)}\n`, stderr: "" };
     }
+    if (args.join(" ") === "-m pip --version") {
+      // Настоящий интерпретатор сообщает об отсутствии pip, если пакета нет.
+      const available = fs.existsSync(path.join(envPaths.sitePackages, "pip"));
+      return available
+        ? { code: 0, stdout: "pip 24.2\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "No module named pip" };
+    }
     if (String(args[0]).endsWith("/pip") && args.includes("install")) {
-      if (options.failPipViaWheel) return { code: 1, stdout: "", stderr: "Unable to execute pip from the wheel" };
-      for (const name of ["numpy", "open3d", "pip"]) {
-        fs.mkdirSync(path.join(envPaths.sitePackages, name), { recursive: true });
-      }
-      return { code: 0, stdout: "Successfully installed pip\n", stderr: "" };
+      // Реальный pip 24.2 отказывается изменять себя из zip-архива.
+      return {
+        code: 1,
+        stdout: "",
+        stderr:
+          "ERROR: To modify pip, please run the following command: python.exe -m pip install ...",
+      };
     }
     if (args[0] === "-m" && args[1] === "pip" && args.includes("install")) {
       if (options.failPip) {
@@ -328,19 +410,58 @@ test("ошибка установки пакетов даёт понятный �
   assert.match(log, /packages/);
 });
 
-test("pip ставится из колеса, а при сбое — резервным способом через PYTHONPATH", async () => {
-  const context = setupOptions({ runner: { failPipViaWheel: true } });
+test("pip распаковывается в среду без запуска внешних установщиков", async () => {
+  const context = setupOptions();
   const result = await bootstrap.runSetup(context.options);
   assert.equal(result.ok, true, JSON.stringify(result.error));
+  assert.ok(fs.existsSync(path.join(context.envPaths.sitePackages, "pip")));
+  assert.ok(fs.existsSync(path.join(context.envPaths.sitePackages, "pip", "__init__.py")));
 
-  const pipCalls = context.calls.filter((call) => call.args.includes("install"));
-  const wheelCall = pipCalls.find((call) => String(call.args[0]).endsWith("/pip"));
-  const moduleCall = pipCalls.find((call) => call.args[0] === "-m" && call.args[1] === "pip");
-  assert.ok(wheelCall, "первая попытка должна запускать pip из колеса");
-  assert.match(String(wheelCall.args[0]), /\/pip$/);
-  assert.ok(moduleCall, "должна быть резервная попытка через -m pip");
-  assert.ok(moduleCall.env.PYTHONPATH.endsWith(".whl"), "PYTHONPATH должен указывать на колесо pip");
-  assert.equal(moduleCall.command, context.envPaths.pythonExe);
+  // Версия pip проверяется интерпретатором Depth Studio.
+  const versionChecks = context.calls.filter((call) => call.args.join(" ") === "-m pip --version");
+  assert.ok(versionChecks.length >= 1);
+  assert.equal(versionChecks[0].command, context.envPaths.pythonExe);
+});
+
+test("битый zip не ломает установку: ошибка объясняется, среда не остаётся «готовой»", async () => {
+  const envRoot = makeTempDir("env");
+  const resources = makeResources();
+  fs.writeFileSync(path.join(resources.root, "python-wheels", resources.pipWheel.filename), "not a zip");
+  resources.lock.bootstrapWheels[0].sha256 = sha256("not a zip");
+  fs.writeFileSync(path.join(resources.root, "python-lock.json"), JSON.stringify(resources.lock, null, 2));
+
+  const context = setupOptions({ resources, appDataRoot: envRoot });
+  const result = await bootstrap.runSetup(context.options);
+  assert.equal(result.ok, false);
+  assert.equal(result.demoAvailable, true);
+  assert.equal(result.error.code, "pip_install_failed");
+});
+
+test("extractZip распаковывает stored и deflate-записи", async () => {
+  const root = makeTempDir("zip");
+  const archive = path.join(root, "bundle.zip");
+  writeZip(archive, [
+    { name: "python311._pth", data: "python311.zip\r\n.\r\n" },
+    { name: "Lib/site-packages/pkg/__init__.py", data: "value = 42\n" },
+    { name: "stored.txt", data: "stored content", store: true },
+  ]);
+  const destination = path.join(root, "out");
+  const result = await bootstrap.extractZip(archive, destination);
+  assert.equal(result.files, 3);
+  assert.match(fs.readFileSync(path.join(destination, "python311._pth"), "utf8"), /python311/);
+  assert.equal(fs.readFileSync(path.join(destination, "stored.txt"), "utf8"), "stored content");
+  assert.match(fs.readFileSync(path.join(destination, "Lib/site-packages/pkg/__init__.py"), "utf8"), /42/);
+});
+
+test("extractZip отвергает пути вне каталога назначения", async () => {
+  const root = makeTempDir("zip");
+  const archive = path.join(root, "evil.zip");
+  writeZip(archive, [{ name: "../escape.txt", data: "boom", store: true }]);
+  await assert.rejects(
+    () => bootstrap.extractZip(archive, path.join(root, "out")),
+    (error) => error.code === "unpack_failed",
+  );
+  assert.equal(fs.existsSync(path.join(root, "escape.txt")), false);
 });
 
 test("без закреплённого SHA-256 архив Python не загружается", async () => {

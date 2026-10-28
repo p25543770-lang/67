@@ -191,6 +191,21 @@ function applyEvent(event) {
     case "log":
       appendLog(event.line);
       break;
+    case "reset": {
+      state = {
+        ...state,
+        ...(event.state || {}),
+        phase: "running",
+        progress: 0,
+        error: null,
+        warnings: [],
+        sensorNotes: [],
+        finishedAt: null,
+        startedAt: new Date().toISOString(),
+      };
+      render();
+      break;
+    }
     case "step": {
       const steps = state.steps?.length ? [...state.steps] : DEFAULT_STEPS.map((step) => ({ ...step }));
       const index = steps.findIndex((item) => item.id === event.step.id);

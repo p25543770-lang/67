@@ -1499,15 +1499,15 @@ function renderEnvironmentSummary(state) {
   const numpyVersion = packages.numpy?.version || environment?.packages?.numpy || null;
   const open3dVersion = packages.open3d?.version || environment?.packages?.open3d || null;
   const envDir = state?.envDir || "%LOCALAPPDATA%\\DepthStudio";
-  if (!state || state.phase === undefined) {
+  if (!state || (!environment && state.phase === undefined)) {
     summary.textContent =
       "Среда Python настраивается установщиком Windows в %LOCALAPPDATA%\\DepthStudio. Веб-версия работает в деморежиме.";
     detail.textContent = "";
     return;
   }
-  const isolated =
-    environment?.isolated ?? python?.executable?.toLowerCase().includes("depthstudio");
-  summary.textContent = `${state.phase === "ready" ? "Среда готова" : setupHeadline(state)} · ${envDir}`;
+  const isolated = environment?.isolated ?? Boolean(python?.executable);
+  const headline = state.phase ? setupHeadline(state) : "Python-мост Depth Studio запущен";
+  summary.textContent = `${state.phase === "ready" ? "Среда готова" : headline} · ${envDir}`;
   const pieces = [
     python?.version ? `Python ${python.version}` : null,
     numpyVersion ? `NumPy ${numpyVersion}` : "NumPy не проверен",

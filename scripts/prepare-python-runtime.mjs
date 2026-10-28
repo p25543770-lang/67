@@ -18,6 +18,8 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { createWriteStream, existsSync, promises as fsp, readFileSync } from "node:fs";
 import https from "node:https";
 import os from "node:os";
@@ -28,6 +30,10 @@ const RUNTIME_DIR = path.join(BUNDLE_DIR, "runtime");
 const WHEELS_DIR = path.join(BUNDLE_DIR, "wheels");
 const CACHE_DIR = path.join(BUNDLE_DIR, "cache");
 const LOCK_PATH = path.resolve("python-lock.json");
+const requireFromHere = createRequire(import.meta.url);
+const { extractZip } = requireFromHere(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "desktop", "bootstrap.cjs"),
+);
 const PTH_CONTENT = ["python311.zip", ".", "Lib\\site-packages", "import site", ""].join("\r\n");
 
 const argv = process.argv.slice(2);
@@ -113,18 +119,9 @@ function download(url, destination) {
 async function extract(archive, destination) {
   await fsp.rm(destination, { recursive: true, force: true });
   await fsp.mkdir(destination, { recursive: true });
-  if (process.platform === "win32") {
-    const result = await run("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destination.replace(/'/g, "''")}' -Force`,
-    ]);
-    if (result.code !== 0) throw new Error(`Expand-Archive завершился с кодом ${result.code}: ${result.stderr}`);
-    return;
-  }
-  const result = await run("unzip", ["-q", "-o", archive, "-d", destination]);
-  if (result.code !== 0) throw new Error(`unzip завершился с кодом ${result.code}: ${result.stderr}`);
+  // Единый распаковщик с приложением: не зависит от PowerShell и настроек политик.
+  const result = await extractZip(archive, destination);
+  log(`Распаковано файлов: ${result.files}`);
 }
 
 async function ensureWheels(lock) {
