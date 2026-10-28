@@ -1528,19 +1528,26 @@ function renderSetupBanner(state) {
   setupState = state;
   const ready = state.phase === "ready";
   const bridgeReady = Boolean(state.bridge?.ready);
+  const open3dMissing = state.packages?.open3d?.available === false;
   renderEnvironmentSummary(state);
-  if (ready && bridgeReady) {
+  if (ready && bridgeReady && !open3dMissing) {
     banner.hidden = true;
     return;
   }
   banner.hidden = false;
-  banner.dataset.phase = ready ? "bridge" : state.phase || "idle";
-  $("setupTitle").textContent = setupHeadline(state);
+  banner.dataset.phase = ready && !open3dMissing ? "bridge" : ready ? "warning" : state.phase || "idle";
+  $("setupTitle").textContent =
+    ready && open3dMissing ? "Open3D недоступен: сканирование с датчиком выключено" : setupHeadline(state);
   const parts = [];
   if (state.phase === "failed" && state.error?.message) parts.push(state.error.message);
   if (state.phase === "failed" && state.error?.hint) parts.push(state.error.hint);
   if (ready && !bridgeReady) {
     parts.push(state.bridge?.error || "Python-мост запускается; деморежим уже доступен.");
+  }
+  if (ready && open3dMissing) {
+    parts.push(
+      "Совмещение кадров и сканирование с датчиком требуют Open3D. Обычно не хватает Microsoft Visual C++ 2015–2022 Redistributable (x64) — установите его вручную, затем нажмите «Повторить». Деморежим и экспорт работают.",
+    );
   }
   if (!ready) {
     parts.push("Деморежим работает сразу: 3D-сцена, синтетический поток и экспорт PLY/OBJ доступны без датчика.");

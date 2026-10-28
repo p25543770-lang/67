@@ -1628,6 +1628,14 @@ input[type="range"] {
   border-color: #cfe2d3;
   background: #f4faf4;
 }
+.setup-banner[data-phase="warning"] {
+  border-color: #eddfc0;
+  background: #fffaf0;
+}
+.setup-banner[data-phase="warning"] .setup-banner-dot {
+  background: #c58b2a;
+  box-shadow: 0 0 0 4px rgba(197, 139, 42, 0.14);
+}
 .setup-banner[data-phase="ready"] {
   border-color: #cfe2d3;
   background: #f4faf4;

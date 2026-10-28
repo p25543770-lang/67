@@ -225,27 +225,31 @@ jobs:
           "installDir=$installDir" >> $env:GITHUB_OUTPUT
           Write-Output "::notice::Installed to $installDir"
 
-      - name: Remove Python from PATH (clean Windows simulation)
+      - name: Simulate a Windows installation without Python
         shell: pwsh
         run: |
           $tripwire = Join-Path $env:RUNNER_TEMP 'python-tripwire'
           New-Item -ItemType Directory -Force $tripwire | Out-Null
-          # Любой запуск python из PATH приведёт к явной ошибке.
+          # Любой запуск python из PATH завершится явной ошибкой.
           Set-Content -Path (Join-Path $tripwire 'python.bat') -Value '@echo off & echo PYTHON FROM PATH WAS USED 1>&2 & exit /b 42'
           Copy-Item (Join-Path $tripwire 'python.bat') (Join-Path $tripwire 'py.bat')
           Set-Content -Path (Join-Path $tripwire 'python3.bat') -Value '@echo off & echo PYTHON3 FROM PATH WAS USED 1>&2 & exit /b 42'
+          # GITHUB_ENV не заменяет PATH, поэтому сохраняем очищенное значение в файл
+          # и подставляем его в каждом шаге, который запускает приложение.
           $clean = "$tripwire;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
-          "PATH=$clean" >> $env:GITHUB_ENV
-          if ($env:PATH -match 'hostedtoolcache' -or $env:PATH -match 'Python3') {
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Value $clean -NoNewline
+          $tripwire | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = $clean
+          if ($env:PATH -match 'hostedtoolcache') {
             Write-Output "::error::PATH не очищен от Python: $env:PATH"
             exit 1
           }
-          $leftover = (Get-Command python, py, python3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source) -join ', '
-          Write-Output "::notice::Python resolutions still visible (tripwire first): $leftover"
+          Write-Output "::notice::Sanitized PATH: $env:PATH"
 
       - name: First launch on a machine without Python
         shell: pwsh
         run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
           $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
           $report = Join-Path $env:RUNNER_TEMP 'selftest-first.json'
           $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
@@ -264,6 +268,7 @@ jobs:
           if (-not $data.environment.packages.open3d.available) { $failures += "Open3D недоступен: $($data.environment.packages.open3d.error)" }
           if (-not $data.bridge.environment.isolated) { $failures += 'мост запущен не из среды Depth Studio' }
           if ($data.setup.cached) { $failures += 'первый запуск не должен считаться кэшированным' }
+          if ($data.systemPathPython.Count -gt 0) { $failures += "в PATH приложения остались каталоги Python: $($data.systemPathPython -join ', ')" }
           if ($failures.Count -gt 0) {
             foreach ($failure in $failures) { Write-Output "::error::$failure" }
             Write-Output "::error::Отчёт самопроверки: $((Get-Content $report -Raw) -replace '\r?\n', ' ')"
@@ -278,6 +283,7 @@ jobs:
       - name: Second launch reuses the prepared environment
         shell: pwsh
         run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
           $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
           $report = Join-Path $env:RUNNER_TEMP 'selftest-second.json'
           $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
@@ -289,6 +295,7 @@ jobs:
       - name: Corrupted environment is repaired on the next launch
         shell: pwsh
         run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
           $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
           Remove-Item -Recurse -Force (Join-Path $envRoot 'runtime\python\Lib\site-packages\numpy')
           $exe = Join-Path '${{ steps.install.outputs.installDir }}' 'Depth Studio.exe'
@@ -305,6 +312,7 @@ jobs:
       - name: Failed setup still leaves demo mode available
         shell: pwsh
         run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
           $envRoot = Join-Path $env:LOCALAPPDATA 'DepthStudio'
           $env:DEPTH_STUDIO_ALLOW_TEST_HOOKS = '1'
           $env:DEPTH_STUDIO_TEST_FAIL_STEP = 'packages'

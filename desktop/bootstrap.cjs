@@ -407,11 +407,9 @@ async function quickStatus(options) {
   else if (state.fingerprint !== fingerprint) problems.push("версии зависимостей изменились");
   if (!(await pathExists(paths.pythonExe))) problems.push("нет интерпретатора Depth Studio");
   if (!(await pathExists(path.join(paths.sitePackages, "numpy")))) problems.push("нет NumPy в среде Depth Studio");
-  const open3dPresent = await pathExists(path.join(paths.sitePackages, "open3d"));
-  if (state && state.packages?.open3d?.available === false && open3dPresent) {
-    // Recorded as unavailable by the last verify step; keep the reason visible.
-    problems.push("Open3D не импортируется");
-  }
+  // Недоступный Open3D (например, из-за отсутствующего Visual C++ Runtime) не
+  // делает среду «неготовой»: переустановка это не исправит, а интерфейс честно
+  // сообщает об ограничении и остаётся в деморежиме.
   return {
     ready: problems.length === 0,
     problems,
