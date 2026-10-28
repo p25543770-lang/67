@@ -182,6 +182,7 @@ function makeProbe(envPaths, overrides = {}) {
     packages: {
       numpy: { available: true, version: "1.26.4", error: null },
       open3d: { available: true, version: "0.18.0", error: null },
+      pythonnet: { available: true, version: "3.2.1", error: null },
       freenect: { available: false, version: null, error: "No module named 'freenect'" },
       ...overrides,
     },
@@ -309,7 +310,14 @@ test("первый запуск создаёт изолированную сре
   assert.ok(fs.existsSync(context.envPaths.stateFile));
   assert.equal(result.sources.python, "bundled");
   assert.equal(result.sources.packages, "bundled");
-  assert.equal(result.warnings.some((warning) => warning.code === "sensor_driver_missing"), true);
+  // Драйвер устройства (Kinect SDK 1.8) и компоненты Python сообщаются раздельно.
+  assert.equal(result.warnings.some((warning) => warning.code === "kinect_sdk_missing"), true);
+  assert.equal(result.warnings.some((warning) => warning.code === "sensor_python_component_missing"), false);
+  assert.equal(result.sensors.kinectSdk.available, false);
+  assert.equal(
+    result.sensors.pythonComponents.find((item) => item.id === "pythonnet").available,
+    true,
+  );
 
   // Каждый запуск процесса выполнен именно интерпретатором Depth Studio.
   assert.ok(context.calls.length >= 3);
@@ -649,4 +657,189 @@ test("parseProbe устойчив к мусору в выводе", () => {
 test("isInside не считает соседние каталоги частью среды", () => {
   assert.equal(bootstrap.isInside("C:\\Local\\DepthStudio", "C:\\Local\\DepthStudio\\runtime\\python\\python.exe"), true);
   assert.equal(bootstrap.isInside("C:\\Local\\DepthStudio", "C:\\Local\\DepthStudio2\\python.exe"), false);
+});
+
+/* ------------------------------------------------------------------------- */
+/* Устойчивость установки pip: место, права, повтор, диагностика вывода.     */
+/* ------------------------------------------------------------------------- */
+
+test("нехватка свободного места определяется до распаковки pip", async () => {
+  const context = setupOptions();
+  let unpacked = 0;
+  const result = await bootstrap.runSetup({
+    ...context.options,
+    statfs: async () => ({ bsize: 4096, frsize: 4096, blocks: 1000, bavail: 8, bfree: 8 }),
+    extractWheel: async () => {
+      unpacked += 1;
+      throw new Error("распаковка не должна выполняться при нехватке места");
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "pip_disk_full");
+  assert.equal(result.error.cause, "disk_full");
+  assert.match(result.error.message, /свободн\S* мест/i);
+  assert.match(result.error.hint, /Повторить/);
+  assert.equal(unpacked, 0, "распаковка pip не должна начинаться без свободного места");
+  // Отдельные подсказки под типовые причины: место — вероятная, остальные — рядом.
+  const relevant = result.error.remedies.filter((remedy) => remedy.relevant);
+  assert.equal(relevant.length, 1);
+  assert.equal(relevant[0].id, "disk_space");
+  for (const id of ["antivirus", "permissions", "network"]) {
+    assert.ok(result.error.remedies.some((remedy) => remedy.id === id), `нет подсказки ${id}`);
+  }
+  assert.equal(result.demoAvailable, true);
+  assert.equal(fs.existsSync(path.join(context.envPaths.sitePackages, "pip")), false);
+});
+
+test("отказ доступа к site-packages объясняется и не повторяется", async () => {
+  const context = setupOptions();
+  const denied = Object.assign(new Error("EACCES: permission denied, open 'site-packages'"), { code: "EACCES" });
+  let unpacked = 0;
+  const result = await bootstrap.runSetup({
+    ...context.options,
+    fileSystem: {
+      ...fs.promises,
+      writeFile: async () => {
+        throw denied;
+      },
+    },
+    extractWheel: async () => {
+      unpacked += 1;
+      throw new Error("распаковка не должна выполняться без прав на запись");
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "pip_access_denied");
+  assert.equal(result.error.cause, "access_denied");
+  assert.match(result.error.message, /прав/i);
+  assert.equal(result.error.remedies[0].id, "permissions");
+  assert.equal(unpacked, 0);
+  assert.equal(result.demoAvailable, true);
+});
+
+test("частичный сбой распаковки pip лечится повторной попыткой", async () => {
+  const context = setupOptions();
+  let attempts = 0;
+  const extractWheel = async (archive, destination) => {
+    attempts += 1;
+    if (attempts === 1) {
+      // Как при обрыве записи: каталог pip уже создан, файлы неполные.
+      fs.mkdirSync(path.join(destination, "pip"), { recursive: true });
+      fs.writeFileSync(path.join(destination, "pip", "__init__.py"), "# неполная распаковка\n");
+      throw new bootstrap.SetupError("unpack_failed", "Запись файлов прервалась.", "", "EBUSY");
+    }
+    return bootstrap.extractZip(archive, destination);
+  };
+
+  const result = await bootstrap.runSetup({ ...context.options, extractWheel });
+
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+  assert.equal(attempts, 2, "ожидалась ровно одна повторная попытка");
+  assert.ok(fs.existsSync(path.join(context.envPaths.sitePackages, "pip", "__init__.py")));
+  assert.equal(fs.readFileSync(path.join(context.envPaths.sitePackages, "pip", "__init__.py"), "utf8"), "__version__ = '24.2'\n");
+  const log = fs.readFileSync(context.envPaths.setupLog, "utf8");
+  assert.match(log, /перед повтором/i);
+});
+
+test("ENOSPC во время распаковки pip не повторяется и даёт код pip_disk_full", async () => {
+  const context = setupOptions();
+  let attempts = 0;
+  const result = await bootstrap.runSetup({
+    ...context.options,
+    extractWheel: async () => {
+      attempts += 1;
+      throw bootstrap.mapFileSystemError(
+        Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" }),
+        { target: "Lib\\\\site-packages", action: "write pip/__init__.py" },
+      );
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "pip_disk_full");
+  assert.equal(result.error.cause, "disk_full");
+  assert.equal(attempts, 1, "нехватку места бессмысленно повторять");
+  assert.match(result.error.details, /ENOSPC/);
+  const log = fs.readFileSync(context.envPaths.setupLog, "utf8");
+  assert.match(log, /ERROR/);
+  assert.ok(fs.existsSync(path.join(context.envPaths.logsDir, "pip-bootstrap.log")));
+});
+
+test("диагностика вывода pip различает типовые причины", () => {
+  assert.equal(
+    bootstrap.diagnosePipOutput("ERROR: Could not install packages ... WinError 5: Access is denied").cause,
+    "access_denied",
+  );
+  assert.equal(
+    bootstrap.diagnosePipOutput("ERROR: [Errno 28] No space left on device").cause,
+    "disk_full",
+  );
+  assert.equal(
+    bootstrap.diagnosePipOutput("ERROR: HTTPSConnectionPool: Max retries exceeded with url (Caused by ProxyError)").cause,
+    "network",
+  );
+  assert.equal(
+    bootstrap.diagnosePipOutput("Access blocked by antivirus (0x80070005)").cause,
+    "access_denied",
+  );
+  const generic = bootstrap.diagnosePipOutput("ERROR: To modify pip, please run the following command");
+  assert.equal(generic.cause, "unknown");
+  assert.deepEqual(
+    generic.remedies.map((remedy) => remedy.id),
+    ["antivirus", "disk_space", "permissions", "network"],
+  );
+  assert.equal(generic.remedies[0].relevant, true);
+  assert.equal(generic.remedies.filter((remedy) => remedy.relevant).length, 1);
+});
+
+test("путь Microsoft.Kinect.dll из Kinect SDK 1.8 проверяется только на чтение", async () => {
+  const candidates = bootstrap.kinectSdkCandidates({ ProgramFiles: "C:\\Program Files" });
+  assert.equal(candidates.length, 1);
+  assert.match(candidates[0], /Kinect[\\/]+v1\.8[\\/]+Assemblies[\\/]+Microsoft\.Kinect\.dll$/);
+
+  const root = makeTempDir("kinect-sdk");
+  const dll = path.join(root, "Microsoft SDKs", "Kinect", "v1.8", "Assemblies", "Microsoft.Kinect.dll");
+  fs.mkdirSync(path.dirname(dll), { recursive: true });
+  fs.writeFileSync(dll, "fake assembly");
+  const found = await bootstrap.detectKinectSdk({ ProgramFiles: root });
+  assert.equal(found.available, true);
+  assert.equal(found.assembly, dll);
+
+  const missing = await bootstrap.detectKinectSdk({ ProgramFiles: makeTempDir("no-kinect-sdk") });
+  assert.equal(missing.available, false);
+  assert.equal(missing.assembly, null);
+});
+
+test("неудачная установка pip показывает диагностику импорта и sys.path", async () => {
+  const context = setupOptions();
+  const result = await bootstrap.runSetup({
+    ...context.options,
+    runCommand: async (_command, args) => {
+      if (args[0] === "-c" && String(args[1]).startsWith("import sys;print")) {
+        return { code: 0, stdout: `${PYTHON_VERSION}\n`, stderr: "" };
+      }
+      if (args[0] === "-c" && String(args[1]).includes("DEPTH_STUDIO_PIP_DIAG")) {
+        return {
+          code: 0,
+          stdout:
+            'DEPTH_STUDIO_PIP_DIAG={"executable":"C:\\\\env\\\\python.exe","prefix":"C:\\\\env","path":["python311.zip","C:\\\\env\\\\Lib\\\\site-packages"],"pip":null,"error":"ModuleNotFoundError: No module named \'pip\'"}\n',
+          stderr: "",
+        };
+      }
+      if (args.join(" ") === "-m pip --version") {
+        return { code: 1, stdout: "", stderr: "No module named pip" };
+      }
+      return { code: 1, stdout: "", stderr: "смоделированный сбой" };
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "pip_install_failed");
+  assert.match(result.error.details, /sys\.path=/);
+  assert.match(result.error.details, /не импортируется/);
+  assert.match(result.error.details, /ModuleNotFoundError/);
+  assert.ok(fs.existsSync(path.join(context.envPaths.logsDir, "pip-bootstrap.log")));
+  assert.match(fs.readFileSync(path.join(context.envPaths.logsDir, "pip-bootstrap.log"), "utf8"), /попытки установки pip/);
 });

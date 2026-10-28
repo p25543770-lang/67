@@ -1,24 +1,45 @@
-"""Experimental Kinect 360 (Kinect v1) adapter via libfreenect.
+"""Experimental Kinect 360 (Kinect v1) adapter via libfreenect — *alternative* path.
 
-This module is implemented as an integration path, but no physical-device test
-is recorded by this repository. Do not treat it as certified/verified support.
+This is the second option, not the recommended one. libfreenect on Windows needs
+the Kinect USB device rebound from the Microsoft driver to libusbK/WinUSB
+(usually with Zadig). That removes the working Microsoft Kinect driver and can
+break applications which already scan with the same sensor, so Depth Studio never
+does it automatically.
+
+The recommended path is :mod:`sensor_drivers.kinect_sdk_v1`, which keeps the
+Microsoft driver and only needs Kinect for Windows SDK 1.8.
+
+No physical-device test is recorded by this repository. Do not treat this module
+as certified/verified support.
 """
 from __future__ import annotations
 
-import importlib.util
 import time
+from typing import Any
 
-from .base import SensorAdapter, SensorFrame
+from .base import SensorAdapter, SensorFrame, requirement
 
 
 class KinectV1Adapter(SensorAdapter):
     id = "kinect_v1"
-    name = "Kinect 360 (Kinect v1)"
+    name = "Kinect 360 · libfreenect (альтернатива)"
     implemented = True
     verified_on_hardware = False
-    windows = "Windows 10/11 x64 are intended; this libfreenect binding/driver combination has not been validated on Windows."
-    driver = "libfreenect with its Python module named 'freenect', NumPy, and a compatible USB driver. The Microsoft Kinect SDK alone does not provide this adapter."
-    limitations = "Kinect v1 only (not Kinect One/v2). Depth-to-colour registration is not implemented; depth calibration is approximate; ICP can drift on plain walls, fast motion, or moving objects. Requires the powered Kinect USB adapter."
+    # Оба адаптера читают один и тот же физический сенсор: одновременно открывать их нельзя.
+    device_family = "kinect_v1"
+    windows = (
+        "Windows 10/11 x64 — целевая среда, но сочетание libfreenect, Python-привязок и USB-драйвера на Windows не валидировано. "
+        "Требуется USB-драйвер libusbK/WinUSB, который заменяет драйвер Microsoft Kinect."
+    )
+    driver = (
+        "libfreenect с Python-модулем freenect, NumPy и USB-драйвер libusbK/WinUSB (обычно Zadig). "
+        "Этот драйвер конфликтует с драйвером Microsoft Kinect: другие Kinect-приложения могут перестать работать."
+    )
+    limitations = (
+        "Kinect v1 only (not Kinect One/v2). Depth-to-colour registration is not implemented; depth calibration is approximate; "
+        "ICP can drift on plain walls, fast motion, or moving objects. Requires the powered Kinect USB adapter. "
+        "Смена USB-драйвера на libusbK/WinUSB ломает работу штатного драйвера Microsoft Kinect."
+    )
     package_names = ("freenect", "numpy")
 
     def dependencies_available(self) -> bool:
@@ -30,8 +51,52 @@ class KinectV1Adapter(SensorAdapter):
             return False
 
     def dependency_error(self) -> str:
-        return ("Не найден модуль Python freenect и/или NumPy. Установите libfreenect с Python-привязками, "
-                "затем NumPy; обычный Kinect SDK не заменяет libfreenect для этого модуля.")
+        return (
+            "Компоненты Python: не найден модуль freenect (libfreenect) и/или NumPy. "
+            "Этот модуль требует собранных вручную Python-привязок libfreenect для интерпретатора Depth Studio. "
+            "Рекомендуемый вариант для Kinect 360 — «Microsoft Kinect SDK» (штатный драйвер Microsoft остаётся как есть)."
+        )
+
+    def requirements(self) -> list[dict[str, Any]]:
+        def available(name: str) -> bool:
+            try:
+                __import__(name)
+                return True
+            except Exception:
+                return False
+
+        freenect_ok = available("freenect")
+        numpy_ok = available("numpy")
+        return [
+            requirement(
+                requirement_id="libusbk_driver",
+                kind="driver",
+                title="Драйвер устройства · libusbK/WinUSB для Kinect",
+                detail=(
+                    "libfreenect требует, чтобы Kinect был привязан к libusbK/WinUSB (обычно через Zadig). "
+                    "Это заменяет драйвер Microsoft Kinect. Depth Studio не меняет USB-драйверы автоматически."
+                ),
+                satisfied=None,
+            ),
+            requirement(
+                requirement_id="freenect",
+                kind="python",
+                title="Компонент Python · freenect (libfreenect)",
+                detail=(
+                    "Модуль freenect доступен."
+                    if freenect_ok
+                    else "Модуль freenect не установлен. Колёс на PyPI нет: привязки нужно собирать MSVC для интерпретатора Depth Studio."
+                ),
+                satisfied=freenect_ok,
+            ),
+            requirement(
+                requirement_id="numpy",
+                kind="python",
+                title="Компонент Python · NumPy",
+                detail="NumPy нужен для построения облака точек." if numpy_ok else "NumPy не найден в среде Depth Studio.",
+                satisfied=numpy_ok,
+            ),
+        ]
 
     @staticmethod
     def _unwrap(result):

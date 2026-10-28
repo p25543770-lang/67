@@ -32,7 +32,9 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-ROOT_REQUIREMENTS = ("numpy==1.26.4", "open3d==0.18.0")
+# pythonnet — мост к .NET: через него адаптер Kinect 360 работает с официальным
+# SDK 1.8 и не трогает установленный драйвер Microsoft Kinect.
+ROOT_REQUIREMENTS = ("numpy==1.26.4", "open3d==0.18.0", "pythonnet==3.2.1")
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -99,29 +101,60 @@ def wheel_tags(filename: str) -> tuple[str, str, str] | None:
     return parts[-3], parts[-2], parts[-1]
 
 
+def compressed_tags(tag: str) -> list[str]:
+    """PEP 425 allows compressed tag sets such as ``cp311.cp312.cp313-none-any``."""
+    return [item for item in tag.split(".") if item]
+
+
 def tags_compatible(python_tag: str, abi_tag: str, platform_tag: str) -> bool:
     """Can CPython 3.11 on Windows x64 install this wheel?"""
-    if platform_tag not in ("win_amd64", "any"):
+    platforms = compressed_tags(platform_tag)
+    if not any(item in ("win_amd64", "any") for item in platforms):
         return False
-    if abi_tag == "none":
-        return python_tag in ("py3", "py2.py3", "cp311")
-    if abi_tag == "abi3":
-        match = re.fullmatch(r"cp3(\d+)", python_tag)
-        return bool(match) and int(match.group(1)) <= 11
-    if abi_tag == "cp311":
-        return python_tag == "cp311"
+    python_tags = compressed_tags(python_tag)
+    for abi in compressed_tags(abi_tag):
+        if abi == "none":
+            # Чистые колёса: py3/py2.py3 или конкретный cp311 (в том числе сжатый набор).
+            if any(item in ("py3", "py2.py3", "cp311") for item in python_tags):
+                return True
+        elif abi == "abi3":
+            for item in python_tags:
+                match = re.fullmatch(r"cp3(\d+)", item)
+                if match and int(match.group(1)) <= 11:
+                    return True
+        elif abi == "cp311" and "cp311" in python_tags:
+            return True
     return False
 
 
 def rank_wheel(filename: str) -> tuple[int, str]:
     python_tag, abi_tag, platform_tag = wheel_tags(filename)
-    if abi_tag == "cp311":
+    abis = set(compressed_tags(abi_tag))
+    if "cp311" in abis:
         specificity = 0
-    elif abi_tag == "abi3":
+    elif "abi3" in abis:
         specificity = 1
     else:
         specificity = 2
     return specificity, filename
+
+
+def compatible_wheel_hashes(name: str, version: str) -> list[str]:
+    """SHA-256 of every wheel a Windows x64 / CPython 3.11 host could install.
+
+    Keeping them all in ``allowedHashes`` lets ``pip --require-hashes`` accept a
+    different-but-equivalent wheel tag on a real Windows machine.
+    """
+    hashes = set()
+    for file in pypi_json(name, version)["urls"]:
+        filename = file["filename"]
+        if not filename.endswith(".whl") or file.get("yanked"):
+            continue
+        tags = wheel_tags(filename)
+        if tags is None or not tags_compatible(*tags):
+            continue
+        hashes.add(file["digests"]["sha256"])
+    return sorted(hashes)
 
 
 def releases_newest_first(name: str) -> list[str]:
@@ -184,6 +217,63 @@ def resolve(pinned: dict[str, str]) -> dict[str, str]:
     return chosen
 
 
+DIRECT_REQUIREMENTS = ("numpy", "open3d", "pythonnet")
+
+
+def build_lock(chosen: dict[str, str], wheels: dict[str, dict], previous: dict) -> dict:
+    """Serialize the resolved Windows closure into python-lock.json."""
+    packages = []
+    for name, version in sorted(chosen.items()):
+        file = wheels[name]
+        local = file["digests"]["sha256"]
+        hashes = sorted({local, *compatible_wheel_hashes(name, version)})
+        packages.append(
+            {
+                "name": name,
+                "version": version,
+                "filename": file["filename"],
+                "sha256": local,
+                "allowedHashes": hashes,
+                "direct": name in DIRECT_REQUIREMENTS,
+            }
+        )
+    python = json.loads(json.dumps(previous.get("python") or {}))
+    python.setdefault("version", PYTHON_VERSION)
+    python.setdefault(
+        "archive",
+        {
+            "url": f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip",
+            "sha256": None,
+        },
+    )
+    python.setdefault("pthFile", "python311._pth")
+    return {
+        "schemaVersion": 1,
+        "generatedFor": {"platform": "win_amd64", "pythonTag": "cp311"},
+        "python": python,
+        "bootstrapWheels": previous.get("bootstrapWheels") or [],
+        "packages": packages,
+        "requirements": [f"{name}=={chosen[name]}" for name in DIRECT_REQUIREMENTS if name in chosen],
+    }
+
+
+def write_lock(lock: dict, lock_path: pathlib.Path, txt_path: pathlib.Path) -> None:
+    lock_path.write_text(f"{json.dumps(lock, indent=2, ensure_ascii=False)}\n", encoding="utf-8")
+    lines = [
+        "# Сгенерировано scripts/make-python-lock.mjs — не редактируйте вручную.",
+        "# Полный набор зависимостей Depth Studio для Windows x64 / CPython 3.11.",
+        "# Установка: python -m pip install --only-binary=:all: --require-hashes -r requirements-scan.lock.txt",
+    ]
+    for pkg in lock["packages"]:
+        lines.append(f"{pkg['name']}=={pkg['version']} \\")
+        for digest in pkg["allowedHashes"]:
+            lines.append(f"    --hash=sha256:{digest}")
+    body = "\n".join(lines)
+    if body.endswith(" \\"):
+        body = body[:-2]
+    txt_path.write_text(f"{body}\n", encoding="utf-8")
+
+
 def download(wheels: dict[str, dict], destination: pathlib.Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name, file in sorted(wheels.items()):
@@ -205,6 +295,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dest", default="python-bundle/wheels")
     parser.add_argument("--skip-download", action="store_true")
+    parser.add_argument(
+        "--emit-lock",
+        action="store_true",
+        help="перезаписать python-lock.json и requirements-scan.lock.txt без скачивания колёс",
+    )
     args = parser.parse_args()
 
     lock_path = pathlib.Path("python-lock.json")
@@ -226,14 +321,18 @@ def main() -> int:
     added = sorted(set(wheels) - set(pinned))
     log(f"всего пакетов: {len(wheels)}; добавлено для Windows: {', '.join(added) or 'ничего'}")
 
-    if not args.skip_download:
+    if args.emit_lock:
+        if not lock.get("bootstrapWheels"):
+            raise SystemExit("в python-lock.json нет bootstrapWheels (pip) — замок не перезаписан")
+        write_lock(build_lock(chosen, wheels, lock), lock_path, pathlib.Path("requirements-scan.lock.txt"))
+        log(f"замок перезаписан: {len(chosen)} пакетов, pip {lock['bootstrapWheels'][0]['version']}")
+
+    if not args.skip_download and not args.emit_lock:
         destination = pathlib.Path(args.dest)
         download(wheels, destination)
         log(f"колёса в {destination}")
-
-    pip = wheels.get("pip")
-    if not pip:
-        raise SystemExit("pip отсутствует в наборе — добавьте его отдельно")
+        if not wheels.get("pip"):
+            raise SystemExit("pip отсутствует в наборе — добавьте его отдельно")
     return 0
 
 

@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("depthStudioSetup", {
   run: (mode) => ipcRenderer.invoke("setup:run", { mode }),
   revealLog: () => ipcRenderer.invoke("setup:reveal-log"),
   readLog: () => ipcRenderer.invoke("setup:read-log"),
+  copyLog: () => ipcRenderer.invoke("setup:copy-log"),
   continueDemo: () => ipcRenderer.invoke("setup:continue-demo"),
   openApp: () => ipcRenderer.invoke("setup:open-app"),
   quit: () => ipcRenderer.invoke("setup:quit"),

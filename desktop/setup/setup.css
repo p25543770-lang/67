@@ -439,3 +439,57 @@ h1 {
   line-height: 1.55;
   color: var(--muted);
 }
+
+/* --- Диагностика: типовые причины и копирование журнала --------------------- */
+.notice-remedies {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #f0d8d0;
+  border-radius: 8px;
+  background: #fffdfc;
+}
+.notice-remedies-title {
+  display: block;
+  font: 500 9.5px var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #8c6154;
+  margin-bottom: 6px;
+}
+.notice-remedies ul {
+  margin: 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 7px;
+}
+.notice-remedies li {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #6c4136;
+}
+.notice-remedies li strong {
+  display: block;
+  font-size: 11.5px;
+}
+.notice-remedies li[data-relevant="true"] strong {
+  color: #a8422b;
+}
+.notice-remedies li[data-relevant="true"] strong::after {
+  content: " · вероятная причина";
+  font-weight: 400;
+  font-size: 10px;
+  color: #b4462f;
+}
+.notice-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.notice-copy-state {
+  font: 10px var(--mono);
+  color: var(--green);
+}
+.notice-code {
+  margin-top: 8px;
+}

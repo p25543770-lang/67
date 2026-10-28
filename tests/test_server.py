@@ -8,13 +8,14 @@ from unittest import mock
 from urllib.request import urlopen
 
 import server
-from sensor_drivers.registry import ADAPTERS, catalog
+from sensor_drivers.registry import ADAPTERS, catalog, device_family, preferred_source
 
 
 class RegistryTests(unittest.TestCase):
-    def test_only_kinect_v1_has_an_implemented_adapter(self):
+    def test_kinect_360_has_two_implemented_adapters_and_sdk_wins(self):
         implemented = [sensor_id for sensor_id, adapter in ADAPTERS.items() if adapter.implemented]
-        self.assertEqual(implemented, ["kinect_v1"])
+        # Kinect 360: адаптер Microsoft Kinect SDK идёт первым, libfreenect — альтернатива.
+        self.assertEqual(implemented, ["kinect_v1_sdk", "kinect_v1"])
         for sensor_id in ("kinect_v2", "azure_kinect", "intel_realsense"):
             self.assertFalse(ADAPTERS[sensor_id].implemented)
             self.assertIn("не реализ", ADAPTERS[sensor_id].not_implemented_reason.lower())
@@ -22,7 +23,28 @@ class RegistryTests(unittest.TestCase):
     def test_no_sensor_is_claimed_hardware_verified(self):
         for device in catalog():
             self.assertFalse(device["verifiedOnHardware"], device["id"])
-        self.assertFalse(ADAPTERS["kinect_v1"].verified_on_hardware)
+        for sensor_id in ("kinect_v1", "kinect_v1_sdk"):
+            self.assertFalse(ADAPTERS[sensor_id].verified_on_hardware)
+
+    def test_requirements_are_split_into_driver_and_python(self):
+        for sensor_id in ("kinect_v1", "kinect_v1_sdk"):
+            requirements = ADAPTERS[sensor_id].requirements()
+            kinds = {item["kind"] for item in requirements}
+            self.assertEqual(kinds, {"driver", "python"}, sensor_id)
+            for item in requirements:
+                self.assertTrue(item["title"], sensor_id)
+                self.assertTrue(item["detail"], sensor_id)
+                self.assertIn(item["satisfied"], (True, False, None))
+
+    def test_preferred_source_skips_adapters_without_dependencies(self):
+        # Без SDK и без freenect предпочитать нечего — интерфейс остаётся в деморежиме.
+        self.assertIsNone(preferred_source({}))
+        # Доступный адаптер Microsoft Kinect SDK предлагается раньше альтернативы.
+        with mock.patch.object(ADAPTERS["kinect_v1_sdk"], "dependencies_available", return_value=True), \
+             mock.patch.object(ADAPTERS["kinect_v1"], "dependencies_available", return_value=True):
+            self.assertEqual(preferred_source({}), "kinect_v1_sdk")
+            self.assertIsNone(preferred_source({"kinect_v1_sdk": {"state": "no_device"}}))
+        self.assertEqual(device_family("kinect_v1_sdk"), device_family("kinect_v1"))
 
     def test_ply_and_obj_export_are_point_clouds(self):
         points = [[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]]
@@ -85,6 +107,12 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(response["demoAvailable"])
         self.assertEqual(devices["kinect_v1"]["implemented"], True)
         self.assertEqual(devices["kinect_v1"]["verifiedOnHardware"], False)
+        self.assertEqual(devices["kinect_v1_sdk"]["implemented"], True)
+        self.assertEqual(devices["kinect_v1_sdk"]["verifiedOnHardware"], False)
+        self.assertIn("preferredSource", response)
+        # Требования разделены: драйвер устройства против компонентов Python.
+        kinds = {item["kind"] for item in devices["kinect_v1_sdk"]["requirements"]}
+        self.assertEqual(kinds, {"driver", "python"})
         for sensor_id in ("kinect_v2", "azure_kinect", "intel_realsense"):
             self.assertEqual(devices[sensor_id]["state"], "not_implemented")
             self.assertFalse(devices[sensor_id]["implemented"])

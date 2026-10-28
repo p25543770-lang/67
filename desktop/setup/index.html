@@ -55,11 +55,19 @@
           <strong id="noticeTitle">Ошибка</strong>
           <p id="noticeMessage"></p>
           <p class="notice-hint" id="noticeHint" hidden></p>
+          <div class="notice-remedies" id="noticeRemedies" hidden>
+            <span class="notice-remedies-title">Что проверить</span>
+            <ul id="noticeRemedyList"></ul>
+          </div>
           <details class="notice-details" id="noticeDetails" hidden>
-            <summary>Технические подробности</summary>
+            <summary id="noticeDetailsSummary">Технические подробности</summary>
             <pre id="noticeDetailsText"></pre>
           </details>
           <p class="notice-code" id="noticeCode" hidden></p>
+          <div class="notice-actions">
+            <button class="link-button" id="copyLogAction" type="button">Скопировать журнал</button>
+            <span class="notice-copy-state" id="copyLogState" hidden>Журнал скопирован в буфер обмена</span>
+          </div>
         </div>
       </section>
 
@@ -72,6 +80,7 @@
         <div class="log-head">
           <strong>Журнал установки</strong>
           <span id="logPath" class="log-path"></span>
+          <button class="link-button" id="copyPanelLogAction" type="button">Скопировать</button>
         </div>
         <pre class="log-body" id="logBody" tabindex="0"></pre>
       </section>

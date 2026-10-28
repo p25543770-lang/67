@@ -14,7 +14,7 @@
  * `DepthStudio.exe --depth-studio-selftest` runs the whole setup headlessly and
  * is used by CI to verify the installer in a clean Windows environment.
  */
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, clipboard, ipcMain, shell } = require("electron");
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -143,6 +143,44 @@ function readTail(file, limit = 400) {
   } catch {
     return [];
   }
+}
+
+/**
+ * Everything a support request needs, in one text: the error code, the likely
+ * cause and both logs. Details never leave the machine unless the user copies
+ * them — nothing is uploaded automatically.
+ */
+function buildSetupReportText() {
+  const parts = [`Depth Studio ${setup.appVersion || ""} · ${new Date().toISOString()}`.trim()];
+  parts.push(`Среда: ${ENV_PATHS.envRoot}`);
+  parts.push(`Журнал установки: ${ENV_PATHS.setupLog}`);
+  parts.push(`Журнал установки pip: ${ENV_PATHS.pipBootstrapLog}`);
+  if (setup.error) {
+    parts.push(`Код: ${setup.error.code}${setup.error.cause ? ` · причина: ${setup.error.cause}` : ""}`);
+    parts.push(`Сообщение: ${setup.error.message}`);
+    if (setup.error.hint) parts.push(`Подсказка: ${setup.error.hint}`);
+    if (setup.error.details) parts.push(`Подробности: ${setup.error.details}`);
+  }
+  parts.push("=== logs/setup.log ===");
+  parts.push(readTail(ENV_PATHS.setupLog, 2000).join("\n") || "(журнал пуст)");
+  parts.push("=== logs/pip-bootstrap.log ===");
+  parts.push(readTail(ENV_PATHS.pipBootstrapLog, 400).join("\n") || "(журнал пуст)");
+  parts.push("=== logs/bridge.log ===");
+  parts.push(readTail(ENV_PATHS.bridgeLog, 400).join("\n") || "(журнал пуст)");
+  if (bridgeStatus?.error) parts.push(`Мост: ${bridgeStatus.error}`);
+  return parts.join("\n").slice(-400_000);
+}
+
+function copySetupReport() {
+  const text = buildSetupReportText();
+  clipboard.writeText(text);
+  return {
+    ok: true,
+    characters: text.length,
+    logFile: ENV_PATHS.setupLog,
+    pipLog: ENV_PATHS.pipBootstrapLog,
+    bridgeLog: ENV_PATHS.bridgeLog,
+  };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -596,6 +634,14 @@ function startWebServer() {
       sendJson(res, 200, { ok: true, logDir: ENV_PATHS.logsDir });
       return;
     }
+    if (requestUrl.pathname === "/app/setup/copy-log" && req.method === "POST") {
+      try {
+        sendJson(res, 200, copySetupReport());
+      } catch (error) {
+        sendJson(res, 500, { ok: false, reason: String(error?.message || error) });
+      }
+      return;
+    }
     if (requestUrl.pathname.startsWith("/api/")) {
       proxyApi(req, res);
       return;
@@ -652,6 +698,14 @@ ipcMain.handle("setup:read-log", () => ({
   setup: readTail(ENV_PATHS.setupLog, 400),
   bridge: readTail(ENV_PATHS.bridgeLog, 200),
 }));
+
+ipcMain.handle("setup:copy-log", () => {
+  try {
+    return copySetupReport();
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error) };
+  }
+});
 
 ipcMain.handle("setup:open-app", async () => {
   await openMainWindow();
@@ -763,6 +817,9 @@ async function runSelfTest(argv) {
   report.environment = {
     python: result.python || null,
     packages: result.packages || null,
+    // Драйвер устройства (SDK 1.8) и компоненты Python проверяются раздельно;
+    // отчёт фиксирует только наличие, ничего не устанавливая.
+    sensors: result.sensors || null,
     logFile: result.logFile || ENV_PATHS.setupLog,
     envSizeBytes: directorySize(ENV_PATHS.envRoot),
   };

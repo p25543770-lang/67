@@ -31,7 +31,13 @@ const elements = {
   noticeHint: document.getElementById("noticeHint"),
   noticeDetails: document.getElementById("noticeDetails"),
   noticeDetailsText: document.getElementById("noticeDetailsText"),
+  noticeDetailsSummary: document.getElementById("noticeDetailsSummary"),
+  noticeRemedies: document.getElementById("noticeRemedies"),
+  noticeRemedyList: document.getElementById("noticeRemedyList"),
   noticeCode: document.getElementById("noticeCode"),
+  copyLog: document.getElementById("copyLogAction"),
+  copyPanelLog: document.getElementById("copyPanelLogAction"),
+  copyLogState: document.getElementById("copyLogState"),
   warnings: document.getElementById("warnings"),
   warningList: document.getElementById("warningList"),
   logPanel: document.getElementById("logPanel"),
@@ -105,10 +111,32 @@ function renderError() {
     "Depth Studio запустится в деморежиме: просмотр сцены, синтетический поток и экспорт доступны без Python.";
   elements.noticeHint.hidden = !error.hint;
   elements.noticeHint.textContent = error.hint || "";
+  renderRemedies(error.remedies || []);
   elements.noticeDetails.hidden = !error.details;
   elements.noticeDetailsText.textContent = error.details || "";
+  if (error.details) {
+    const lines = error.details.split(/\r?\n/).length;
+    elements.noticeDetailsSummary.textContent = `Технические подробности — вывод pip, ${lines} стр. (${
+      error.cause ? `причина: ${error.cause}` : "см. журнал"
+    })`;
+  }
   elements.noticeCode.hidden = !error.code;
-  elements.noticeCode.textContent = error.code ? `Код: ${error.code}` : "";
+  elements.noticeCode.textContent = error.code
+    ? `Код: ${error.code}${error.cause ? ` · причина: ${error.cause}` : ""}`
+    : "";
+  elements.noticeCode.title = "Скопируйте журнал: он содержит полный вывод установки.";
+}
+
+function renderRemedies(remedies) {
+  const list = Array.isArray(remedies) ? remedies : [];
+  elements.noticeRemedies.hidden = list.length === 0;
+  elements.noticeRemedyList.innerHTML = list
+    .map(
+      (remedy) => `<li data-relevant="${remedy.relevant ? "true" : "false"}"><strong>${escapeHtml(
+        remedy.title,
+      )}</strong><span>${escapeHtml(remedy.text)}</span></li>`,
+    )
+    .join("");
 }
 
 function renderWarnings() {
@@ -279,6 +307,27 @@ elements.log.addEventListener("click", async () => {
 elements.demo.addEventListener("click", async () => {
   await api.continueDemo();
 });
+
+async function copySetupLog() {
+  elements.copyLogState.hidden = true;
+  try {
+    const result = await api.copyLog();
+    if (!result?.ok) throw new Error(result?.reason || "Журнал недоступен");
+    elements.copyLogState.hidden = false;
+    elements.copyLogState.textContent = `Журнал скопирован (${result.characters} символов)`;
+    clearTimeout(copyStateTimer);
+    copyStateTimer = setTimeout(() => {
+      elements.copyLogState.hidden = true;
+    }, 6000);
+  } catch (error) {
+    elements.copyLogState.hidden = false;
+    elements.copyLogState.textContent = `Не удалось скопировать: ${error.message}`;
+  }
+}
+
+let copyStateTimer = null;
+elements.copyLog.addEventListener("click", copySetupLog);
+elements.copyPanelLog.addEventListener("click", copySetupLog);
 elements.toggleLog.addEventListener("click", async () => {
   logVisible = !logVisible;
   elements.logPanel.hidden = !logVisible;

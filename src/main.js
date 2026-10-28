@@ -53,6 +53,14 @@ document.querySelector("#app").innerHTML = `
         <div class="setup-banner-copy">
           <strong id="setupTitle">Среда Depth Studio не настроена</strong>
           <p id="setupText"></p>
+          <div class="setup-banner-remedies" id="setupRemedies" hidden>
+            <span class="setup-banner-remedies-title">Что проверить</span>
+            <ul id="setupRemedyList"></ul>
+          </div>
+          <details class="setup-banner-details" id="setupDetails" hidden>
+            <summary id="setupDetailsSummary">Технические подробности</summary>
+            <pre id="setupDetailsText"></pre>
+          </details>
           <div class="setup-banner-progress" id="setupProgressWrap" hidden>
             <div class="setup-banner-fill" id="setupProgressFill"></div>
           </div>
@@ -61,6 +69,7 @@ document.querySelector("#app").innerHTML = `
       <div class="setup-banner-actions">
         <button class="setup-action" id="setupRetryBtn">Повторить</button>
         <button class="setup-action" id="setupRepairBtn">Восстановить среду</button>
+        <button class="setup-action ghost" id="setupCopyLogBtn">Скопировать журнал</button>
         <button class="setup-action ghost" id="setupLogBtn">Журнал установки</button>
       </div>
     </section>
@@ -139,6 +148,7 @@ document.querySelector("#app").innerHTML = `
             <p id="sourceDescription">Синтетическая сцена помогает проверить интерфейс и экспорт. Физический датчик не используется.</p>
             <div class="verification-label" id="verificationLabel"><span>i</span><span>Демо не требует датчика. Аппаратная проверка не выполнялась.</span></div>
           </div>
+          <div class="requirements-block" id="sourceRequirements" hidden></div>
           <div class="source-buttons">
             <button class="button-secondary full-button" id="detectButton"><i data-lucide="radio"></i> Обнаружить датчики</button>
             <button class="button-primary full-button connect-button" id="connectButton"><i data-lucide="check"></i><span>Демо-режим активен</span></button>
@@ -174,9 +184,9 @@ document.querySelector("#app").innerHTML = `
       <button class="modal-close" id="closeModal" aria-label="Закрыть">×</button>
       <span class="section-kicker">СПРАВКА / ИСТОЧНИКИ ГЛУБИНЫ</span>
       <h2 id="modalTitle">Подключение датчиков</h2>
-      <p class="modal-intro">В этой сборке физическое сканирование реализовано только экспериментальным модулем Kinect v1. Оно не отмечено как проверенное на реальном устройстве. Остальные строки — требования для будущих модулей, а не заявление о поддержке.</p>
+      <p class="modal-intro">В этой сборке физическое сканирование реализовано только для Kinect 360: рекомендуемый путь — Microsoft Kinect SDK 1.8, альтернативный — libfreenect с другим USB-драйвером. Оба помечены как не проверенные на реальном устройстве. Остальные строки — требования для будущих модулей, а не заявление о поддержке.</p>
       <div class="device-table-wrap"><table class="device-table"><thead><tr><th>Устройство</th><th>Статус</th><th>Windows и драйверы</th><th>Ограничения</th></tr></thead><tbody>
-        <tr><td><strong>Kinect 360</strong><small>Kinect v1 / Xbox 360</small></td><td><span class="status-tag experimental">Экспериментальный модуль</span><small>На физическом датчике не проверен</small></td><td>Цель — Windows 10/11 x64, но сочетание libfreenect, Python-привязок и USB-драйвера на Windows не валидировано. Нужны libfreenect + модуль <code>freenect</code>, NumPy, USB-адаптер с питанием.</td><td>Калибровка глубины приближённая; цвет и глубина не совмещены; ICP может дрейфовать. Kinect SDK сам по себе не подходит этому модулю.</td></tr>
+        <tr><td><strong>Kinect 360</strong><small>Kinect v1 / Xbox 360</small></td><td><span class="status-tag experimental">Экспериментальный модуль</span><small>На физическом датчике не проверен</small></td><td><b>Рекомендуется:</b> штатный драйвер Microsoft Kinect + Kinect for Windows SDK 1.8 (pythonnet уже входит в Depth Studio). USB-драйвер не меняется. <b>Альтернатива:</b> libfreenect + модуль <code>freenect</code> с драйвером libusbK/WinUSB — он заменяет драйвер Microsoft и может сломать другие Kinect-приложения.</td><td>Калибровка глубины приближённая; цвет и глубина не совмещены; ICP может дрейфовать. Нужен штатный блок питания/USB-адаптер.</td></tr>
         <tr><td><strong>Kinect One</strong><small>Kinect v2 / Xbox One</small></td><td><span class="status-tag unavailable">Не реализован</span></td><td>Исторически Kinect for Windows SDK 2.0 на Windows 8.1/10 x64, USB 3.0-контроллер и адаптер питания. Windows 11 требует отдельной проверки.</td><td>Приложение не обнаруживает этот датчик. Нужны отдельный адаптер, проверка SDK и аппаратные тесты.</td></tr>
         <tr><td><strong>Azure Kinect DK</strong></td><td><span class="status-tag unavailable">Не реализован</span></td><td>Для будущей интеграции: Windows 10 x64, Azure Kinect Sensor SDK/прошивка и USB 3.0; доступность устаревшего SDK следует проверить.</td><td>Приложение не обнаруживает устройство. Модель снята с рынка; SDK и конкретная прошивка требуют отдельной проверки.</td></tr>
         <tr><td><strong>Intel RealSense</strong></td><td><span class="status-tag unavailable">Не реализован</span></td><td>Для будущей интеграции: Windows 10/11 x64, совместимая с моделью версия RealSense SDK 2.0 и USB 3.x.</td><td>Приложение не обнаруживает устройство. Дальность и точность зависят от модели, прошивки и условий сцены.</td></tr>
@@ -188,7 +198,7 @@ document.querySelector("#app").innerHTML = `
         <p class="env-detail" id="envDetail"></p>
         <div class="env-actions"><button class="setup-action" id="envRetryBtn">Проверить и повторить настройку</button><button class="setup-action ghost" id="envLogBtn">Журнал установки</button></div>
       </div>
-      <div class="modal-columns"><div><h3>Запуск демо</h3><p>Демо работает без датчика и Python-моста. Кнопки сканирования и экспорта в демо-режиме используют синтетическую комнату.</p></div><div><h3>Реальное устройство</h3><p>Для Kinect v1 установите Python, NumPy, Open3D, libfreenect и его Python-привязки. В Windows этот набор не проверен; инструкции и диагностика находятся в README.</p></div></div>
+      <div class="modal-columns"><div><h3>Запуск демо</h3><p>Демо работает без датчика и Python-моста. Кнопки сканирования и экспорта в демо-режиме используют синтетическую комнату.</p></div><div><h3>Реальное устройство</h3><p>Для Kinect 360 установите Kinect for Windows SDK 1.8 с сайта Microsoft: драйвер Microsoft Kinect при этом остаётся как есть, а pythonnet уже входит в Depth Studio. Вариант с libfreenect и Zadig описан в README как альтернатива с предупреждением о конфликте драйверов. Оба пути не проверены на физическом датчике в этом репозитории.</p></div></div>
       <button class="button-primary modal-done" id="modalDone"><i data-lucide="check"></i> Понятно</button>
     </div>
   </div>
@@ -429,12 +439,14 @@ async function apiRequest(path, options = {}) {
     payload = {};
   }
   if (!response.ok) {
-    const message =
+    const base =
       payload.error ||
       (response.status >= 500
         ? "Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio."
         : `Ошибка локального моста (${response.status}).`);
-    throw new Error(message);
+    // Адаптер возвращает и подсказку — она уточняет, что именно проверить.
+    const hint = typeof payload.hint === "string" && payload.hint ? ` ${payload.hint}` : "";
+    throw new Error(`${base}${hint}`);
   }
   return payload;
 }
@@ -442,17 +454,68 @@ async function apiRequest(path, options = {}) {
 function fallbackDevices() {
   return [
     {
-      id: "kinect_v1",
-      name: "Kinect 360 (Kinect v1)",
+      id: "kinect_v1_sdk",
+      name: "Kinect 360 · Microsoft Kinect SDK",
       implemented: true,
       verifiedOnHardware: false,
       dependenciesAvailable: false,
       state: "driver_missing",
       connected: null,
-      error: "Python-мост не запущен: среда Depth Studio не готова или датчик не подключён.",
-      windows: "Windows 10/11 x64 — не проверено.",
+      error:
+        "Python-мост не запущен: статус компонентов неизвестен. Деморежим работает без него.",
+      windows: "Windows 10/11 x64, драйвер Microsoft Kinect остаётся как есть.",
+      driver: "Kinect for Windows SDK 1.8 и pythonnet.",
+      limitations: "Экспериментальный, не проверен на физическом датчике.",
+      requirements: [
+        {
+          id: "kinect_sdk_runtime",
+          kind: "driver",
+          title: "Драйвер устройства · Kinect for Windows SDK 1.8",
+          detail:
+            "Статус неизвестен: нужен запущенный Python-мост. SDK ставится вручную с сайта Microsoft. " +
+            "https://www.microsoft.com/en-us/download/details.aspx?id=40278",
+          satisfied: null,
+        },
+        {
+          id: "pythonnet",
+          kind: "python",
+          title: "Компонент Python · pythonnet",
+          detail: "Статус неизвестен: нужен запущенный Python-мост Depth Studio.",
+          satisfied: null,
+        },
+      ],
+    },
+    {
+      id: "kinect_v1",
+      name: "Kinect 360 · libfreenect (альтернатива)",
+      implemented: true,
+      verifiedOnHardware: false,
+      dependenciesAvailable: false,
+      state: "driver_missing",
+      connected: null,
+      error:
+        "Python-мост не запущен: статус компонентов неизвестен. Деморежим работает без него.",
+      windows: "Windows 10/11 x64 — не проверено, нужен драйвер libusbK/WinUSB.",
       driver: "libfreenect и Python-модуль freenect.",
-      limitations: "Экспериментальный, не проверен на физическом устройстве.",
+      limitations: "Экспериментальный, не проверен на физическом устройстве; конфликтует с драйвером Microsoft Kinect.",
+      requirements: [
+        {
+          id: "libusbk_driver",
+          kind: "driver",
+          title: "Драйвер устройства · libusbK/WinUSB для Kinect",
+          detail:
+            "libfreenect требует привязки Kinect к libusbK/WinUSB (Zadig). Это заменяет драйвер Microsoft Kinect " +
+            "и может сломать другие Kinect-приложения; Depth Studio не меняет USB-драйверы автоматически.",
+          satisfied: null,
+        },
+        {
+          id: "freenect",
+          kind: "python",
+          title: "Компонент Python · freenect (libfreenect)",
+          detail: "Модуль freenect не входит в установщик: привязки нужно собирать вручную.",
+          satisfied: null,
+        },
+      ],
     },
     {
       id: "kinect_v2",
@@ -540,6 +603,56 @@ function selectedProfile() {
   return devices.find((device) => device.id === activeSource) || null;
 }
 
+function linkifyDetail(text) {
+  // Ссылки только https: приложение не открывает произвольные схемы.
+  return escapeHtml(text).replace(
+    /(https:\/\/[^\s<]+[^\s<.,;:)])/g,
+    (url) => `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`,
+  );
+}
+
+const REQUIREMENT_GROUPS = [
+  {
+    kind: "driver",
+    title: "Драйвер устройства",
+    note: "Драйверы, SDK и системные компоненты ставите вы; Depth Studio не устанавливает их автоматически.",
+  },
+  {
+    kind: "python",
+    title: "Компоненты Python",
+    note: "Входят в изолированную среду Depth Studio и ставятся установщиком.",
+  },
+];
+
+function requirementItem(item) {
+  const status = item.satisfied === true ? "ok" : item.satisfied === false ? "missing" : "unknown";
+  const mark = status === "ok" ? "✓" : status === "missing" ? "!" : "·";
+  return `<li data-status="${status}"><span class="requirement-mark">${mark}</span><div><strong>${escapeHtml(
+    item.title,
+  )}</strong><small>${linkifyDetail(item.detail)}</small></div></li>`;
+}
+
+function renderSourceRequirements(profile) {
+  const block = $("sourceRequirements");
+  if (!block) return;
+  const requirements = Array.isArray(profile?.requirements) ? profile.requirements : [];
+  if (!requirements.length) {
+    block.hidden = true;
+    block.innerHTML = "";
+    return;
+  }
+  block.hidden = false;
+  block.innerHTML = REQUIREMENT_GROUPS.map((group) => {
+    const items = requirements.filter((item) => item.kind === group.kind);
+    if (!items.length) return "";
+    return `<div class="requirements-group" data-kind="${group.kind}">
+        <span class="requirements-group-title">${group.title}</span>
+        <ul>${items.map(requirementItem).join("")}</ul>
+        <span class="requirements-note">${group.note}</span>
+      </div>`;
+  }).join("");
+}
+
 function updateSourcePanel() {
   const profile = selectedProfile();
   const dot = $("sourceDot");
@@ -550,6 +663,7 @@ function updateSourcePanel() {
     $("sourceStateMeta").textContent = "DEMO";
     $("sourceDescription").textContent =
       "Синтетическая сцена помогает проверить интерфейс и экспорт. Физический датчик не используется.";
+    renderSourceRequirements(null);
     $("verificationLabel").innerHTML =
       "<span>i</span><span>Демо не требует датчика. Аппаратная проверка не выполнялась.</span>";
     $("connectButton").innerHTML =
@@ -570,11 +684,12 @@ function updateSourcePanel() {
     );
     renderDemoFeeds();
   } else if (profile) {
+    renderSourceRequirements(profile);
     const stateLabels = {
       connected: "Поток активен",
       detected: "Датчик обнаружен",
       not_checked: "Не проверен",
-      driver_missing: "Нужны драйверы",
+      driver_missing: "Требования не выполнены",
       no_device: "Датчик не найден",
       not_implemented: "Не реализован",
     };
@@ -892,18 +1007,27 @@ async function probeDevices() {
       body: {},
     });
     devices = result.devices || devices;
+    const connected = result.connected || [];
+    // Найденный датчик становится активным источником; при двух адаптерах Kinect 360
+    // сервер отдаёт первым рекомендуемый (Microsoft Kinect SDK).
+    if (connected.length && !isScanning && activeSource === "demo") {
+      activeSource = connected[0];
+      $("sourceSelect").value = connected[0];
+    }
     renderSourceOptions();
     updateSourcePanel();
-    const connected = result.connected || [];
     if (connected.length) {
       showToast(
         `Обнаружен датчик: ${devices.find((device) => device.id === connected[0])?.name || connected[0]}.`,
         "success",
       );
     } else {
-      const experimental = devices.find((device) => device.id === "kinect_v1");
+      const preferred =
+        devices.find((device) => device.id === result.preferredSource) ||
+        devices.find((device) => device.id === "kinect_v1_sdk") ||
+        devices.find((device) => device.id === "kinect_v1");
       showToast(
-        experimental?.error ||
+        preferred?.error ||
           "Совместимый датчик не обнаружен. Проверьте питание, USB и драйверы.",
         "warning",
       );
@@ -1553,12 +1677,59 @@ function renderSetupBanner(state) {
     parts.push("Деморежим работает сразу: 3D-сцена, синтетический поток и экспорт PLY/OBJ доступны без датчика.");
   }
   $("setupText").textContent = parts.join(" ");
+  renderSetupRemedies(state);
+  renderSetupDetails(state);
   const running = state.phase === "running";
   $("setupProgressWrap").hidden = !running;
   $("setupProgressFill").style.width = `${Math.max(0, Math.min(100, state.progress || 0))}%`;
   $("setupRetryBtn").hidden = ready;
   $("setupRetryBtn").disabled = running;
   $("setupRepairBtn").disabled = running;
+}
+
+function renderSetupRemedies(state) {
+  const container = $("setupRemedies");
+  const list = $("setupRemedyList");
+  if (!container || !list) return;
+  const remedies = Array.isArray(state?.error?.remedies) ? state.error.remedies : [];
+  container.hidden = remedies.length === 0;
+  list.innerHTML = remedies
+    .map(
+      (remedy) => `<li data-relevant="${remedy.relevant ? "true" : "false"}"><strong>${escapeHtml(
+        remedy.title,
+      )}</strong><span>${escapeHtml(remedy.text)}</span></li>`,
+    )
+    .join("");
+}
+
+function renderSetupDetails(state) {
+  const details = $("setupDetails");
+  const summary = $("setupDetailsSummary");
+  const text = $("setupDetailsText");
+  if (!details || !summary || !text) return;
+  const error = state?.error;
+  const body = error?.details || "";
+  details.hidden = !body;
+  text.textContent = body;
+  if (body) {
+    const lines = body.split(/\r?\n/).length;
+    summary.textContent = `Технические подробности — вывод pip, ${lines} стр. (${
+      error?.cause ? `причина: ${error.cause}` : "см. журнал"
+    })`;
+  }
+}
+
+async function copySetupLog() {
+  try {
+    const response = await fetch("/app/setup/copy-log", { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.reason || "Журнал доступен только в установленном приложении.");
+    }
+    showToast(`Журнал и подробности ошибки скопированы (${payload.characters} символов).`, "success");
+  } catch (error) {
+    showToast(error.message, "warning");
+  }
 }
 
 function scheduleSetupPoll(delay = 1500) {
@@ -1617,6 +1788,7 @@ async function revealSetupLog() {
 $("setupRetryBtn").onclick = () => runSetupAction("retry");
 $("setupRepairBtn").onclick = () => runSetupAction("repair");
 $("setupLogBtn").onclick = revealSetupLog;
+$("setupCopyLogBtn").onclick = copySetupLog;
 $("envRetryBtn").onclick = () => runSetupAction("retry");
 $("envLogBtn").onclick = revealSetupLog;
 

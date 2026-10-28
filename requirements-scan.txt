@@ -9,7 +9,14 @@
 #   python -m pip install --only-binary=:all: --require-hashes -r requirements-scan.lock.txt
 numpy==1.26.4
 open3d==0.18.0
+# pythonnet bridges Python to .NET, so the Kinect 360 adapter can use the
+# officially installed Microsoft Kinect SDK 1.8 without replacing the Kinect USB
+# driver. Pure-Python wheel; brings clr-loader, cffi and pycparser (pinned in the
+# lock files with SHA-256).
+pythonnet==3.2.1
 
 # freenect (libfreenect Python binding) is intentionally NOT listed: it is a
-# native binding that needs a matching USB driver. Depth Studio never installs
-# USB drivers, SDKs or system sensor components without explicit consent.
+# native binding that needs a matching libusbK/WinUSB driver, which replaces the
+# Microsoft Kinect driver and can break other Kinect applications. Depth Studio
+# never installs USB drivers, SDKs or system sensor components without explicit
+# consent.
