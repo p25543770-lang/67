@@ -4,7 +4,25 @@ on:
   push:
     branches: [main, "arena/**"]
 jobs:
+  renderer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build renderer
+        run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: depth-studio-renderer
+          path: dist/
+          retention-days: 1
+
   build:
+    needs: renderer
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,16 +35,20 @@ jobs:
           python-version: "3.11"
       - run: npm ci
       - run: npm run test:python
-      - name: Build Windows installer
+      - uses: actions/download-artifact@v4
+        with:
+          name: depth-studio-renderer
+          path: dist/
+      - name: Package Windows installer
         shell: pwsh
         timeout-minutes: 10
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
-          npm run build:win 2>&1 | Tee-Object -FilePath build-win.log
+          npx electron-builder --win nsis --x64 2>&1 | Tee-Object -FilePath package-win.log
           $buildExitCode = $LASTEXITCODE
           if ($buildExitCode -ne 0) {
-            Get-Content build-win.log | Select-Object -Last 40 | ForEach-Object {
+            Get-Content package-win.log | Select-Object -Last 40 | ForEach-Object {
               Write-Output "::error::$_"
             }
             exit $buildExitCode
