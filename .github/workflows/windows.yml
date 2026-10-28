@@ -92,8 +92,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Не удалось собрать встроенную среду Python.'; exit 1 }
           $manifest = Get-Content python-bundle/manifest.json -Raw | ConvertFrom-Json
           Write-Output "::notice::Bundled Python $($manifest.python.version); pinned SHA-256: $($manifest.python.pinned); wheels: $($manifest.wheels.count)"
+          Write-Output "::notice::python.org archive SHA-256: $($manifest.python.archiveSha256)"
           $size = (Get-ChildItem python-bundle -Recurse -File | Measure-Object -Property Length -Sum).Sum
           Write-Output "::notice::Python bundle size: $([math]::Round($size / 1MB, 1)) MiB"
+          if (-not $manifest.python.pinned) {
+            Write-Output '::warning::SHA-256 архива python.org ещё не закреплён в python-lock.json — резервная загрузка Python отключена до закрепления.'
+          }
 
       - id: electron-cache
         uses: actions/cache/restore@v4
@@ -154,7 +158,7 @@ jobs:
           }
           $required = @(
             'resources\python-runtime\python.exe',
-            'resources\python-runtime\Lib\site-packages',
+            'resources\python-runtime\python311._pth',
             'resources\python-wheels',
             'resources\python-lock.json',
             'resources\requirements-scan.lock.txt',
@@ -165,6 +169,11 @@ jobs:
               Write-Output "::error::В установщике нет обязательного компонента: $relative"
               exit 1
             }
+          }
+          $pth = Get-Content 'release/win-unpacked/resources/python-runtime/python311._pth' -Raw
+          if ($pth -notmatch 'site-packages' -or $pth -notmatch 'import site') {
+            Write-Output '::error::python311._pth не подключает site-packages — встроенный Python не увидит пакеты.'
+            exit 1
           }
           $wheels = (Get-ChildItem 'release/win-unpacked/resources/python-wheels' -Filter '*.whl' -File).Count
           Write-Output "::notice::Bundled wheels: $wheels"
