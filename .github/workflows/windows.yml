@@ -1,11 +1,11 @@
-name: Build Windows application
+name: Build Windows installer
 on:
   workflow_dispatch:
   push:
-    branches: [main, 'arena/**']
+    branches: [main, "arena/**"]
 jobs:
-  build:
-    runs-on: windows-latest
+  renderer:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -13,9 +13,100 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build:win
+      - name: Build renderer
+        run: npm run build
       - uses: actions/upload-artifact@v4
         with:
-          name: Depth-Studio-Windows
-          path: release/*.exe
+          name: depth-studio-renderer
+          path: dist/
+          retention-days: 1
+
+  build:
+    needs: renderer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - run: npm run test:python
+      - uses: actions/download-artifact@v4
+        with:
+          name: depth-studio-renderer
+          path: dist/
+      - id: electron-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-builder-
+      - name: Package Windows application
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          npx electron-builder --win --x64 --dir --publish never 2>&1 | Tee-Object -FilePath package-win.log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            Get-Content package-win.log | Select-Object -Last 40 | ForEach-Object {
+              Write-Output "::error::$_"
+            }
+            exit $buildExitCode
+          }
+      - name: Create NSIS installer
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked --publish never 2>&1 | Tee-Object -FilePath nsis-win.log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            Get-Content nsis-win.log | Select-Object -Last 40 | ForEach-Object {
+              Write-Output "::error::$_"
+            }
+            exit $buildExitCode
+          }
+      - name: Validate NSIS installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release -Filter 'Depth-Studio-Setup-*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          if ($null -eq $installer) {
+            Write-Output '::error::The NSIS installer was not created.'
+            exit 1
+          }
+          $appBytes = (Get-ChildItem release/win-unpacked -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          Write-Output "::notice::Installer size: $($installer.Length) bytes; unpacked app: $appBytes bytes."
+          if ($installer.Length -lt 50MB) {
+            Write-Output "::error::Installer appears incomplete: only $($installer.Length) bytes."
+            exit 1
+          }
+          $stream = [IO.File]::OpenRead($installer.FullName)
+          try {
+            $signature = New-Object byte[] 2
+            [void]$stream.Read($signature, 0, 2)
+          } finally {
+            $stream.Dispose()
+          }
+          if ($signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
+            Write-Output '::error::Installer does not have a valid Windows executable signature.'
+            exit 1
+          }
+          Write-Output "Validated $($installer.Name): $($installer.Length) bytes."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Depth-Studio-Windows-Installer
+          path: release/Depth-Studio-Setup-*.exe
           if-no-files-found: error
+          retention-days: 14
+      - name: Save Electron tool cache
+        if: always() && steps.electron-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
