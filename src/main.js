@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from "./readiness.js";
 import { apiRequest } from "./api.js";
+import { formatFps, formatSpeed } from "./metrics.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import Box from "lucide/dist/esm/icons/box.js";
 import Radio from "lucide/dist/esm/icons/radio.js";
@@ -44,7 +45,7 @@ document.querySelector("#app").innerHTML = `
     <div class="topbar-right">
       <div class="connection-pill" id="headerConnection"><span class="status-dot"></span><span id="headerStatus">Демо-режим</span></div>
       <button class="top-icon" id="helpBtn" aria-label="Помощь и требования" title="Помощь и требования"><i data-lucide="circle-help"></i></button>
-      <span class="version-tag">BETA · 1.1</span>
+      <span class="version-tag">BETA · 1.2.1</span>
     </div>
   </header>
 
@@ -172,9 +173,14 @@ document.querySelector("#app").innerHTML = `
           <div class="section-heading compact-heading"><div><span class="section-kicker">02 / СЪЁМКА</span><h2>Состояние трекинга</h2></div><span class="heading-icon"><i data-lucide="activity"></i></span></div>
           <div class="tracking-summary" id="trackingSummary" data-status="demo"><span class="summary-icon">✳</span><div><strong id="trackingSummaryTitle">Демонстрация</strong><small id="trackingSummaryText">Перейдите на источник глубины, чтобы сканировать комнату.</small></div></div>
           <div class="warning-box" id="warningBox" hidden><span class="warning-mark">!</span><span id="warningText"></span></div>
-          <div class="tracking-metrics"><div><span>СКОРОСТЬ</span><strong id="speedMetric">— м/с</strong></div><div><span>СОСТОЯНИЕ</span><strong id="stateMetric">Демо</strong></div></div>
+          <div class="tracking-metrics">
+            <div><span>СКОРОСТЬ · ОЦЕНКА</span><strong id="speedMetric">— км/ч</strong></div>
+            <div><span>FPS · ЗАХВАТ / ОБРАБОТКА</span><strong id="fpsMetric">— / —</strong></div>
+            <div><span>ПРОПУЩЕНО КАДРОВ</span><strong id="droppedMetric">—</strong></div>
+            <div><span>СОСТОЯНИЕ</span><strong id="stateMetric">Демо</strong></div>
+          </div>
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
-          <p class="movement-hint">Двигайте датчик плавно, примерно до <b>0,45 м/с</b>. Оставляйте в кадре часть уже увиденной поверхности.</p>
+          <p class="movement-hint">Цель — до <b>7 км/ч</b> при плавном движении и перекрытии кадров. Kinect v1 даёт до 30 FPS; обработка может быть медленнее. Новые проходы обрабатывают глубину 320×240 вместо 640×480. Скорость не гарантируется.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
@@ -791,9 +797,11 @@ function setTracking(status, speed, warning, title = "", text = "") {
     (warning ? "Смотрите подсказку ниже и скорректируйте движение." : "");
   $("stateMetric").textContent = status === "demo" ? "Демо" : display;
   $("speedMetric").textContent =
-    status === "demo" || status === "idle" || status === "stopped"
-      ? "— м/с"
-      : `${Number(speed || 0).toFixed(2)} м/с`;
+    status === "demo" || status === "idle" || status === "stopped" ? formatSpeed(null) : formatSpeed(speed);
+  if (status === "demo") {
+    $("fpsMetric").textContent = "— / —";
+    $("droppedMetric").textContent = "—";
+  }
   $("warningBox").hidden = !warning;
   if (warning) $("warningText").textContent = warning;
   $("liveIndicator").classList.toggle(
@@ -1406,6 +1414,9 @@ async function refreshScan() {
       $("depthFrameLabel").textContent = hasDepth ? "LIVE · DEPTH" : "NO DEPTH";
       $("feedState").textContent = "ПОТОК АКТИВЕН · СКАНИРОВАНИЕ";
     }
+    const performance = data.performance;
+    $("fpsMetric").textContent = `${formatFps(performance?.captureFps)} / ${formatFps(performance?.processingFps)}`;
+    $("droppedMetric").textContent = Number.isFinite(performance?.droppedFrames) ? String(performance.droppedFrames) : "—";
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
     const tracking = data.tracking || (isScanning ? "tracking" : "stopped");
@@ -1428,7 +1439,7 @@ async function refreshScan() {
       scanPhase === "merging" ? "Выполняется выравнивание сохранённых проходов." :
       isScanning ? "Сохраняйте перекрытие между кадрами и избегайте резких поворотов." :
       hasScan ? "Результат сохранён; экспорт содержит сетку и вершинные цвета." : "Подключите источник и начните новый проход.";
-    setTracking(tracking, data.speedMps || 0, warning, title, text);
+    setTracking(tracking, data.speedMps ?? null, warning, title, text);
     if (hasScan) $("sceneModeLabel").textContent = data.lastResultId === "merged" ? "ОБЪЕДИНЁННЫЕ ПРОХОДЫ" : "РЕЗУЛЬТАТ ПРОХОДА";
     const processing = isScanInProgress(scanPhase, isScanning);
     if (!processing && scanTimer) { clearInterval(scanTimer); scanTimer = null; }

@@ -226,6 +226,22 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(all(value == 0 for value in sensor.DepthStream.timeouts))
         self.assertIn("Microsoft.Kinect", env.calls)
 
+    def test_packed_depth_is_exact_integer_millimetres(self):
+        raw = np.array([999 << 3, (1001 << 3) | 3, 1501 << 3, 1999 << 3], dtype=np.uint16)
+        frame = sdk.depth_and_color_to_frame(raw, 4, 1, None, None, None, captured_at=5.0)
+        np.testing.assert_array_equal(frame.depth_mm, [[999, 1001, 1501, 1999]])
+        self.assertEqual(frame.captured_at, 5.0)
+
+    def test_missing_rgb_does_not_delay_or_retimestamp_depth_by_hundreds_of_ms(self):
+        clock = [10.0]
+        with AdapterEnvironment(depth_frames=[FakeFrame(depth_pixels(1200))], color_frames=[]) as env:
+            env.adapter._clock = lambda: clock[0]
+            env.adapter._sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+            frame = env.adapter.capture()
+        self.assertEqual(frame.captured_at, 10.0)  # before the short RGB wait
+        self.assertLessEqual(clock[0] - frame.captured_at, 0.02)
+        self.assertIn("RGB", frame.warning)
+
     def test_zero_depth_pixels_are_not_turned_into_points(self):
         pixels = np.zeros(640 * 480, dtype=np.int16)
         pixels[0] = 1500 << 3  # один валидный пиксель

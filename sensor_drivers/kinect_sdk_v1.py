@@ -41,9 +41,9 @@ SDK_RELATIVE_PATH = os.path.join("Microsoft SDKs", "Kinect", "v1.8", "Assemblies
 SDK_DOWNLOAD_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=40278"
 SDK_ASSEMBLY_ENV = "DEPTH_STUDIO_KINECT_SDK_DLL"
 
-DEFAULT_MAX_FPS = 15.0
+DEFAULT_MAX_FPS = 30.0
 DEFAULT_FRAME_TIMEOUT = 1.5
-POLL_INTERVAL = 0.01
+POLL_INTERVAL = 0.002
 # Kinect v1 даёт 640x480 при 30 к/с; внутренние параметры — приближённые.
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
@@ -200,7 +200,9 @@ def depth_and_color_to_frame(
             f"Кадр глубины короче ожидаемого: {pixels.size} пикселей вместо {expected}."
         )
     depth_u16 = pixels[:expected].reshape(height, width)
-    depth_m = depth_pixels_to_metres(depth_u16)
+    # Packed SDK depth is already integer millimetres in the upper bits.
+    # Avoid a full-frame float conversion and a lossy round trip through metres.
+    depth_mm = np.right_shift(depth_u16, PLAYER_INDEX_BITS)
 
     color_rgb = None
     if color_bytes:
@@ -211,8 +213,8 @@ def depth_and_color_to_frame(
             # ColorImageFrame даёт BGRA; приложению нужен RGB.
             color_rgb = np.ascontiguousarray(bgra[:, :, 2::-1])
 
-    sampled_mm = depth_u16[::4, ::4]
-    sampled_z = depth_m[::4, ::4]
+    sampled_mm = depth_mm[::4, ::4]
+    sampled_z = sampled_mm.astype(np.float32) / 1000.0
     v, u = np.indices(sampled_z.shape, dtype=np.float32)
     u = u * 4
     v = v * 4
@@ -229,10 +231,6 @@ def depth_and_color_to_frame(
     x = (u - cx) * sampled_z / fx
     y = -(v - cy) * sampled_z / fy
     points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
-
-    depth_mm = np.zeros((height, width), dtype=np.uint16)
-    valid_full = (depth_u16 > 0) & np.isfinite(depth_m) & (depth_m > 0)
-    depth_mm[valid_full] = np.clip(depth_m[valid_full] * 1000.0, 1, 65535).astype(np.uint16)
 
     return SensorFrame(
         color_rgb,
@@ -380,14 +378,14 @@ class KinectSdkV1Adapter(SensorAdapter):
         *,
         max_fps: float = DEFAULT_MAX_FPS,
         frame_timeout: float = DEFAULT_FRAME_TIMEOUT,
-        color_timeout: float = 0.4,
+        color_timeout: float = 0.015,
         env: dict[str, str] | None = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
         self.max_fps = max(1.0, float(max_fps))
         self.frame_timeout = max(0.05, float(frame_timeout))
-        self.color_timeout = max(0.05, float(color_timeout))
+        self.color_timeout = max(0.0, float(color_timeout))
         self._env = env
         self._clock = clock
         self._sleep = sleep
@@ -597,6 +595,8 @@ class KinectSdkV1Adapter(SensorAdapter):
                     "Проверьте питание и USB, закройте другие Kinect-приложения и повторите.",
                 )
             width, height, depth_bytes = depth
+            # Measure the depth instant, not the later RGB wait/conversion time.
+            captured_at = self._clock()
             color = None
             color_warning = ""
             try:
@@ -618,6 +618,7 @@ class KinectSdkV1Adapter(SensorAdapter):
                 color[2] if color else None,
                 color[0] if color else None,
                 color[1] if color else None,
+                captured_at=captured_at,
             )
             frame.warning = color_warning
             return frame

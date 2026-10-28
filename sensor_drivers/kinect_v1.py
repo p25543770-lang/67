@@ -116,6 +116,7 @@ class KinectV1Adapter(SensorAdapter):
         try:
             raw_result = freenect.sync_get_depth()
             raw_depth = self._unwrap(raw_result)
+            captured_at = time.monotonic()
             if raw_depth is None:
                 raise RuntimeError("Kinect не вернул кадр глубины.")
             raw_depth = np.asarray(raw_depth)
@@ -133,7 +134,7 @@ class KinectV1Adapter(SensorAdapter):
                     if video.ndim != 3 or video.shape[2] < 3:
                         video = None
                     else:
-                        video = np.ascontiguousarray(video[:, :, :3])
+                        video = np.array(video[:, :, :3], dtype=np.uint8, order="C", copy=True)
             except Exception:
                 # A depth frame is still useful if the optional RGB stream fails.
                 video = None
@@ -163,7 +164,7 @@ class KinectV1Adapter(SensorAdapter):
             depth_mm = np.zeros(raw_depth.shape, dtype=np.uint16)
             valid_full = (raw_depth < 2047) & np.isfinite(depth_m) & (depth_m > 0)
             depth_mm[valid_full] = np.clip(depth_m[valid_full] * 1000.0, 1, 65535).astype(np.uint16)
-            return SensorFrame(video, depth_mm, points, time.time(),
+            return SensorFrame(video, depth_mm, points, captured_at,
                                "Kinect v1 approximate depth formula; RGB/depth are not registered")
         except RuntimeError:
             raise

@@ -4,11 +4,10 @@
 накапливала ошибку (дрейф). Здесь каждый кадр сравнивается с общей моделью сцены.
 
 Этапы на кадр:
-1. начальная оценка — последняя принятая поза (как в KinectFusion). Постоянная скорость
-   здесь не используется: ошибки ICP попадают в оценку скорости и усиливаются от кадра
-   к кадру (проверено на синтетике: ошибка предсказания росла ×2.5 за кадр);
+1. начальная оценка — последняя принятая поза; при достаточно быстром движении
+   ограниченный по времени и скорости прогноз переноса помогает не потерять перекрытие;
 2. обрезка модели по видимому фрустуму камеры;
-3. ICP point-to-plane в три масштаба (5, 2.5, 1.2 см) по нормалям модели из TSDF;
+3. ICP point-to-plane в два масштаба (4 и 2 см) по нормалям модели из TSDF;
 4. проверка вырождения (как в KinectFusion): собственные значения 6x6 гессиана
    point-to-plane по соответствиям в финальной позе. Если наименьшее собственное
    значение пренебрежимо мало, ICP скользит вдоль плоскости (стена без признаков) —
@@ -20,8 +19,6 @@
 («lost» на большинстве кадров), а точечный point-to-plane держал 120 кадров с ошибкой
 ≤5 мм. Флаг ``use_color_icp`` оставлен для экспериментов. Цвет используется для текстуры
 меша (см. texture.py).
-
-Стартовая оценка позы — последняя принятая поза, без экстраполяции скорости (см. пункт 1).
 
 Модель подготавливается один раз на её версию (даунсэмпл по масштабам), поэтому на кадр
 остаются обрезка и ICP по небольшим облакам.
@@ -42,6 +39,15 @@ DEGENERACY_RATIO = 1e-3            # λmin/λmax гессиана ниже — I
 MIN_MODEL_POINTS = 500
 MIN_SOURCE_POINTS = 400
 MAX_SOURCE_POINTS = 6000
+# На границе 7 км/ч погрешность ICP в несколько миллиметров не должна сама
+# приводить к отбраковке. Это допуск измерения, а не гарантия фактической скорости.
+SPEED_STEP_TOLERANCE_M = 0.006
+PREDICT_MIN_SPEED_MPS = 0.7
+PREDICT_MAX_SECONDS = 0.35
+RECOVERY_RADIUS_M = 0.05
+RECOVERY_ROTATION_DEG = 5.0
+PREDICTION_CORRECTION_MIN_M = 0.025
+PREDICTION_CORRECTION_RATIO = 0.35
 
 
 @dataclass
@@ -78,43 +84,29 @@ def crop_model_to_view(points, normals, colors, intrinsics: Intrinsics, pose_wc,
     return points[keep], normals[keep], colors[keep]
 
 
-def geometric_rmse(source, target, transform, max_distance: float) -> float:
-    import open3d as o3d
-
-    src = o3d.geometry.PointCloud(source)
-    src.transform(transform)
-    result = o3d.pipelines.registration.evaluate_registration(src, target, max_distance, np.eye(4))
-    return float(result.inlier_rmse) if len(result.correspondence_set) else float("inf")
-
-
-def degeneracy_ratio(source, target, transform, max_distance: float) -> float:
-    """λmin/λmax гессиана point-to-plane в позе ``transform`` (1.0 — хорошо, ~0 — вырождено).
-
-    Гессиан A = Σ JᵀJ по соответствиям, J = [p×n, n]. Малое λmin означает направление
-    (например, сдвиг вдоль стены), которое ICP не наблюдает.
-    """
+def registration_diagnostics(source, target, transform, max_distance: float) -> tuple[float, float]:
+    """One correspondence search for geometric RMS and the point-to-plane Hessian."""
     import open3d as o3d
 
     if source is None or target is None or len(source.points) == 0:
-        return 0.0
+        return float("inf"), 0.0
     src = o3d.geometry.PointCloud(source)
     src.transform(transform)
     result = o3d.pipelines.registration.evaluate_registration(src, target, max_distance, np.eye(4))
     pairs = np.asarray(result.correspondence_set)
+    rmse = float(result.inlier_rmse) if len(pairs) else float("inf")
     if len(pairs) < 6:
-        return 0.0
+        return rmse, 0.0
     points = np.asarray(src.points)[pairs[:, 0]]
     normals = np.asarray(target.normals)[pairs[:, 1]]
     jac = np.hstack((np.cross(points, normals), normals))
-    hessian = jac.T @ jac
-    eig = np.linalg.eigvalsh(hessian)
-    if eig[-1] <= 0:
-        return 0.0
-    return float(max(eig[0], 0.0) / eig[-1])
+    eig = np.linalg.eigvalsh(jac.T @ jac)
+    ratio = float(max(eig[0], 0.0) / eig[-1]) if eig[-1] > 0 else 0.0
+    return rmse, ratio
 
 
 class PreparedModel:
-    """Модель в трёх масштабах: точки, нормали и цвет (кэш на версию модели)."""
+    """Модель в двух масштабах: точки, нормали и цвет (кэш на версию модели)."""
 
     def __init__(self, points, normals, colors):
         import open3d as o3d
@@ -144,6 +136,8 @@ class FrameToModelTracker:
         self.settings = settings
         self.pose: np.ndarray | None = None      # последняя принятая поза
         self._previous_pose: np.ndarray | None = None
+        self._last_accepted_dt: float | None = None
+        self._recovery_state: str | None = None
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
         self.last_result: TrackResult | None = None
@@ -151,6 +145,8 @@ class FrameToModelTracker:
     def reset(self, pose: np.ndarray | None = None) -> None:
         self.pose = None if pose is None else np.array(pose, dtype=np.float64)
         self._previous_pose = None
+        self._last_accepted_dt = None
+        self._recovery_state = None
         self._prepared = None
         self.last_result = None
 
@@ -163,8 +159,22 @@ class FrameToModelTracker:
         self._prepared = PreparedModel(points, normals, colors)
         self._prepared_version = version
 
-    def _predict(self) -> np.ndarray:
-        return np.eye(4) if self.pose is None else self.pose
+    def _predict(self, dt: float) -> np.ndarray:
+        predicted = np.eye(4) if self.pose is None else self.pose.copy()
+        if (self.pose is None or self._previous_pose is None or not self._last_accepted_dt or
+                (self.last_result is not None and self.last_result.state != "ok")):
+            return predicted
+        if dt > PREDICT_MAX_SECONDS:
+            return predicted
+        delta = self.pose[:3, 3] - self._previous_pose[:3, 3]
+        speed = float(np.linalg.norm(delta)) / self._last_accepted_dt
+        # Do not extrapolate the small noisy steps common when scanning slowly.
+        if speed < PREDICT_MIN_SPEED_MPS:
+            return predicted
+        horizon = min(dt, self._last_accepted_dt * 3.0)
+        direction = delta / max(float(np.linalg.norm(delta)), 1e-12)
+        predicted[:3, 3] += direction * min(speed, self.settings.max_speed_mps) * horizon
+        return predicted
 
     def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None) -> TrackResult:
         """Оценить позу кадра относительно подготовленной модели.
@@ -174,7 +184,7 @@ class FrameToModelTracker:
         import open3d as o3d
 
         dt = dt if dt and dt > 0 else 1.0 / TARGET_FPS
-        predicted = self._predict()          # начальная оценка = последняя принятая поза
+        predicted = self._predict(dt)
 
         if self._prepared is None or self.pose is None:
             # Первый кадр прохода: модели ещё нет, поза задаёт начало координат.
@@ -193,7 +203,8 @@ class FrameToModelTracker:
         source_world = cam_points @ predicted[:3, :3].T + predicted[:3, 3]
         source_base = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source_world))
         source_base.colors = o3d.utility.Vector3dVector(np.clip(cam_colors, 0.0, 1.0))
-        source_base.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=20))
+        # Point-to-plane ICP uses the model normals; source normals are only
+        # required by the optional colored ICP. Avoid estimating them twice.
 
         transform = np.eye(4)
         fitness = rmse = 0.0
@@ -212,7 +223,8 @@ class FrameToModelTracker:
             target.normals = o3d.utility.Vector3dVector(vn)
             target.colors = o3d.utility.Vector3dVector(vc)
             source = source_base.voxel_down_sample(level["radius"])
-            source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=level["radius"] * 2, max_nn=30))
+            if self.settings.use_color_icp:
+                source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=level["radius"] * 2, max_nn=30))
             criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
                 relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=level["iterations"])
             try:
@@ -223,7 +235,8 @@ class FrameToModelTracker:
                     method = "colored_icp"
                 else:
                     icp = o3d.pipelines.registration.registration_icp(
-                        source, target, level["radius"] * 2, transform,
+                        source, target,
+                        max(level["radius"] * 2, min(0.25, self.settings.max_speed_mps * dt + 0.03)), transform,
                         o3d.pipelines.registration.TransformationEstimationPointToPlane(), criteria)
                     method = "point_to_plane_icp"
             except RuntimeError:
@@ -232,11 +245,9 @@ class FrameToModelTracker:
             transform = np.asarray(icp.transformation)
             fitness = float(icp.fitness)
             finest_source, finest_target = source, target
-        # RMS — геометрическая (точка–точка) на самом тонком масштабе: цветной член его не искажает.
-        rmse = geometric_rmse(finest_source, finest_target, transform, INLIER_DISTANCE_M)
-
+        # Одни и те же соответствия используются для RMS и проверки вырождения.
+        rmse, ratio = registration_diagnostics(finest_source, finest_target, transform, INLIER_DISTANCE_M)
         candidate = transform @ predicted
-        ratio = degeneracy_ratio(finest_source, finest_target, transform, INLIER_DISTANCE_M)
         if fitness < self.settings.icp_max_fitness_loss or rmse > self.settings.icp_max_rmse_m:
             return self._reject("lost", predicted, "icp_residual", fitness, rmse, method=method,
                                 extra={"eigenRatio": ratio})
@@ -245,13 +256,28 @@ class FrameToModelTracker:
                                 extra={"eigenRatio": ratio})
 
         step_m, step_deg = relative_motion(self.pose, candidate)
-        speed = step_m / dt
         angular = np.radians(step_deg) / dt
-        if speed > self.settings.max_speed_mps or angular > self.settings.max_angular_rps:
+        if self._recovery_state and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
+            return self._reject(self._recovery_state, predicted, "return_to_last_pose", fitness, rmse,
+                                step_m, step_deg, method=method)
+        if step_m > self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M or angular > self.settings.max_angular_rps:
+            self._recovery_state = "too_fast"
             return self._reject("too_fast", predicted, "speed_limit", fitness, rmse, step_m, step_deg,
                                 method=method)
+        predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
+        correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
+        if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
+                                                      predicted_step * PREDICTION_CORRECTION_RATIO):
+            # A sudden stop/turn or weak geometry can make ICP confidently slide
+            # along a wall. Refuse to fuse the ambiguous frame rather than turn a
+            # large prediction disagreement into a silently corrupted mesh.
+            self._recovery_state = "lost"
+            return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
 
+        self._recovery_state = None
         self._accept(candidate)
+        self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
                                        method=method, extra={"viewPoints": view_size})
         return self.last_result

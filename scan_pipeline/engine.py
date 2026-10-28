@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 
@@ -13,7 +14,7 @@ import numpy as np
 
 from . import cleanup, texture
 from .camera import Intrinsics, depth_to_points_rgb, invert_pose
-from .config import FRAME_BUDGET_MS, DegradationNote, ScanSettings
+from .config import FRAME_BUDGET_MS, TARGET_FPS, DegradationNote, ScanSettings
 from .fusion import TsdfFusion
 from .quality import HINTS, assess_frame
 from .tracking import FrameToModelTracker, KeyframePolicy
@@ -44,21 +45,30 @@ class ScanEngine:
         self.warning = ""
         self.budget_reached = False
         self.disk_low = False
+        self.disk_error = ""
         self.last_pose = None
         self.last_quality = None
         self.last_step = (0.0, 0.0)
+        self.last_speed_mps: float | None = None
         self._recent_integrate: deque[float] = deque(maxlen=TIMING_WINDOW)
         self._memory_keyframes: list[dict] | None = [] if keep_keyframes_in_memory else None
-        self._last_capture_at = None
+        self._last_accepted_capture_at = None
         self._model_version = 0
 
     # ----- вход ---------------------------------------------------------------
     def process(self, depth_mm, color_rgb, captured_at: float | None = None) -> dict:
         now = self.clock()
+        try:
+            captured_at = float(captured_at) if captured_at is not None else None
+            if captured_at is not None and not math.isfinite(captured_at):
+                captured_at = None
+        except (TypeError, ValueError):
+            captured_at = None
         self.frames_seen += 1
         quality = assess_frame(depth_mm, color_rgb, self.settings)
         self.last_quality = quality
         if not quality.usable:
+            self.last_speed_mps = None
             self.rejected[quality.state] = self.rejected.get(quality.state, 0) + 1
             self._set_state(quality.state, quality.state)
             return self._event(False, quality.state)
@@ -70,10 +80,14 @@ class ScanEngine:
             depth = depth[::stride, ::stride]
             color = color[::stride, ::stride]
         depth_m = depth.astype(np.float32) / 1000.0
-        cam_points, cam_colors = depth_to_points_rgb(depth_m, color, self.intrinsics)
+        cam_points, cam_colors = depth_to_points_rgb(
+            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride)
 
-        result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=self._dt(captured_at))
+        dt = self._dt(captured_at)
+        result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt)
         self.last_step = (result.step_m, result.step_deg)
+        self.last_speed_mps = (result.step_m / dt if dt and result.state in ("ok", "too_fast")
+                               and result.reason not in ("first_frame", "return_to_last_pose") else None)
         if result.state == "lost":
             self.rejected["lost"] += 1
             self._set_state("lost", "lost")
@@ -83,6 +97,9 @@ class ScanEngine:
             self._set_state("too_fast", "too_fast")
             return self._event(False, "too_fast", result)
 
+        if captured_at is not None and (self._last_accepted_capture_at is None or
+                                        captured_at > self._last_accepted_capture_at):
+            self._last_accepted_capture_at = captured_at
         self.frames_tracked += 1
         if result.fitness:
             self.fitness_values.append(result.fitness)
@@ -111,12 +128,11 @@ class ScanEngine:
         return np.ascontiguousarray(color)
 
     def _dt(self, captured_at):
-        """Интервал между кадрами для порогов скорости; None, если времени нет или оно странное."""
-        previous, self._last_capture_at = self._last_capture_at, captured_at
-        if captured_at is None or previous is None:
+        """Время с последней принятой позы, не с последнего отбракованного кадра."""
+        if captured_at is None or self._last_accepted_capture_at is None:
             return None
-        dt = captured_at - previous
-        return dt if 0.005 < dt < 1.0 else None
+        dt = captured_at - self._last_accepted_capture_at
+        return dt if dt > 0.001 else None
 
     def _integrate(self, depth, color, pose, captured_at) -> bool:
         elapsed = self.fusion.integrate(depth, color, self.intrinsics, pose)
@@ -129,7 +145,8 @@ class ScanEngine:
                                            captured_at if captured_at is not None else time.time())
             except OSError as exc:  # диск заполнен или заблокирован: честно сообщаем
                 self.disk_low = True
-                self.warning = f"Не удалось сохранить кадр на диск: {exc}"
+                self.disk_error = f"Не удалось сохранить кадр на диск: {exc}"
+                self.warning = self.disk_error
         if self._memory_keyframes is not None:
             self._memory_keyframes.append({"index": index, "depth_mm": depth.copy(),
                                            "color": color.copy(), "pose": np.array(pose),
@@ -152,7 +169,7 @@ class ScanEngine:
         self.tracker.set_model(model, self._model_version)
 
     def _maybe_degrade(self) -> None:
-        """Если интеграция не укладывается в 40 мс, уменьшить разрешение и честно сообщить."""
+        """Если интеграция превышает бюджет кадра, предупредить или снизить разрешение."""
         if len(self._recent_integrate) < TIMING_WINDOW:
             return
         median = float(np.median(self._recent_integrate))
@@ -214,7 +231,9 @@ class ScanEngine:
             self._refresh_model()
             self.policy.reset(last, self.clock())
             self.last_pose = last
-            self.intrinsics = kf["intrinsics"]
+            # The new frames use this pass's active stride, which may differ
+            # from the last saved keyframe after adaptive degradation/migration.
+            self.intrinsics = self.base_intrinsics.downscaled(self.settings.depth_stride)
         return count
 
     def model_points(self, max_points: int = 14000):
@@ -238,6 +257,7 @@ class ScanEngine:
             "icpFitnessMean": None if fitness is None else round(fitness, 3),
             "icpRmsMmMean": None if rmse is None else round(rmse * 1000.0, 2),
             "acceptedRatio": round(self.frames_tracked / self.frames_seen, 3) if self.frames_seen else None,
+            "diskWriteError": self.disk_error if self.disk_low else None,
         }
 
     def pipeline_info(self) -> dict:
@@ -248,6 +268,8 @@ class ScanEngine:
             "truncMm": round(self.settings.sdf_trunc_m * 1000.0, 2),
             "resolution": [self.intrinsics.width, self.intrinsics.height],
             "baseResolution": [self.base_intrinsics.width, self.base_intrinsics.height],
+            "trackingStride": self.settings.tracking_stride,
+            "targetFps": TARGET_FPS,
             "degraded": bool(self.degradations),
             "degradations": [note.__dict__ for note in self.degradations],
             "memoryEstimateMb": round(self.fusion.memory_estimate_mb(), 1),
@@ -291,6 +313,7 @@ class ScanEngine:
             "integratedFrames": self.integrated,
             "quality": self.quality_summary(),
             "pipeline": self.pipeline_info(),
+            "warnings": [self.disk_error] if self.disk_low and self.disk_error else [],
             "verifiedOnHardware": False,
         }
         return arrays, metrics

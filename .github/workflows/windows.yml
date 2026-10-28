@@ -328,9 +328,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка установленного Open3D-конвейера на синтетическом кадре.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка синтетических тестов скорости, пропусков или потери трекинга.'; exit 1 }
           & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами через pythonnet.'; exit 1 }
-          Write-Output '::notice::Установленный конвейер и .NET-массивы проверены без физического Kinect.'
+          Write-Output '::notice::Установленный конвейер, синтетическая скорость и .NET-массивы проверены без физического Kinect.'
 
       - name: Second launch reuses the prepared environment
         shell: pwsh

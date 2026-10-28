@@ -23,6 +23,7 @@ import numpy as np
 
 import server
 from scan_pipeline import runner as runner_module
+from scan_pipeline.storage import PassStore
 from sensor_drivers.base import SensorAdapter, SensorFrame
 from sensor_drivers.kinect_sdk_v1 import KinectSdkUnavailable
 from sensor_drivers.registry import ADAPTERS
@@ -521,6 +522,130 @@ class ScanApiTests(unittest.TestCase):
         self.assertEqual(result[0][0], 200, result)
         self.assertIsNone(server.scan_start_pending)
         self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+
+    def test_slow_processing_drops_frames_reports_both_rates_and_warns(self):
+        class SlowEngine(FakeEngine):
+            def process(self, depth, color, captured_at):
+                time.sleep(0.12)
+                return super().process(depth, color, captured_at)
+
+        with mock.patch.object(runner_module, "ScanEngine", SlowEngine):
+            self.connect()
+            self.start()
+            live = self.wait_for(lambda s: s.get("performance") and
+                                 s["performance"]["elapsedSeconds"] >= 2 and
+                                 s["performance"]["processingFps"] is not None, timeout=8)
+            perf = live["performance"]
+            self.assertGreater(perf["captureFps"], perf["processingFps"] * 2)
+            self.assertGreater(perf["droppedFrames"], 0)
+            self.assertGreaterEqual(perf["latencyMs"], 100)
+            self.assertIn("ниже цели", live["warning"])
+            self.assertIsNone(live["speedMps"])  # fake engine has no measured speed
+            self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+            final = self.wait_for(lambda s: s["phase"] == "ready")
+            self.assertGreater(final["resultMetrics"]["performance"]["droppedFrames"], 0)
+
+    def test_stop_waits_for_pending_keyframe_writes_before_finalizing(self):
+        entered, release = threading.Event(), threading.Event()
+        original = PassStore.append_keyframe
+
+        def blocked(store, *args):
+            entered.set()
+            if not release.wait(6):
+                raise RuntimeError("test write timed out")
+            return original(store, *args)
+
+        with mock.patch.object(PassStore, "append_keyframe", blocked):
+            self.connect()
+            started = self.start()
+            self.assertTrue(entered.wait(3))
+            response = []
+            stopper = threading.Thread(target=lambda: response.append(self.request("/api/scan/stop", {})))
+            stopper.start()
+            try:
+                self.wait_for(lambda s: s["phase"] == "stopping")
+                self.assertTrue(stopper.is_alive())
+                self.assertTrue((Path(self.tmp.name) / "scans" / started["passId"]).exists())
+            finally:
+                release.set()
+                stopper.join(7)
+            self.assertFalse(stopper.is_alive())
+            self.assertEqual(response[0][0], 200, response)
+            self.wait_for(lambda s: s["phase"] == "ready")
+            passes = self.request("/api/scan/passes")[1]["passes"]
+            self.assertEqual(passes[0]["keyframeFiles"], 1)
+
+    def test_disk_writer_failure_is_visible_during_and_after_scan(self):
+        class ReportingEngine(FakeEngine):
+            def finish(self):
+                arrays, metrics = super().finish()
+                metrics["warnings"] = [self.disk_error] if getattr(self, "disk_error", "") else []
+                return arrays, metrics
+
+        with mock.patch.object(runner_module, "ScanEngine", ReportingEngine), mock.patch.object(
+                PassStore, "append_keyframe", side_effect=OSError("disk full")):
+            self.connect()
+            self.start()
+            live = self.wait_for(lambda s: "disk full" in s.get("warning", ""))
+            self.assertTrue(live["running"])
+            self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+            final = self.wait_for(lambda s: s["phase"] == "ready")
+            self.assertIn("disk full", final["warning"])
+            self.assertIn("disk full", final["resultMetrics"]["warnings"][0])
+
+    def test_blocked_sensor_is_not_released_or_reopened_on_stop_timeout(self):
+        self.connect()
+        entered, release = threading.Event(), threading.Event()
+        original_capture = self.sensor.capture
+
+        def blocked_capture():
+            if self.sensor.captures >= 2:  # connection and scan preflight have completed
+                entered.set()
+                release.wait(6)
+            return original_capture()
+
+        with mock.patch.object(self.sensor, "capture", side_effect=blocked_capture):
+            started = self.start()
+            self.assertTrue(entered.wait(3))
+            active = server.scan_runner.active
+            try:
+                with mock.patch.object(active["thread"], "join", return_value=None):
+                    status, response = self.request("/api/scan/stop", {})
+                self.assertEqual(status, 503, response)
+                self.assertIs(server.scan_runner.active, active)
+                self.assertFalse(active["engine"].released)
+                self.assertEqual(self.sensor.closes, 0)
+                self.assertTrue((Path(self.tmp.name) / "scans" / started["passId"]).exists())
+            finally:
+                release.set()
+            self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+            self.assertGreaterEqual(self.sensor.closes, 1)
+
+    def test_resume_migrates_old_fps_profile_but_preserves_voxel_settings(self):
+        from scan_pipeline.camera import Intrinsics
+        from scan_pipeline.config import ScanSettings
+        from scan_pipeline.storage import ScanStorage
+
+        root = ScanStorage(Path(self.tmp.name) / "scans")
+        pass_id = root.new_pass_id()
+        store = root.store(pass_id)
+        intr = Intrinsics.kinect_v1(32, 24)
+        old = ScanSettings(voxel_mm=6.0, depth_stride=1, max_speed_mps=0.45, model_refresh_every=4)
+        store.create(pass_id, "old pass", old, intr, self.sensor.id)
+        legacy = old.as_dict()
+        legacy.pop("tracking_stride")
+        store.update_manifest(state="interrupted", settings=legacy)
+        store.append_keyframe(1, np.full((24, 32), 1500, dtype=np.uint16),
+                              np.full((24, 32, 3), 100, dtype=np.uint8), np.eye(4), intr, 0.0)
+        self.connect()
+        self.start(resumePassId=pass_id)
+        settings = server.scan_runner.active["engine"].settings
+        self.assertEqual(settings.voxel_mm, 6.0)
+        self.assertEqual(settings.depth_stride, 2)
+        self.assertEqual(settings.model_refresh_every, 8)
+        self.assertAlmostEqual(settings.max_speed_mps * 3.6, 7.0)
+        self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+        self.assertEqual(store.manifest()["settings"]["tracking_stride"], 1)
 
     def test_stop_timeout_does_not_release_engine_or_delete_active_files(self):
         entered, release = threading.Event(), threading.Event()

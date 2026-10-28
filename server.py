@@ -18,6 +18,12 @@ from importlib.util import find_spec
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+# Avoid oversubscribing small ICP/TSDF workloads and starving sensor capture.
+# Respect an explicit user setting; this runs before NumPy/Open3D are imported.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 from sensor_drivers.registry import ADAPTERS, catalog, device_family, get_adapter, preferred_source
 
 HOST = "127.0.0.1"
