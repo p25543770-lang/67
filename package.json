@@ -1,0 +1,44 @@
+{
+  "name": "kinect-space",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "build:win": "npm run build && electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "lucide": "^0.468.0",
+    "three": "^0.170.0",
+    "vite": "^6.0.0"
+  },
+  "devDependencies": {
+    "electron": "^35.7.5",
+    "electron-builder": "^26.18.0"
+  },
+  "main": "desktop/main.cjs",
+  "build": {
+    "appId": "studio.depth.kinect",
+    "productName": "Depth Studio",
+    "files": [
+      "dist/**/*",
+      "desktop/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "server.py",
+        "to": "server.py"
+      }
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "directories": {
+      "output": "release"
+    }
+  }
+}
