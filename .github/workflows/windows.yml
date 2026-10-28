@@ -51,7 +51,7 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
-          npx electron-builder --win --x64 --dir 2>&1 | Tee-Object -FilePath package-win.log
+          npx electron-builder --win --x64 --dir --publish never 2>&1 | Tee-Object -FilePath package-win.log
           $buildExitCode = $LASTEXITCODE
           if ($buildExitCode -ne 0) {
             Get-Content package-win.log | Select-Object -Last 40 | ForEach-Object {
@@ -62,9 +62,8 @@ jobs:
       - name: Create NSIS installer
         shell: pwsh
         timeout-minutes: 10
-        continue-on-error: true
         run: |
-          npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked 2>&1 | Tee-Object -FilePath nsis-win.log
+          npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked --publish never 2>&1 | Tee-Object -FilePath nsis-win.log
           $buildExitCode = $LASTEXITCODE
           if ($buildExitCode -ne 0) {
             Get-Content nsis-win.log | Select-Object -Last 40 | ForEach-Object {
@@ -73,7 +72,6 @@ jobs:
             exit $buildExitCode
           }
       - name: Validate NSIS installer
-        if: always()
         shell: pwsh
         run: |
           $installer = Get-ChildItem release -Filter 'Depth-Studio-Setup-*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
