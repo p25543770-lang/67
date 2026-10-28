@@ -1,0 +1,4 @@
+# Optional Python dependencies for point-cloud registration and export.
+# Install with the same Python interpreter that runs server.py.
+numpy>=1.24,<2.3
+open3d>=0.18,<0.20
