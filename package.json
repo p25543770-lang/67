@@ -10,8 +10,8 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "npm run test:python && npm run test:desktop",
-    "test:python": "python -m unittest discover -s tests -p 'test_*.py'",
-    "test:desktop": "node --test desktop/tests/bootstrap.test.cjs",
+    "test:python": "python -m unittest discover -s tests -p \"test_*.py\"",
+    "test:desktop": "node --test desktop/tests/*.test.cjs",
     "prepare:python": "node scripts/prepare-python-runtime.mjs",
     "check:python-bundle": "node scripts/prepare-python-runtime.mjs --check",
     "lock:python": "node scripts/make-python-lock.mjs --wheels python-bundle/wheels --pip-wheel python-bundle/wheels/pip-24.2-py3-none-any.whl",
@@ -47,6 +47,11 @@
       {
         "from": "sensor_drivers",
         "to": "sensor_drivers"
+      },
+      {
+        "from": "scan_pipeline",
+        "to": "scan_pipeline",
+        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
       },
       {
         "from": "requirements-scan.txt",

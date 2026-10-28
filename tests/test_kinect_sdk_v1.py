@@ -6,6 +6,9 @@ open failures and resource release are exercised deterministically.
 """
 from __future__ import annotations
 
+import array
+import contextlib
+import io
 import importlib.machinery
 import os
 import sys
@@ -39,10 +42,18 @@ class FakeFrame:
         self._pixels = pixels
         self.Width = width
         self.Height = height
+        self.PixelDataLength = len(pixels)
         self.disposed = False
+        self.copied = False
 
-    def GetPixels(self):
-        return self._pixels
+    def CopyPixelDataTo(self, target):
+        if len(target) != self.PixelDataLength:
+            raise ValueError("incorrect managed array length")
+        self.copied = True
+        if isinstance(target, array.array):
+            target[:] = array.array("h", self._pixels)
+        else:
+            target[:] = bytes(self._pixels)
 
     def Dispose(self):
         self.disposed = True
@@ -151,7 +162,17 @@ class AdapterEnvironment:
         self._tempdir = None
 
     def __enter__(self):
-        modules = {"clr": self.clr, "Microsoft.Kinect": self.namespace}
+        class FakeArray:
+            @staticmethod
+            def CreateInstance(element_type, count):
+                if element_type == "Int16":
+                    return array.array("h", [0]) * count
+                if element_type == "Byte":
+                    return bytearray(count)
+                raise ValueError("unexpected managed array type")
+
+        system = make_module("System", Array=FakeArray, Int16="Int16", Byte="Byte")
+        modules = {"clr": self.clr, "Microsoft.Kinect": self.namespace, "System": system}
         self._patch_modules = mock.patch.dict(sys.modules, modules)
         self._patch_modules.start()
         env: dict[str, str] = {}
@@ -192,6 +213,8 @@ class CaptureTests(unittest.TestCase):
         # BGRA → RGB: красный пиксель остаётся красным.
         self.assertEqual(list(frame.color_rgb[0, 0]), [255, 0, 0])
         # Кадры .NET освобождаются, сенсор открыт и потоки включены.
+        self.assertTrue(depth.copied)
+        self.assertTrue(color.copied)
         self.assertTrue(depth.disposed)
         self.assertTrue(color.disposed)
         sensor = env.sensors[0]
@@ -219,6 +242,22 @@ class CaptureTests(unittest.TestCase):
             frame = env.adapter.capture()
         self.assertIsNone(frame.color_rgb)
         self.assertEqual(int(frame.depth_mm[10, 10]), 1200)
+        self.assertIn("не вернул RGB-кадр", frame.warning)
+        self.assertIn("Проверьте", frame.warning)
+
+    def test_rgb_copy_failure_preserves_exact_warning_and_logs_it(self):
+        bad_color = FakeFrame(color_pixels())
+        bad_color.CopyPixelDataTo = mock.Mock(side_effect=RuntimeError("RGB buffer failure"))
+        output = io.StringIO()
+        with AdapterEnvironment(depth_frames=[FakeFrame(depth_pixels(1200))], color_frames=[bad_color]) as env:
+            with contextlib.redirect_stdout(output):
+                frame = env.adapter.capture()
+        self.assertIsNone(frame.color_rgb)
+        self.assertEqual(int(frame.depth_mm[0, 0]), 1200)
+        self.assertIn("RGB buffer failure", frame.warning)
+        self.assertIn("Проверьте USB и SDK", frame.warning)
+        self.assertIn("RGB buffer failure", output.getvalue())
+        self.assertTrue(bad_color.disposed)
 
     def test_frame_timeout_is_reported_and_sensor_stays_open(self):
         with AdapterEnvironment(depth_frames=[]) as env:

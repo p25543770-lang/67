@@ -42,7 +42,8 @@ def write_ply(vertices, normals, colors, faces, metrics: dict | None = None) -> 
     ]
     if metrics is not None:
         # Метрики в комментариях: один JSON на строку (ограничение формата PLY).
-        header.append("comment metrics " + json.dumps(_compact(metrics), ensure_ascii=False))
+        # PLY headers are ASCII; escape Cyrillic text in pipeline metrics.
+        header.append("comment metrics " + json.dumps(_compact(metrics), ensure_ascii=True))
     header += [
         f"element vertex {len(v)}",
         "property float x", "property float y", "property float z",

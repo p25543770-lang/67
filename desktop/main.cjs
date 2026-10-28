@@ -21,6 +21,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const bootstrap = require("./bootstrap.cjs");
+const { isBridgeHealthValid } = require("./bridge-health.cjs");
 const packageInfo = require("../package.json");
 
 const IS_PACKAGED = app.isPackaged;
@@ -264,6 +265,26 @@ async function closeSetupWindow() {
 /* Настройка среды                                                           */
 /* ------------------------------------------------------------------------- */
 
+// Repair replaces the managed interpreter. Stop the old bridge first so it
+// cannot keep files open or continue reporting an obsolete health response.
+function stopBridgeForSetup() {
+  const child = bridge;
+  if (!child) return Promise.resolve();
+  bridge = null;
+  bridgeStatus = { running: false, ready: false, error: null, python: null, instance: BRIDGE_INSTANCE };
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(() => reject(new Error("Не удалось остановить Python-мост перед настройкой.")), 5000);
+    child.once("close", () => { clearTimeout(timer); resolve(); });
+    try {
+      child.kill();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+    }
+  });
+}
+
 function runEnvironmentSetup(mode = "retry") {
   if (setupPromise) return setupPromise;
   const force = mode === "repair";
@@ -277,8 +298,8 @@ function runEnvironmentSetup(mode = "retry") {
   setup.steps = bootstrap.STEP_DEFINITIONS.map((step) => ({ ...step, status: "pending", detailText: "" }));
   broadcast({ type: "reset", state: setupPublicState() });
 
-  setupPromise = bootstrap
-    .runSetup({
+  setupPromise = (force || !bridgeStatus.ready ? stopBridgeForSetup() : Promise.resolve())
+    .then(() => bootstrap.runSetup({
       appDataRoot: APP_DATA_ROOT,
       resourcesRoot: RESOURCES_ROOT,
       bundleRoot: BUNDLE_ROOT,
@@ -291,7 +312,7 @@ function runEnvironmentSetup(mode = "retry") {
         applySetupEvent(event);
         broadcast(event);
       },
-    })
+    }))
     .then(async (result) => {
       setupPromise = null;
       if (result.ok) {
@@ -328,11 +349,11 @@ function runEnvironmentSetup(mode = "retry") {
 /* ------------------------------------------------------------------------- */
 
 function findFreePort(start) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const attempt = (port, remaining) => {
       const probe = http.createServer();
       probe.once("error", () => {
-        if (remaining <= 0) resolve(start);
+        if (remaining <= 0) reject(new Error(`Порты ${start}–${port} заняты.`));
         else attempt(port + 1, remaining - 1);
       });
       probe.listen(port, "127.0.0.1", () => {
@@ -344,7 +365,7 @@ function findFreePort(start) {
   });
 }
 
-function waitForBridgeHealth(token, timeoutMs = 45_000) {
+function waitForBridgeHealth(token, timeoutMs = 45_000, isRunning = () => true) {
   return new Promise((resolve) => {
     const started = Date.now();
     const attempt = () => {
@@ -361,7 +382,7 @@ function waitForBridgeHealth(token, timeoutMs = 45_000) {
           } catch {
             payload = null;
           }
-          if (response.statusCode === 200 && payload?.instance === token) resolve(payload);
+          if (isBridgeHealthValid(response.statusCode, payload, token)) resolve(payload);
           else retry();
         });
       });
@@ -369,7 +390,7 @@ function waitForBridgeHealth(token, timeoutMs = 45_000) {
       request.on("error", retry);
     };
     const retry = () => {
-      if (Date.now() - started >= timeoutMs) resolve(null);
+      if (!isRunning() || Date.now() - started >= timeoutMs) resolve(null);
       else setTimeout(attempt, 350);
     };
     attempt();
@@ -427,9 +448,25 @@ async function startBridge() {
     return bridgeStatus;
   }
 
-  bridgePort = await findFreePort(PREFERRED_PORT);
-  fs.mkdirSync(ENV_PATHS.logsDir, { recursive: true });
+  try {
+    bridgePort = await findFreePort(PREFERRED_PORT);
+  } catch (error) {
+    bridgeStatus = { running: false, ready: false,
+      error: `Не удалось найти свободный порт для Python-моста: ${error.message}`,
+      python: null, instance: BRIDGE_INSTANCE };
+    return bridgeStatus;
+  }
+  try {
+    fs.mkdirSync(ENV_PATHS.logsDir, { recursive: true });
+  } catch (error) {
+    bridgeStatus = { running: false, ready: false,
+      error: `Не удалось создать каталог журнала Python-моста: ${error.message}`,
+      python: null, instance: BRIDGE_INSTANCE };
+    return bridgeStatus;
+  }
   const logStream = fs.createWriteStream(ENV_PATHS.bridgeLog, { flags: "a" });
+  // Log-write errors must not crash Electron or obscure bridge diagnostics.
+  logStream.on("error", (error) => console.error(`Не удалось записать журнал моста: ${error.message}`));
   logStream.write(
     `\n=== ${new Date().toISOString()} запуск моста из ${ENV_PATHS.pythonExe} на порту ${bridgePort} ===\n`,
   );
@@ -445,10 +482,14 @@ async function startBridge() {
         DEPTH_STUDIO_STATE: ENV_PATHS.stateFile,
         DEPTH_STUDIO_REQUIRE_APP_ENV: "1",
         DEPTH_STUDIO_INSTANCE: BRIDGE_INSTANCE,
+        // Bridge logs contain Russian diagnostics even on non-Russian Windows.
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
+    logStream.end();
     bridgeStatus = {
       running: false,
       ready: false,
@@ -460,12 +501,26 @@ async function startBridge() {
   }
 
   bridge = child;
-  child.stdout.pipe(logStream);
-  child.stderr.pipe(logStream);
+  // Both pipes share one file. Close it only when both child streams are done.
+  child.stdout.pipe(logStream, { end: false });
+  child.stderr.pipe(logStream, { end: false });
+  child.once("close", () => logStream.end());
   bridgeStatus = { running: true, ready: false, error: null, python: null, instance: BRIDGE_INSTANCE };
 
+  child.once("error", (error) => {
+    if (bridge !== child) return;
+    bridge = null;
+    bridgeStatus = {
+      running: false, ready: false,
+      error: `Не удалось запустить Python-мост: ${error.message}. Проверьте журнал моста и настройку среды.`,
+      python: null, instance: BRIDGE_INSTANCE,
+    };
+    try { logStream.write(`Ошибка запуска моста: ${error.stack || error.message}\n`); } catch { /* log unavailable */ }
+  });
+
   child.once("exit", (code) => {
-    if (bridge === child) bridge = null;
+    if (bridge !== child) return; // an old bridge stopped for repair must not overwrite the new status
+    bridge = null;
     if (shuttingDown) return;
     const tail = readTail(ENV_PATHS.bridgeLog, 40).join(" ");
     bridgeStatus = {
@@ -480,8 +535,8 @@ async function startBridge() {
     };
   });
 
-  const health = await waitForBridgeHealth(BRIDGE_INSTANCE);
-  if (health) {
+  const health = await waitForBridgeHealth(BRIDGE_INSTANCE, 45_000, () => bridge === child && bridgeStatus.running);
+  if (health && bridge === child && bridgeStatus.running) {
     bridgeStatus = {
       running: true,
       ready: true,
@@ -491,9 +546,13 @@ async function startBridge() {
       modules: health.modules || null,
       instance: BRIDGE_INSTANCE,
     };
-  } else if (bridgeStatus.running) {
+  } else if (bridge === child && bridgeStatus.running) {
+    // A timed-out child must not block a subsequent retry.
+    bridge = null;
+    child.kill();
     bridgeStatus = {
       ...bridgeStatus,
+      running: false,
       ready: false,
       error:
         "Python-мост не отвечает. Деморежим доступен; откройте журнал моста или повторите настройку среды.",
@@ -587,8 +646,17 @@ function proxyApi(req, res) {
       upstream.pipe(res);
     },
   );
+  // In particular, a hanging health request must invalidate readiness rather
+  // than leaving the last successful result on screen indefinitely.
+  const healthRequest = new URL(req.url, "http://127.0.0.1").pathname === "/api/health";
+  proxy.setTimeout(healthRequest ? 2500 : 150000, () => proxy.destroy(new Error("bridge request timed out")));
+  res.on("close", () => { if (!res.writableEnded) proxy.destroy(); });
   proxy.on("error", () => {
-    if (res.headersSent) return;
+    if (bridgeStatus.running) {
+      bridgeStatus = { ...bridgeStatus, ready: false,
+        error: "Python-мост не отвечает. Откройте журнал моста или повторите настройку среды." };
+    }
+    if (res.headersSent || res.destroyed) return;
     sendJson(res, 503, {
       error:
         bridgeStatus.error ||
@@ -603,6 +671,16 @@ function startWebServer() {
     const requestUrl = new URL(req.url, "http://127.0.0.1");
 
     if (requestUrl.pathname === "/app/setup" || requestUrl.pathname === "/app/setup/") {
+      // A bridge that briefly stopped responding may recover without restarting.
+      // Only a fresh health response from our own instance can restore readiness.
+      if (bridge && bridgeStatus.running && !bridgeStatus.ready) {
+        const child = bridge;
+        const health = await waitForBridgeHealth(BRIDGE_INSTANCE, 1200, () => bridge === child && bridgeStatus.running);
+        if (health && bridge === child && bridgeStatus.running) {
+          bridgeStatus = { ...bridgeStatus, ready: true, error: null, python: health.python || null,
+            environment: health.environment || null, modules: health.modules || null };
+        }
+      }
       sendJson(res, 200, setupPublicState());
       return;
     }

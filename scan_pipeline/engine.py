@@ -242,7 +242,8 @@ class ScanEngine:
 
     def pipeline_info(self) -> dict:
         return {
-            "method": "KinectFusion: TSDF-объём + frame-to-model цветной ICP",
+            "method": "KinectFusion: TSDF-объём + frame-to-model " +
+                      ("цветной ICP" if self.settings.use_color_icp else "геометрический ICP"),
             "voxelMm": self.settings.voxel_mm,
             "truncMm": round(self.settings.sdf_trunc_m * 1000.0, 2),
             "resolution": [self.intrinsics.width, self.intrinsics.height],

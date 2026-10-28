@@ -1910,3 +1910,50 @@ input[type="range"] {
   white-space: pre-wrap;
   color: #6c4136;
 }
+
+/* Readiness and saved-pass controls */
+#cancelScanButton[hidden], .scan-action-reason[hidden], .passes-card[hidden] { display: none; }
+.scan-action-reason {
+  margin: 0;
+  padding: 0 18px 14px;
+  color: #9a6a2f;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.scan-actions { flex-wrap: wrap; }
+.viewer-footer { flex-wrap: wrap; }
+.tracking-chip[data-status="too_fast"],
+.tracking-chip[data-status="few_valid_pixels"],
+.tracking-chip[data-status="sensor_covered"],
+.tracking-chip[data-status="memory_budget_reached"] {
+  background: #fff6e7;
+  color: #a47539;
+  border-color: #f0dfc1;
+}
+.tracking-summary[data-status="too_fast"],
+.tracking-summary[data-status="few_valid_pixels"],
+.tracking-summary[data-status="sensor_covered"],
+.tracking-summary[data-status="memory_budget_reached"] {
+  border-color: #f0dfc1;
+  background: #fffaf0;
+}
+.passes-card { padding: 18px; }
+.passes-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.passes-heading h2 { margin: 5px 0 0; font-size: 15px; }
+.passes-intro, .passes-empty { color: #829589; font-size: 10px; line-height: 1.6; }
+.passes-list { margin: 12px 0; border-top: 1px solid #edf1ed; }
+.pass-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #edf1ed; }
+.pass-row label { min-width: 0; display: flex; align-items: center; gap: 9px; }
+.pass-row input { accent-color: #285a45; }
+.pass-row label span { min-width: 0; }
+.pass-row strong, .pass-row small { display: block; overflow-wrap: anywhere; }
+.pass-row strong { font-size: 11px; color: #405b4a; }
+.pass-row small { margin-top: 4px; color: #93a197; font-size: 9px; }
+.pass-buttons, .passes-actions { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.pass-buttons button { border: 1px solid #dfe9e0; border-radius: 5px; background: #f9fbf8; color: #567060; font-size: 9px; padding: 6px 8px; }
+.passes-actions span { color: #93a197; font-size: 9px; line-height: 1.5; }
+@media (max-width: 760px) {
+  .viewer-footer { flex-wrap: wrap; }
+  .scan-actions { width: 100%; margin: 0; }
+  .pass-row { align-items: flex-start; flex-direction: column; }
+}

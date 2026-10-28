@@ -110,7 +110,7 @@ def find_sdk_assembly(env: dict[str, str] | None = None) -> str | None:
 def _pixels_to_bytes(pixels: Any, item_size: int = 2) -> bytes:
     """Read a .NET ``byte[]``/``short[]`` buffer as raw bytes.
 
-    ``short[]`` is what ``DepthImageFrame.GetPixels`` returns; depth values above
+    ``short[]`` is what ``DepthImageFrame.CopyPixelDataTo`` fills; depth values above
     8 m (``> 32767`` after the ``<< 3`` shift) arrive as negative ``Int16``, so the
     conversion must accept both ranges — the two's-complement bytes are identical.
     ``bytes(bytearray(...))`` is *not* usable for depth: it rejects values > 255.
@@ -287,13 +287,31 @@ class _SdkSession:
         height = int(getattr(frame, "Height", default_height) or default_height)
         return width, height
 
+    @staticmethod
+    def _copy_pixels(frame: Any, item_size: int, expected_length: int) -> bytes:
+        """Copy pixels before Dispose using the actual Kinect SDK 1.8 API.
+
+        DepthImageFrame accepts System.Int16[] (packed depth/player bits),
+        ColorImageFrame accepts System.Byte[] (BGRA). Neither frame exposes a
+        GetPixels() method in SDK 1.8. A managed array also disambiguates the
+        overload from the IntPtr overload when called through pythonnet.
+        """
+        count = int(getattr(frame, "PixelDataLength", expected_length))
+        if count != expected_length:
+            raise RuntimeError(f"Некорректная длина кадра SDK: {count}, ожидалось {expected_length}.")
+        system = importlib.import_module("System")
+        element_type = system.Int16 if item_size == 2 else system.Byte
+        pixels = system.Array.CreateInstance(element_type, count)
+        frame.CopyPixelDataTo(pixels)
+        return _pixels_to_bytes(pixels, item_size)
+
     def grab_depth(self, timeout: float) -> tuple[int, int, bytes] | None:
         frame = self._read_frame(self.sensor.DepthStream, timeout)
         if frame is None:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, _pixels_to_bytes(frame.GetPixels(), 2)
+            return width, height, self._copy_pixels(frame, 2, width * height)
         finally:
             _dispose(frame)
 
@@ -303,7 +321,7 @@ class _SdkSession:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, _pixels_to_bytes(frame.GetPixels(), 1)
+            return width, height, self._copy_pixels(frame, 1, width * height * 4)
         finally:
             _dispose(frame)
 
@@ -376,6 +394,7 @@ class KinectSdkV1Adapter(SensorAdapter):
         self._lock = threading.RLock()
         self._session: _SdkSession | None = None
         self._last_capture: float | None = None
+        self._last_color_warning = ""
 
     # ------------------------------------------------------------------ status
     def _env_map(self) -> dict[str, str]:
@@ -552,6 +571,7 @@ class KinectSdkV1Adapter(SensorAdapter):
             session, self._session = self._session, None
         if session is not None:
             session.close()
+        self._last_color_warning = ""
 
     def __enter__(self) -> "KinectSdkV1Adapter":
         return self
@@ -578,11 +598,20 @@ class KinectSdkV1Adapter(SensorAdapter):
                 )
             width, height, depth_bytes = depth
             color = None
+            color_warning = ""
             try:
                 color = session.grab_color(self.color_timeout)
-            except Exception:  # noqa: BLE001 - глубина остаётся полезной без RGB
-                color = None
-            return depth_and_color_to_frame(
+                if color is None:
+                    color_warning = "Kinect не вернул RGB-кадр. Проверьте USB и закройте другие приложения Kinect; глубина доступна, но цвет может отсутствовать."
+            except Exception as exc:  # noqa: BLE001 - глубина остаётся полезной без RGB
+                color_warning = f"Не удалось прочитать RGB-кадр Kinect: {exc}. Проверьте USB и SDK; глубина доступна, но цвет может отсутствовать."
+            if color_warning != self._last_color_warning:
+                if color_warning:
+                    print(f"[Depth Studio] {color_warning}", flush=True)
+                elif self._last_color_warning:
+                    print("[Depth Studio] RGB-поток Kinect восстановлен.", flush=True)
+                self._last_color_warning = color_warning
+            frame = depth_and_color_to_frame(
                 depth_bytes,
                 width,
                 height,
@@ -590,6 +619,8 @@ class KinectSdkV1Adapter(SensorAdapter):
                 color[0] if color else None,
                 color[1] if color else None,
             )
+            frame.warning = color_warning
+            return frame
         except KinectSdkUnavailable as exc:
             # Таймаут кадра не повод переоткрывать сенсор: следующая попытка может удаться.
             if exc.code != "frame_timeout":

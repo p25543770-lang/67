@@ -171,7 +171,10 @@ class ScanStorage:
         return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def store(self, pass_id: str) -> PassStore:
-        if "/" in pass_id or "\\" in pass_id or pass_id in ("", ".", ".."):
+        # Идентификатор приходит из HTTP-запроса: не допускаем пути, буквы диска
+        # Windows и служебный каталог объединённого результата.
+        if (not isinstance(pass_id, str) or not pass_id or pass_id == "merged" or
+                any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in pass_id)):
             raise ValueError("Некорректный идентификатор прохода.")
         return PassStore(self.root / pass_id)
 

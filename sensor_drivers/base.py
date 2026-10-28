@@ -11,7 +11,8 @@ class SensorFrame:
 
     ``color_rgb`` is an optional HxWx3 uint8 array. ``depth_mm`` is an optional
     HxW uint16 depth image in millimetres. ``points`` is an Nx3 float array in
-    metres, with +Y up and the camera looking down -Z.
+    metres, with +Y up and the camera looking down -Z. ``warning`` describes
+    non-fatal issues such as a missing RGB frame, even when depth is usable.
     """
 
     color_rgb: Any
@@ -19,6 +20,7 @@ class SensorFrame:
     points: Any
     captured_at: float
     calibration: str = ""
+    warning: str = ""
 
 
 REQUIREMENT_KINDS = ("driver", "python")
@@ -90,6 +92,8 @@ class SensorAdapter:
             "state": state,
             "connected": probe.get("connected"),
             "error": probe.get("error") or (self.dependency_error() if self.implemented and not dependencies_available else ""),
+            "errorCode": probe.get("code", ""),
+            "hint": probe.get("hint", ""),
             "windows": self.windows,
             "driver": self.driver,
             "limitations": self.limitations,

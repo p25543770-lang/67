@@ -1,4 +1,6 @@
 import * as THREE from "three";
+import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from "./readiness.js";
+import { apiRequest } from "./api.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import Box from "lucide/dist/esm/icons/box.js";
 import Radio from "lucide/dist/esm/icons/radio.js";
@@ -111,13 +113,16 @@ document.querySelector("#app").innerHTML = `
             <div class="footer-separator"></div>
             <div class="scan-actions">
               <button class="button-primary" id="scanButton"><i data-lucide="scan-line"></i><span>Начать сканирование</span></button>
-              <button class="button-secondary clear-button" id="clearButton" title="Очистить собранные данные"><i data-lucide="rotate-ccw"></i><span>Очистить</span></button>
-              <div class="export-buttons" aria-label="Экспорт облака точек">
-                <button id="exportPly" title="Экспортировать облако в PLY"><i data-lucide="download"></i> PLY</button>
-                <button id="exportObj" title="Экспортировать вершины в OBJ">OBJ</button>
+              <button class="button-secondary" id="cancelScanButton" title="Отменить текущий проход" hidden>Отменить</button>
+              <button class="button-secondary clear-button" id="clearButton" title="Очистить просмотр"><i data-lucide="rotate-ccw"></i><span>Очистить</span></button>
+              <div class="export-buttons" aria-label="Экспорт результата">
+                <button id="exportPly" title="Экспорт в PLY"><i data-lucide="download"></i> PLY</button>
+                <button id="exportObj" title="Экспорт в OBJ">OBJ</button>
+                <button id="exportGlb" title="Экспорт сетки в GLB">GLB</button>
               </div>
             </div>
           </div>
+          <p class="scan-action-reason" id="scanActionReason" aria-live="polite" hidden></p>
         </section>
 
         <section class="feed-card card">
@@ -135,6 +140,13 @@ document.querySelector("#app").innerHTML = `
               <div class="feed-caption"><strong>Карта глубины</strong><small id="depthDescription">Синтетическая демо-карта</small></div>
             </div>
           </div>
+        </section>
+
+        <section class="passes-card card" id="passesCard" hidden>
+          <div class="passes-heading"><div><span class="section-kicker">ПРОХОДЫ / СОХРАНЕНИЕ</span><h2>Сохранённые проходы</h2></div><button class="button-secondary" id="refreshPassesButton">Обновить</button></div>
+          <p class="passes-intro">Проходы сохраняются на диске. Выберите не менее двух завершённых проходов для объединения.</p>
+          <div class="passes-list" id="passesList" aria-live="polite"></div>
+          <div class="passes-actions"><button class="button-secondary" id="mergePassesButton">Объединить выбранные</button><span id="passesNote">Калибровка приблизительная; на физическом датчике не проверено.</span></div>
         </section>
       </div>
 
@@ -176,7 +188,7 @@ document.querySelector("#app").innerHTML = `
         <section class="honesty-note"><span class="honesty-icon">i</span><p><strong>Важно</strong> Камера без датчика глубины не подходит автоматически. Поддержка устройства появится только после реализации и проверки его отдельного модуля.</p></section>
       </aside>
     </div>
-    <footer class="page-footer"><span>DEPTH STUDIO <b>·</b> ДЕМО И ЭКСПЕРИМЕНТАЛЬНОЕ СКАНИРОВАНИЕ</span><span>ОБЛАКО ТОЧЕК — НЕ ПОЛИГОНАЛЬНАЯ МОДЕЛЬ</span></footer>
+    <footer class="page-footer"><span>DEPTH STUDIO <b>·</b> ДЕМО И ЭКСПЕРИМЕНТАЛЬНОЕ СКАНИРОВАНИЕ</span><span>ДЕМО — ОБЛАКО ТОЧЕК · ДАТЧИК — ЭКСПЕРИМЕНТАЛЬНАЯ СЕТКА</span></footer>
   </main>
 
   <div class="modal-backdrop" id="helpModal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
@@ -281,6 +293,14 @@ let demoPoints = makeDemoRoom();
 let activeSource = "demo";
 let devices = [];
 let deviceConnected = false;
+let deviceActionBusy = false;
+let scanActionBusy = false;
+let bridgeHealth = null;
+let devicesAvailable = false;
+let scanPhase = "idle";
+let savedPasses = [];
+let selectedPassIds = new Set();
+let streamGeneration = 0;
 let streamTimer = null;
 let streamBusy = false;
 let scanTimer = null;
@@ -405,50 +425,6 @@ function showToast(message, kind = "info") {
   toast.classList.add("show");
   clearTimeout(toastTimeout);
   toastTimeout = setTimeout(() => toast.classList.remove("show"), 4800);
-}
-
-async function apiRequest(path, options = {}) {
-  let response;
-  try {
-    response = await fetch(path, {
-      cache: "no-store",
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...(options.headers || {}),
-      },
-      body:
-        options.body && typeof options.body !== "string"
-          ? JSON.stringify(options.body)
-          : options.body,
-    });
-  } catch (error) {
-    throw new Error(
-      "Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio.",
-    );
-  }
-  let payload;
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    try {
-      payload = await response.json();
-    } catch {
-      payload = {};
-    }
-  } else {
-    payload = {};
-  }
-  if (!response.ok) {
-    const base =
-      payload.error ||
-      (response.status >= 500
-        ? "Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio."
-        : `Ошибка локального моста (${response.status}).`);
-    // Адаптер возвращает и подсказку — она уточняет, что именно проверить.
-    const hint = typeof payload.hint === "string" && payload.hint ? ` ${payload.hint}` : "";
-    throw new Error(`${base}${hint}`);
-  }
-  return payload;
 }
 
 function fallbackDevices() {
@@ -577,21 +553,24 @@ function escapeHtml(value) {
   );
 }
 
-async function loadDevices() {
+async function loadDevices(knownHealth = null) {
   try {
-    const [health, response] = await Promise.all([
-      apiRequest("/api/health"),
-      apiRequest("/api/devices"),
-    ]);
+    const health = knownHealth || await apiRequest("/api/health");
+    if (health?.ok !== true) throw new Error("Python-мост не подтвердил готовность.");
+    bridgeHealth = health;
+    const response = await apiRequest("/api/devices");
     devices = response.devices || fallbackDevices();
+    devicesAvailable = true;
     const env = health.environment || null;
     const envText = env
       ? `Python ${escapeHtml(env.version || health.python || "")} · ${env.isolated ? "среда Depth Studio" : "системный интерпретатор"}`
       : `Python ${escapeHtml(health.python || "")}`;
     $("serverNote").innerHTML = `<span class="server-note-dot online"></span><span>Локальный мост запущен · ${envText}</span>`;
-    renderEnvironmentSummary({ ...(setupState || {}), environment: env, bridge: { ready: true } });
+    renderEnvironmentSummary({ ...(setupState || {}), environment: env });
   } catch {
+    if (!knownHealth) bridgeHealth = null;
     devices = fallbackDevices();
+    devicesAvailable = false;
     $("serverNote").innerHTML =
       '<span class="server-note-dot"></span><span>Локальный мост не запущен · демо доступно</span>';
   }
@@ -693,11 +672,8 @@ function updateSourcePanel() {
       no_device: "Датчик не найден",
       not_implemented: "Не реализован",
     };
-    const state = deviceConnected
-      ? "connected"
-      : profile.connected
-        ? "detected"
-        : profile.state || "not_checked";
+    const state = deviceConnected ? "connected" :
+      profile.state === "connected" ? "detected" : profile.state || "not_checked";
     dot.dataset.state = deviceConnected
       ? "connected"
       : state === "driver_missing"
@@ -708,9 +684,8 @@ function updateSourcePanel() {
       ? "ПРОВЕРЕН"
       : "НЕ ПРОВЕРЕН";
     $("sourceDescription").textContent =
-      profile.error ||
-      profile.limitations ||
-      "Выбран экспериментальный источник глубины.";
+      [profile.error, profile.hint, profile.warning].filter(Boolean).join(" ") ||
+      profile.limitations || "Выбран экспериментальный источник глубины.";
     $("verificationLabel").innerHTML = profile.verifiedOnHardware
       ? "<span>✓</span><span>Этот модуль прошёл аппаратную проверку.</span>"
       : "<span>!</span><span>Модуль не проверен на реальном датчике; совместимость не гарантируется.</span>";
@@ -719,7 +694,7 @@ function updateSourcePanel() {
       : profile.connected
         ? '<i data-lucide="radio"></i><span>Подключить поток</span>'
         : '<i data-lucide="radio"></i><span>Подключить выбранный источник</span>';
-    $("connectButton").disabled = false;
+    $("connectButton").disabled = deviceActionBusy || isScanning || bridgeHealth?.ok !== true;
     $("headerStatus").textContent = deviceConnected
       ? "Поток датчика активен"
       : profile.connected
@@ -749,17 +724,17 @@ function updateSourcePanel() {
         ? "Датчик готов к открытию потока"
         : "Ожидание данных глубины";
     if (!deviceConnected) drawNoSignal();
-    setTracking(
+    if (!isScanning && !["finalizing", "merging"].includes(scanPhase)) setTracking(
       deviceConnected ? "tracking" : "idle",
       0,
-      "",
+      deviceConnected ? (profile.warning || "") : "",
       deviceConnected
         ? "Поток подключён"
         : profile.connected
           ? "Датчик обнаружен"
           : "Источник не подключён",
       deviceConnected
-        ? "Поток глубины поступает в приложение."
+        ? (profile.warning || "Поток глубины поступает в приложение.")
         : profile.connected
           ? "Подключите источник, чтобы начать поток изображения и глубины."
           : "Обнаружьте устройство и проверьте драйверы.",
@@ -788,7 +763,9 @@ function updateSourcePanel() {
       Menu,
     },
   });
+  $("passesCard").hidden = activeSource === "demo";
   updateExportButtons();
+  renderPasses();
 }
 
 function setTracking(status, speed, warning, title = "", text = "") {
@@ -797,7 +774,11 @@ function setTracking(status, speed, warning, title = "", text = "") {
     idle: "Ожидание",
     tracking: "Отслеживание",
     moving: "Двигайтесь медленнее",
+    too_fast: "Слишком быстро",
     lost: "Трекинг потерян",
+    few_valid_pixels: "Мало данных глубины",
+    sensor_covered: "Датчик закрыт",
+    memory_budget_reached: "Лимит памяти",
     stopped: "Остановлено",
   };
   const display = labels[status] || status;
@@ -817,7 +798,7 @@ function setTracking(status, speed, warning, title = "", text = "") {
   if (warning) $("warningText").textContent = warning;
   $("liveIndicator").classList.toggle(
     "is-live",
-    status === "tracking" || status === "moving",
+    ["tracking", "moving", "too_fast"].includes(status),
   );
 }
 
@@ -992,45 +973,40 @@ function paintDepth(frame) {
 
 async function probeDevices() {
   if (isScanning) {
-    showToast(
-      "Остановите сканирование перед повторным обнаружением датчиков.",
-      "warning",
-    );
+    showToast("Остановите сканирование перед повторным обнаружением датчиков.", "warning");
     return;
   }
   const button = $("detectButton");
   button.disabled = true;
   button.classList.add("is-busy");
   try {
-    const result = await apiRequest("/api/devices/probe", {
-      method: "POST",
-      body: {},
-    });
+    const result = await apiRequest("/api/devices/probe", { method: "POST", body: {} });
     devices = result.devices || devices;
-    const connected = result.connected || [];
-    // Найденный датчик становится активным источником; при двух адаптерах Kinect 360
-    // сервер отдаёт первым рекомендуемый (Microsoft Kinect SDK).
-    if (connected.length && !isScanning && activeSource === "demo") {
-      activeSource = connected[0];
-      $("sourceSelect").value = connected[0];
+    const detected = result.detected || [];
+    if (deviceConnected && !(result.connected || []).includes(activeSource)) {
+      stopStream();
+      deviceConnected = false;
+    }
+    // Обнаружение не оставляет датчик открытым: подключение — отдельный шаг.
+    if (detected.length && activeSource === "demo") {
+      activeSource = detected[0];
+      $("sourceSelect").value = activeSource;
+      deviceConnected = false;
+      hasScan = false;
+      originalPoints = [];
+      $("frameCount").textContent = "0";
+      renderPoints();
     }
     renderSourceOptions();
     updateSourcePanel();
-    if (connected.length) {
-      showToast(
-        `Обнаружен датчик: ${devices.find((device) => device.id === connected[0])?.name || connected[0]}.`,
-        "success",
-      );
+    if (detected.length) {
+      showToast(`Обнаружен датчик: ${devices.find((device) => device.id === detected[0])?.name || detected[0]}. Подключите выбранный источник.`, "success");
     } else {
-      const preferred =
-        devices.find((device) => device.id === result.preferredSource) ||
+      const preferred = devices.find((device) => device.id === activeSource) ||
         devices.find((device) => device.id === "kinect_v1_sdk") ||
         devices.find((device) => device.id === "kinect_v1");
-      showToast(
-        preferred?.error ||
-          "Совместимый датчик не обнаружен. Проверьте питание, USB и драйверы.",
-        "warning",
-      );
+      showToast([preferred?.error, preferred?.hint].filter(Boolean).join(" ") ||
+        "Совместимый датчик не обнаружен. Проверьте питание, USB-адаптер и драйверы.", "warning");
     }
   } catch (error) {
     showToast(error.message, "warning");
@@ -1043,133 +1019,117 @@ async function probeDevices() {
 function stopStream() {
   if (streamTimer) clearInterval(streamTimer);
   streamTimer = null;
+  // Ignore in-flight frame requests from an old connection/source.
+  streamGeneration += 1;
   streamBusy = false;
 }
 
+function displaySensorFrame(data) {
+  const profile = selectedProfile();
+  if (profile) {
+    profile.warning = data.warning || "";
+    $("sourceDescription").textContent = profile.warning || profile.limitations || "Выбран экспериментальный источник глубины.";
+  }
+  if (!hasScan && !isScanning && !["finalizing", "merging"].includes(scanPhase) && Array.isArray(data.points)) {
+    originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
+    renderPoints();
+  }
+  const hasRgb = paintRgb(data.color);
+  const hasDepth = paintDepth(data.depth);
+  $("rgbDescription").textContent = hasRgb ? "Кадр с Kinect 360" : "RGB-поток недоступен";
+  $("depthDescription").textContent = hasDepth ? "Глубина в реальном времени" : "Карта глубины недоступна";
+  $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
+  $("depthFrameLabel").textContent = hasDepth ? "LIVE · DEPTH" : "NO DEPTH";
+  $("feedState").textContent = "ПОТОК АКТИВЕН";
+  if (!hasScan && !isScanning && !["finalizing", "merging"].includes(scanPhase)) {
+    $("sceneModeLabel").textContent = "ПОТОК ДАТЧИКА";
+    setTracking("tracking", 0, data.warning || "", "Датчик подключён",
+      data.warning || "Поток глубины поступает в приложение.");
+    $("frameCount").textContent = "LIVE";
+  }
+}
+
 async function pollFrame() {
-  if (streamBusy || activeSource === "demo" || hasScan) return;
+  if (streamBusy || activeSource === "demo" || !deviceConnected || isScanning) return;
+  const generation = streamGeneration;
+  const source = activeSource;
   streamBusy = true;
   try {
-    const data = await apiRequest(
-      `/api/frame?source=${encodeURIComponent(activeSource)}`,
-    );
-    deviceConnected = true;
-    const profile = devices.find((device) => device.id === activeSource);
-    if (profile) {
-      profile.connected = true;
-      profile.state = "connected";
-      profile.error = "";
-    }
-    if (Array.isArray(data.points)) {
-      originalPoints = data.points.map(([x, y, z, depth]) => [
-        x,
-        y + 1.25,
-        z,
-        depth,
-      ]);
-      renderPoints();
-    }
-    const hasRgb = paintRgb(data.color);
-    const hasDepth = paintDepth(data.depth);
-    $("rgbDescription").textContent = hasRgb
-      ? "Кадр с Kinect 360"
-      : "RGB-поток недоступен";
-    $("depthDescription").textContent = hasDepth
-      ? "Глубина в реальном времени"
-      : "Карта глубины недоступна";
-    $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
-    $("depthFrameLabel").textContent = hasDepth ? "LIVE · DEPTH" : "NO DEPTH";
-    $("feedState").textContent = "ПОТОК АКТИВЕН";
-    $("sceneModeLabel").textContent = "ПОТОК ДАТЧИКА";
-    setTracking(
-      "tracking",
-      0,
-      "",
-      "Датчик подключён",
-      "Поток глубины поступает в приложение.",
-    );
-    $("frameCount").textContent = "LIVE";
+    const data = await apiRequest(`/api/frame?source=${encodeURIComponent(source)}`);
+    if (generation !== streamGeneration || source !== activeSource) return;
+    displaySensorFrame(data);
   } catch (error) {
+    if (generation !== streamGeneration || source !== activeSource) return;
     stopStream();
     deviceConnected = false;
-    const profile = devices.find((device) => device.id === activeSource);
+    const profile = devices.find((device) => device.id === source);
     if (profile) {
       profile.connected = false;
       profile.state = "no_device";
       profile.error = error.message;
+      profile.hint = "";
+      profile.errorCode = error.code || "";
     }
     updateSourcePanel();
     showToast(`Поток датчика остановлен. ${error.message}`, "warning");
   } finally {
-    streamBusy = false;
+    if (generation === streamGeneration) streamBusy = false;
   }
 }
 
-async function connectSelectedSource() {
+async function connectSelectedSource({ reconnect = false } = {}) {
   if (isScanning) {
-    showToast(
-      "Сначала остановите сканирование, затем отключайте датчик.",
-      "warning",
-    );
-    return;
+    showToast("Сначала остановите сканирование, затем отключайте датчик.", "warning");
+    return false;
   }
   if (activeSource === "demo") {
-    stopStream();
-    deviceConnected = false;
-    hasScan = false;
-    originalPoints = demoPoints.slice();
-    renderPoints();
-    updateSourcePanel();
-    showToast(
-      "Демо-сцена готова. Подключение датчика не требуется.",
-      "success",
-    );
-    return;
+    showToast("Демо-сцена готова. Подключение датчика не требуется.", "success");
+    return true;
   }
-  if (deviceConnected) {
-    stopStream();
-    deviceConnected = false;
-    hasScan = false;
-    originalPoints = [];
-    renderPoints();
-    const profile = devices.find((device) => device.id === activeSource);
-    if (profile) {
-      profile.connected = false;
-      profile.state = "not_checked";
-    }
-    updateSourcePanel();
-    drawNoSignal();
-    return;
-  }
-  const button = $("connectButton");
-  button.disabled = true;
-  button.classList.add("is-busy");
+  if (deviceActionBusy) return false;
+  const source = activeSource;
+  deviceActionBusy = true;
+  updateSourcePanel();
   try {
-    const result = await apiRequest("/api/devices/probe", {
-      method: "POST",
-      body: {},
-    });
-    devices = result.devices || devices;
-    renderSourceOptions();
-    const profile = devices.find((device) => device.id === activeSource);
-    if (!profile?.connected) {
-      updateSourcePanel();
-      throw new Error(
-        profile?.error ||
-          "Выбранный датчик не обнаружен. Проверьте драйвер и подключение.",
-      );
+    if (deviceConnected && !reconnect) {
+      stopStream();
+      await apiRequest("/api/devices/disconnect", { method: "POST", body: { source } });
+      deviceConnected = false;
+      const profile = devices.find((device) => device.id === source);
+      if (profile) { profile.connected = false; profile.state = "detected"; profile.error = ""; profile.hint = ""; }
+      if (!hasScan) { originalPoints = []; renderPoints(); }
+      drawNoSignal();
+      return true;
+    }
+    if (deviceConnected) return true;
+    const result = await apiRequest("/api/devices/connect", { method: "POST", body: { source } });
+    if (source !== activeSource) {
+      await apiRequest("/api/devices/disconnect", { method: "POST", body: { source } });
+      return false;
     }
     deviceConnected = true;
+    const profile = devices.find((device) => device.id === source);
+    if (profile) { profile.connected = true; profile.state = "connected"; profile.error = ""; profile.hint = ""; }
     updateSourcePanel();
-    await pollFrame();
-    if (!deviceConnected) return;
+    displaySensorFrame(result.frame);
     if (!streamTimer) streamTimer = setInterval(pollFrame, 300);
-    showToast("Датчик подключён. Перемещайте его медленно.", "success");
+    if (!reconnect) showToast("Датчик подключён. Перемещайте его медленно.", "success");
+    return true;
   } catch (error) {
-    showToast(error.message, "warning");
+    deviceConnected = false;
+    stopStream();
+    const profile = devices.find((device) => device.id === source);
+    if (profile) {
+      profile.connected = false;
+      profile.state = "no_device";
+      profile.error = error.message;
+      profile.hint = "";
+      profile.errorCode = error.code || "";
+    }
+    showToast(`Не удалось подключить источник. ${error.message}`, "warning");
+    return false;
   } finally {
-    button.disabled = false;
-    button.classList.remove("is-busy");
+    deviceActionBusy = false;
     updateSourcePanel();
   }
 }
@@ -1201,14 +1161,34 @@ function setScanButton() {
       Menu,
     },
   });
+  updateExportButtons();
+}
+
+function currentScanActions() {
+  return scanActions({ source: activeSource, connected: deviceConnected, setup: setupState,
+    health: bridgeHealth, phase: scanPhase, running: isScanning, hasResult: hasScan,
+    hasVisibleData: originalPoints.length > 0, busy: scanActionBusy });
 }
 
 function updateExportButtons() {
-  const enabled = activeSource === "demo" ? originalPoints.length > 0 : hasScan;
-  $("exportPly").disabled = !enabled;
-  $("exportObj").disabled = !enabled;
-  $("clearButton").disabled =
-    originalPoints.length === 0 && !hasScan && !isScanning;
+  const actions = currentScanActions();
+  $("scanButton").disabled = !actions.start;
+  $("clearButton").disabled = !actions.clear;
+  $("exportPly").disabled = !actions.export;
+  $("exportObj").disabled = !actions.export;
+  $("exportGlb").disabled = activeSource === "demo" || !actions.export;
+  $("cancelScanButton").hidden = activeSource === "demo" || !isScanning;
+  $("cancelScanButton").disabled = !actions.cancel;
+  const reason = $("scanActionReason");
+  reason.textContent = actions.reason;
+  reason.hidden = !actions.reason;
+  $("scanButton").title = !actions.start ? actions.reason : "";
+  $("clearButton").title = !actions.clear && actions.reason ? actions.reason : "Очистить просмотр";
+  for (const id of ["exportPly", "exportObj", "exportGlb"]) {
+    const button = $(id);
+    const format = id.slice("export".length).toUpperCase();
+    button.title = button.disabled && actions.reason ? actions.reason : `Экспорт в ${format}`;
+  }
 }
 
 function startDemoScan() {
@@ -1274,64 +1254,131 @@ function stopDemoScan(reset = false) {
   );
 }
 
-async function toggleScan() {
-  if (isScanning) {
-    if (activeSource === "demo") {
-      stopDemoScan();
-      return;
-    }
-    try {
-      await apiRequest("/api/scan/stop", { method: "POST", body: {} });
-      isScanning = false;
-      if (scanTimer) clearInterval(scanTimer);
-      scanTimer = null;
-      await refreshScan();
-      setScanButton();
-      showToast(
-        "Сканирование остановлено. Облако сохранено для экспорта.",
-        "success",
-      );
-    } catch (error) {
-      showToast(error.message, "warning");
-    }
-    return;
+function startScanPolling() {
+  if (!scanTimer) scanTimer = setInterval(refreshScan, 450);
+}
+
+function markScanDeviceReleased(error = "") {
+  stopStream();
+  deviceConnected = false;
+  const profile = selectedProfile();
+  if (profile) {
+    profile.connected = false;
+    profile.state = error ? "no_device" : "detected";
+    profile.error = error;
+    profile.hint = "";
   }
-  if (activeSource === "demo") {
-    startDemoScan();
-    return;
-  }
-  if (!deviceConnected) {
-    showToast("Сначала выберите и подключите обнаруженный датчик.", "warning");
-    return;
-  }
+  updateSourcePanel();
+}
+
+async function startPhysicalScan(resumePassId = null) {
+  if (!currentScanActions().start || isScanning) return;
+  scanActionBusy = true;
+  stopStream();
+  updateExportButtons();
   try {
-    const result = await apiRequest("/api/scan/start", {
-      method: "POST",
-      body: { source: activeSource },
+    await apiRequest("/api/scan/start", {
+      method: "POST", body: { source: activeSource, ...(resumePassId ? { resumePassId } : {}) },
     });
     hasScan = false;
     isScanning = true;
+    scanPhase = "capturing";
+    originalPoints = [];
     $("frameCount").textContent = "0";
     $("scanProgressFill").style.width = "0%";
+    renderPoints();
     setScanButton();
-    setTracking(
-      "tracking",
-      0,
-      "",
-      "Подготовка сканирования",
-      "Медленно перемещайте датчик, сохраняя перекрытие кадров.",
-    );
-    $("sceneModeLabel").textContent = "СКАНИРОВАНИЕ";
-    if (streamTimer) {
-      clearInterval(streamTimer);
-      streamTimer = null;
-    }
-    scanTimer = setInterval(refreshScan, 450);
+    setTracking("tracking", 0, "", "Подготовка сканирования",
+      "Медленно перемещайте датчик, сохраняя перекрытие кадров.");
+    $("sceneModeLabel").textContent = "СКАНИРОВАНИЕ · TSDF";
+    startScanPolling();
     await refreshScan();
+    await loadPasses();
   } catch (error) {
-    isScanning = false;
-    setScanButton();
     showToast(error.message, "warning");
+    if (error.code === "timeout") {
+      // The bridge may still be starting. Keep Stop/Cancel available until its
+      // actual state is known rather than assuming that the capture failed.
+      isScanning = true;
+      scanPhase = "starting";
+      startScanPolling();
+      await refreshScan();
+    } else {
+      isScanning = false;
+      // The server closes a failed sensor; a new frame request reports details.
+      if (deviceConnected && !streamTimer) {
+        streamTimer = setInterval(pollFrame, 300);
+        void pollFrame();
+      }
+    }
+  } finally {
+    scanActionBusy = false;
+    setScanButton();
+    renderPasses();
+  }
+}
+
+async function toggleScan() {
+  if (activeSource === "demo") {
+    if (isScanning) stopDemoScan();
+    else startDemoScan();
+    return;
+  }
+  if (!isScanning) {
+    await startPhysicalScan();
+    return;
+  }
+  scanActionBusy = true;
+  updateExportButtons();
+  try {
+    const result = await apiRequest("/api/scan/stop", { method: "POST", body: {} });
+    isScanning = false;
+    scanPhase = result.phase || "idle";
+    // ScanRunner releases the handle when capture stops. Reopen the stream
+    // explicitly; export stays disabled until that succeeds.
+    markScanDeviceReleased();
+    startScanPolling();
+    await refreshScan();
+    if (scanPhase !== "error") await connectSelectedSource({ reconnect: true });
+    showToast("Захват остановлен. Идёт обработка прохода.", "info");
+  } catch (error) {
+    showToast(error.message, "warning");
+    await refreshScan();
+  } finally {
+    scanActionBusy = false;
+    setScanButton();
+    renderPasses();
+  }
+}
+
+async function cancelScan() {
+  if (!isScanning || activeSource === "demo" || scanActionBusy) return;
+  scanActionBusy = true;
+  updateExportButtons();
+  try {
+    const result = await apiRequest("/api/scan/cancel", { method: "POST", body: {} });
+    if (scanTimer) clearInterval(scanTimer);
+    scanTimer = null;
+    isScanning = false;
+    scanPhase = "idle";
+    hasScan = false;
+    originalPoints = [];
+    $("frameCount").textContent = "0";
+    $("scanProgressFill").style.width = "0%";
+    markScanDeviceReleased();
+    renderPoints();
+    await loadPasses();
+    await connectSelectedSource({ reconnect: true });
+    showToast(result.keptPass
+      ? "Захват отменён; продолженный проход сохранён как прерванный."
+      : "Проход отменён; его временные файлы удалены.", "info");
+  } catch (error) {
+    showToast(error.message, "warning");
+    await refreshScan();
+  } finally {
+    scanActionBusy = false;
+    setScanButton();
+    renderPasses();
   }
 }
 
@@ -1340,67 +1387,75 @@ async function refreshScan() {
   scanBusy = true;
   try {
     const data = await apiRequest("/api/scan");
+    const previousPhase = scanPhase;
+    const wasRunning = isScanning;
     isScanning = Boolean(data.running);
-    if (Array.isArray(data.points) && data.points.length > 0) {
-      originalPoints = data.points.map(([x, y, z, depth]) => [
-        x,
-        y + 1.25,
-        z,
-        depth,
-      ]);
-      hasScan = true;
+    scanPhase = data.phase || (isScanning ? "capturing" : "idle");
+    if (wasRunning && !isScanning) markScanDeviceReleased(data.error || "");
+    hasScan = scanPhase === "ready" && Boolean(data.lastResultId);
+    if (Array.isArray(data.points) && (data.points.length > 0 || scanPhase === "ready")) {
+      originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
       renderPoints();
     }
     if (data.preview) {
       const hasRgb = paintRgb(data.preview.color);
       const hasDepth = paintDepth(data.preview.depth);
-      $("rgbDescription").textContent = hasRgb
-        ? "Кадр с Kinect 360"
-        : "RGB-поток недоступен";
-      $("depthDescription").textContent = hasDepth
-        ? "Карта глубины в реальном времени"
-        : "Карта глубины недоступна";
+      $("rgbDescription").textContent = hasRgb ? "Кадр с Kinect 360" : "RGB-поток недоступен";
+      $("depthDescription").textContent = hasDepth ? "Карта глубины в реальном времени" : "Карта глубины недоступна";
       $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
       $("depthFrameLabel").textContent = hasDepth ? "LIVE · DEPTH" : "NO DEPTH";
       $("feedState").textContent = "ПОТОК АКТИВЕН · СКАНИРОВАНИЕ";
     }
     $("frameCount").textContent = String(data.frames || 0);
-    $("scanProgressFill").style.width =
-      `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
-    const tracking = data.tracking || (data.running ? "tracking" : "stopped");
-    setTracking(
-      tracking,
-      data.speedMps || 0,
-      data.warning || data.error || "",
-      tracking === "lost"
-        ? "Отслеживание потеряно"
-        : tracking === "moving"
-          ? "Слишком быстрое движение"
-          : data.running
-            ? "Идёт сканирование"
-            : "Сканирование остановлено",
-      data.running
-        ? "Сохраняйте перекрытие между кадрами и избегайте резких поворотов."
-        : "Сканирование остановлено; облако точек сохранено.",
-    );
-    if (!data.running && scanTimer) {
-      clearInterval(scanTimer);
-      scanTimer = null;
-      setScanButton();
+    $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
+    const tracking = data.tracking || (isScanning ? "tracking" : "stopped");
+    const statusTitles = {
+      lost: "Отслеживание потеряно", too_fast: "Слишком быстрое движение",
+      few_valid_pixels: "Мало валидных пикселей", sensor_covered: "Датчик, возможно, закрыт",
+      memory_budget_reached: "Достигнут лимит памяти",
+    };
+    const failedPasses = (data.resultMetrics?.mergedPasses || []).filter((pass) => !pass.ok);
+    const mergeWarning = failedPasses.length
+      ? `Не удалось совместить проходы: ${failedPasses.map((pass) => `${pass.passId}: ${pass.reason || "нет совпадения"}`).join("; ")}. Они не вошли в результат.` : "";
+    const warning = [data.error, data.warning, data.hint, mergeWarning].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i).join(" ");
+    const title = scanPhase === "starting" ? "Подготовка сканирования" :
+      scanPhase === "finalizing" ? "Обработка прохода" :
+      scanPhase === "merging" ? "Объединение проходов" :
+      scanPhase === "error" ? "Ошибка сканирования" :
+      statusTitles[tracking] || (isScanning ? "Идёт сканирование" : hasScan ? "Результат готов" : "Ожидание");
+    const text = scanPhase === "starting" ? "Открытие датчика или восстановление сохранённых кадров ещё выполняется." :
+      scanPhase === "finalizing" ? "Извлечение сетки и проекция цвета выполняются в фоне." :
+      scanPhase === "merging" ? "Выполняется выравнивание сохранённых проходов." :
+      isScanning ? "Сохраняйте перекрытие между кадрами и избегайте резких поворотов." :
+      hasScan ? "Результат сохранён; экспорт содержит сетку и вершинные цвета." : "Подключите источник и начните новый проход.";
+    setTracking(tracking, data.speedMps || 0, warning, title, text);
+    if (hasScan) $("sceneModeLabel").textContent = data.lastResultId === "merged" ? "ОБЪЕДИНЁННЫЕ ПРОХОДЫ" : "РЕЗУЛЬТАТ ПРОХОДА";
+    const processing = isScanInProgress(scanPhase, isScanning);
+    if (!processing && scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+    if (!processing && previousPhase !== scanPhase) {
+      await loadPasses();
       if (data.error) showToast(data.error, "warning");
     }
-  } catch (error) {
-    if (scanTimer) clearInterval(scanTimer);
-    scanTimer = null;
-    isScanning = false;
     setScanButton();
-    showToast(
-      `Ошибка получения состояния сканирования. ${error.message}`,
-      "warning",
-    );
+  } catch (error) {
+    if (isScanInProgress(scanPhase, isScanning)) {
+      // A failed status request is not evidence that capture stopped. Keep
+      // polling and allow Stop/Cancel until the server confirms the outcome.
+      startScanPolling();
+      setTracking("idle", 0, error.message, "Состояние сканирования неизвестно",
+        "Ожидаем ответ моста; захват может продолжаться. При необходимости остановите или отмените его.");
+    } else {
+      if (scanTimer) clearInterval(scanTimer);
+      scanTimer = null;
+      scanPhase = "error";
+      setTracking("idle", 0, error.message, "Нет ответа о сканировании", "Повторите запрос после восстановления моста.");
+    }
+    setScanButton();
+    showToast(`Ошибка получения состояния сканирования. ${error.message}`, "warning");
   } finally {
     scanBusy = false;
     updateExportButtons();
+    renderPasses();
   }
 }
 
@@ -1409,42 +1464,90 @@ async function clearScan() {
     stopDemoScan(true);
     $("scanProgressFill").style.width = "0%";
     $("sceneModeLabel").textContent = "ДЕМО-СЦЕНА · ОЧИЩЕНО";
-    setTracking(
-      "demo",
-      0,
-      "",
-      "Данные очищены",
-      "Запустите демо-сканирование, чтобы собрать сцену заново.",
-    );
+    setTracking("demo", 0, "", "Данные очищены", "Запустите демо-сканирование, чтобы собрать сцену заново.");
     return;
   }
+  if (!currentScanActions().clear) return;
   try {
     await apiRequest("/api/scan/clear", { method: "POST", body: {} });
-    if (scanTimer) clearInterval(scanTimer);
-    scanTimer = null;
-    isScanning = false;
+    scanPhase = "idle";
     hasScan = false;
     originalPoints = [];
     $("frameCount").textContent = "0";
     $("scanProgressFill").style.width = "0%";
     setScanButton();
     renderPoints();
-    setTracking(
-      deviceConnected ? "tracking" : "idle",
-      0,
-      "",
-      "Облако очищено",
-      "Поток датчика остаётся подключённым; сканирование остановлено.",
-    );
-    if (deviceConnected && !streamTimer) {
-      pollFrame();
-      streamTimer = setInterval(pollFrame, 300);
-    }
-    showToast("Собранное облако точек очищено.", "success");
+    setTracking("tracking", 0, "", "Просмотр очищен", "Сохранённые проходы остаются на диске.");
+    showToast("Просмотр очищен. Сохранённые проходы не удалены.", "success");
   } catch (error) {
     showToast(error.message, "warning");
   }
 }
+
+async function loadPasses() {
+  if (bridgeHealth?.ok !== true) return;
+  try {
+    const result = await apiRequest("/api/scan/passes");
+    savedPasses = result.passes || [];
+    const finished = new Set(savedPasses.filter((pass) => pass.state === "finished").map((pass) => pass.id));
+    selectedPassIds = new Set([...selectedPassIds].filter((id) => finished.has(id)));
+    renderPasses();
+  } catch (error) {
+    $("passesList").textContent = `Не удалось получить список проходов. ${error.message}`;
+  }
+}
+
+function renderPasses() {
+  const list = $("passesList");
+  if (!list) return;
+  const environment = environmentStatus(setupState, bridgeHealth);
+  const busy = isScanning || scanActionBusy || ["finalizing", "merging"].includes(scanPhase);
+  const labels = { finished: "Завершён", interrupted: "Прерван", running: "Идёт захват", empty: "Пустой" };
+  if (!savedPasses.length) {
+    list.innerHTML = '<p class="passes-empty">Сохранённых проходов пока нет.</p>';
+  } else {
+    list.innerHTML = savedPasses.map((pass) => {
+      const id = escapeHtml(pass.id);
+      const done = pass.state === "finished";
+      const resumable = pass.state === "interrupted" && pass.source === activeSource;
+      const status = labels[pass.state] || pass.state;
+      const selectable = done && environment.ready && !busy;
+      return `<div class="pass-row"><label><input type="checkbox" data-pass-check="${id}" ${selectedPassIds.has(pass.id) ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="Выбрать ${escapeHtml(pass.name || pass.id)} для объединения"><span><strong>${escapeHtml(pass.name || pass.id)}</strong><small>${escapeHtml(status)} · кадров: ${Number(pass.frames || 0)} · ${id}</small></span></label><div class="pass-buttons">${done ? `<button data-pass-action="select" data-pass-id="${id}" ${environment.ready && !busy ? "" : "disabled"}>Показать</button>` : ""}${resumable ? `<button data-pass-action="resume" data-pass-id="${id}" ${currentScanActions().start && !busy ? "" : "disabled"}>Продолжить</button>` : ""}<button data-pass-action="delete" data-pass-id="${id}" ${environment.ready && !busy ? "" : "disabled"}>Удалить</button></div></div>`;
+    }).join("");
+  }
+  $("mergePassesButton").disabled = !environment.ready || !deviceConnected || busy || selectedPassIds.size < 2;
+}
+
+$("passesList").onchange = (event) => {
+  const id = event.target.dataset.passCheck;
+  if (!id) return;
+  if (event.target.checked) selectedPassIds.add(id); else selectedPassIds.delete(id);
+  renderPasses();
+};
+$("passesList").onclick = async (event) => {
+  const button = event.target.closest("button[data-pass-action]");
+  if (!button) return;
+  const id = button.dataset.passId;
+  const action = button.dataset.passAction;
+  if (action === "resume") { await startPhysicalScan(id); return; }
+  if (action === "delete" && !window.confirm("Удалить сохранённый проход и его файлы?")) return;
+  try {
+    await apiRequest(`/api/scan/passes/${action}`, { method: "POST", body: { passId: id } });
+    await loadPasses();
+    await refreshScan();
+    if (action === "delete") showToast("Проход удалён.", "info");
+  } catch (error) { showToast(error.message, "warning"); }
+};
+$("refreshPassesButton").onclick = loadPasses;
+$("mergePassesButton").onclick = async () => {
+  try {
+    await apiRequest("/api/scan/merge", { method: "POST", body: { passIds: [...selectedPassIds] } });
+    scanPhase = "merging";
+    hasScan = false;
+    startScanPolling();
+    await refreshScan();
+  } catch (error) { showToast(error.message, "warning"); }
+};
 
 function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob);
@@ -1499,8 +1602,8 @@ async function exportScan(format) {
     exportDemo(format);
     return;
   }
-  if (!hasScan) {
-    showToast("Сначала выполните сканирование.", "warning");
+  if (!currentScanActions().export) {
+    showToast("Подключите источник и дождитесь завершения обработки прохода.", "warning");
     return;
   }
   try {
@@ -1519,7 +1622,7 @@ async function exportScan(format) {
     const blob = await response.blob();
     downloadBlob(blob, `depth-studio-scan.${format}`);
     showToast(
-      `Облако точек экспортировано в ${format.toUpperCase()}.`,
+      `Результат экспортирован в ${format.toUpperCase()}.`,
       "success",
     );
   } catch (error) {
@@ -1527,35 +1630,44 @@ async function exportScan(format) {
   }
 }
 
-$("sourceSelect").onchange = (event) => {
-  if (isScanning) {
-    showToast(
-      "Сначала остановите сканирование, затем смените источник.",
-      "warning",
-    );
+$("sourceSelect").onchange = async (event) => {
+  if (isScanning || scanActionBusy || deviceActionBusy || ["finalizing", "merging"].includes(scanPhase)) {
+    showToast("Дождитесь окончания текущего прохода перед сменой источника.", "warning");
     event.target.value = activeSource;
     return;
   }
+  const nextSource = event.target.value;
+  const previousSource = activeSource;
+  const wasConnected = deviceConnected;
   stopStream();
-  activeSource = event.target.value;
+  if (wasConnected && previousSource !== "demo") {
+    try { await apiRequest("/api/devices/disconnect", { method: "POST", body: { source: previousSource } }); }
+    catch (error) { showToast(error.message, "warning"); }
+  }
+  activeSource = nextSource;
   deviceConnected = false;
   hasScan = false;
   originalPoints = activeSource === "demo" ? demoPoints.slice() : [];
   $("frameCount").textContent = "0";
   $("scanProgressFill").style.width = "0%";
-  $("sceneModeLabel").textContent =
-    activeSource === "demo" ? "ДЕМО-СЦЕНА" : "ИСТОЧНИК НЕ ПОДКЛЮЧЁН";
+  $("sceneModeLabel").textContent = activeSource === "demo" ? "ДЕМО-СЦЕНА" : "ИСТОЧНИК НЕ ПОДКЛЮЧЁН";
   renderPoints();
-  if (activeSource === "demo") renderDemoFeeds();
-  else drawNoSignal();
+  if (activeSource === "demo") renderDemoFeeds(); else drawNoSignal();
   updateSourcePanel();
+  setScanButton();
+  if (activeSource !== "demo" && bridgeHealth?.ok) {
+    await loadPasses();
+    await refreshScan();
+  }
 };
 $("detectButton").onclick = probeDevices;
-$("connectButton").onclick = connectSelectedSource;
+$("connectButton").onclick = () => connectSelectedSource();
 $("scanButton").onclick = toggleScan;
+$("cancelScanButton").onclick = cancelScan;
 $("clearButton").onclick = clearScan;
 $("exportPly").onclick = () => exportScan("ply");
 $("exportObj").onclick = () => exportScan("obj");
+$("exportGlb").onclick = () => exportScan("glb");
 
 $("pointSize").oninput = (event) => {
   const value = Number(event.target.value);
@@ -1593,24 +1705,14 @@ document.addEventListener("keydown", (event) => {
 /* --- Среда Depth Studio: экран настройки, прогресс и журнал --------------- */
 let setupState = null;
 let setupPollTimer = null;
-let setupPollAttempts = 0;
 
 async function fetchSetupState() {
   try {
-    const response = await fetch("/app/setup", { cache: "no-store" });
-    const type = response.headers.get("content-type") || "";
-    if (!response.ok || !type.includes("application/json")) return null;
-    return await response.json();
+    const state = await apiRequest("/app/setup", { timeoutMs: 4000 });
+    return typeof state?.phase === "string" ? state : null;
   } catch {
     return null;
   }
-}
-
-function setupHeadline(state) {
-  if (state.phase === "ready") return "Среда Depth Studio готова";
-  if (state.phase === "failed") return "Настройка среды не завершена — доступен деморежим";
-  if (state.phase === "running") return "Настройка среды выполняется…";
-  return "Среда Depth Studio ещё не настроена";
 }
 
 function renderEnvironmentSummary(state) {
@@ -1630,8 +1732,9 @@ function renderEnvironmentSummary(state) {
     return;
   }
   const isolated = environment?.isolated ?? Boolean(python?.executable);
-  const headline = state.phase ? setupHeadline(state) : "Python-мост Depth Studio запущен";
-  summary.textContent = `${state.phase === "ready" ? "Среда готова" : headline} · ${envDir}`;
+  const headline = state.phase ? setupHeadline(state, bridgeHealth) :
+    bridgeHealth?.ok ? "Python-мост Depth Studio запущен" : "Ожидание Python-моста Depth Studio";
+  summary.textContent = `${headline} · ${envDir}`;
   const pieces = [
     python?.version ? `Python ${python.version}` : null,
     numpyVersion ? `NumPy ${numpyVersion}` : "NumPy не проверен",
@@ -1645,46 +1748,50 @@ function renderSetupBanner(state) {
   const banner = $("setupBanner");
   if (!banner) return;
   if (!state) {
-    banner.hidden = true;
-    renderEnvironmentSummary(null);
+    banner.hidden = true; // web/demo mode has no desktop setup service
+    renderEnvironmentSummary(bridgeHealth ? { environment: bridgeHealth.environment } : null);
+    updateExportButtons();
     return;
   }
   setupState = state;
-  const ready = state.phase === "ready";
-  const bridgeReady = Boolean(state.bridge?.ready);
-  const open3dMissing = state.packages?.open3d?.available === false;
-  renderEnvironmentSummary(state);
-  if (ready && bridgeReady && !open3dMissing) {
+  const setupReady = state.phase === "ready";
+  const bridgeReady = Boolean(state.bridge?.ready) && bridgeHealth?.ok === true;
+  const open3dMissing = state.packages?.open3d?.available === false ||
+    (bridgeHealth?.ok === true && bridgeHealth.modules?.open3d !== true);
+  const numpyMissing = state.packages?.numpy?.available === false ||
+    (bridgeHealth?.ok === true && bridgeHealth.modules?.numpy !== true);
+  renderEnvironmentSummary({ ...state, environment: bridgeHealth?.environment });
+  if (setupReady && bridgeReady && !open3dMissing && !numpyMissing) {
     banner.hidden = true;
+    updateExportButtons();
     return;
   }
   banner.hidden = false;
-  banner.dataset.phase = ready && !open3dMissing ? "bridge" : ready ? "warning" : state.phase || "idle";
-  $("setupTitle").textContent =
-    ready && open3dMissing ? "Open3D недоступен: сканирование с датчиком выключено" : setupHeadline(state);
+  banner.dataset.phase = setupReady && !bridgeReady ? "bridge" : setupReady ? "warning" : state.phase || "idle";
+  $("setupTitle").textContent = setupReady && bridgeReady && (open3dMissing || numpyMissing)
+    ? `${open3dMissing ? "Open3D" : "NumPy"} недоступен: сканирование с датчиком выключено`
+    : setupHeadline(state, bridgeHealth);
   const parts = [];
   if (state.phase === "failed" && state.error?.message) parts.push(state.error.message);
   if (state.phase === "failed" && state.error?.hint) parts.push(state.error.hint);
-  if (ready && !bridgeReady) {
-    parts.push(state.bridge?.error || "Python-мост запускается; деморежим уже доступен.");
+  if (setupReady && !bridgeReady) {
+    parts.push(state.bridge?.error || "Python-мост запускается или ещё не ответил; деморежим доступен.");
   }
-  if (ready && open3dMissing) {
-    parts.push(
-      "Совмещение кадров и сканирование с датчиком требуют Open3D. Обычно не хватает Microsoft Visual C++ 2015–2022 Redistributable (x64) — установите его вручную, затем нажмите «Повторить». Деморежим и экспорт работают.",
-    );
+  if (setupReady && bridgeReady && open3dMissing) {
+    parts.push("Сканирование с датчиком требует Open3D. Проверьте Microsoft Visual C++ 2015–2022 Redistributable (x64), затем повторите настройку. Деморежим доступен.");
   }
-  if (!ready) {
-    parts.push("Деморежим работает сразу: 3D-сцена, синтетический поток и экспорт PLY/OBJ доступны без датчика.");
-  }
+  if (setupReady && bridgeReady && numpyMissing) parts.push("Восстановите среду Depth Studio, чтобы установить NumPy.");
+  if (!setupReady) parts.push("Деморежим работает сразу: синтетическая сцена и экспорт PLY/OBJ доступны без датчика.");
   $("setupText").textContent = parts.join(" ");
   renderSetupRemedies(state);
   renderSetupDetails(state);
   const running = state.phase === "running";
   $("setupProgressWrap").hidden = !running;
   $("setupProgressFill").style.width = `${Math.max(0, Math.min(100, state.progress || 0))}%`;
-  $("setupRetryBtn").hidden = ready;
+  $("setupRetryBtn").hidden = setupReady && bridgeReady && !open3dMissing && !numpyMissing;
   $("setupRetryBtn").disabled = running;
   $("setupRepairBtn").disabled = running;
+  updateExportButtons();
 }
 
 function renderSetupRemedies(state) {
@@ -1732,19 +1839,31 @@ async function copySetupLog() {
   }
 }
 
-function scheduleSetupPoll(delay = 1500) {
+function scheduleSetupPoll(delay = 3000) {
   clearTimeout(setupPollTimer);
-  if (setupPollAttempts > 240) return;
   setupPollTimer = setTimeout(async () => {
-    setupPollAttempts += 1;
-    const state = await fetchSetupState();
-    renderSetupBanner(state);
-    const settled = state && state.phase === "ready" && state.bridge?.ready;
-    if (!settled) {
-      scheduleSetupPoll(setupState?.phase === "running" ? 1200 : 3000);
-    } else {
-      loadDevices();
+    const wasOnline = bridgeHealth?.ok === true;
+    const [state, health] = await Promise.all([
+      fetchSetupState(),
+      apiRequest("/api/health").catch(() => null),
+    ]);
+    if (state) setupState = state;
+    bridgeHealth = health?.ok === true ? health : null;
+    if (bridgeHealth && (!wasOnline || !devicesAvailable)) {
+      await loadDevices(bridgeHealth);
+      if (activeSource !== "demo") await loadPasses();
+    } else if (!bridgeHealth && wasOnline) {
+      devicesAvailable = false;
+      stopStream();
+      deviceConnected = false;
+      $("serverNote").innerHTML = '<span class="server-note-dot"></span><span>Локальный мост не отвечает · демо доступно</span>';
+      updateSourcePanel();
     }
+    renderSetupBanner(setupState);
+    updateExportButtons();
+    renderPasses();
+    // Continue checking even after startup: the bridge can exit or recover later.
+    scheduleSetupPoll(setupState?.phase === "running" ? 1200 : 3000);
   }, delay);
 }
 
@@ -1767,7 +1886,6 @@ async function runSetupAction(mode) {
         "success",
       );
     }
-    setupPollAttempts = 0;
     renderSetupBanner(payload.state || setupState);
     scheduleSetupPoll(700);
   } catch (error) {
@@ -1792,10 +1910,11 @@ $("setupCopyLogBtn").onclick = copySetupLog;
 $("envRetryBtn").onclick = () => runSetupAction("retry");
 $("envLogBtn").onclick = revealSetupLog;
 
-async function initEnvironmentUi() {
-  const state = await fetchSetupState();
-  renderSetupBanner(state);
-  if (state && !(state.phase === "ready" && state.bridge?.ready)) scheduleSetupPoll(1200);
+function initEnvironmentUi() {
+  devices = fallbackDevices();
+  renderSourceOptions();
+  updateSourcePanel();
+  scheduleSetupPoll(0);
 }
 
 // Demo is immediately usable without Python, a camera, or a depth sensor.
@@ -1803,5 +1922,4 @@ originalPoints = demoPoints.slice();
 renderPoints();
 renderDemoFeeds();
 updateSourcePanel();
-loadDevices();
 initEnvironmentUi();

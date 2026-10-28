@@ -30,9 +30,11 @@ PREVIEW_POINTS = 14000
 
 
 class ScanRunner:
-    def __init__(self, storage: ScanStorage, capture_lock: threading.Lock | None = None):
+    def __init__(self, storage: ScanStorage, capture_lock: threading.Lock | None = None,
+                 on_sensor_release=None):
         self.storage = storage
         self.capture_lock = capture_lock or threading.Lock()
+        self.on_sensor_release = on_sensor_release
         self.lock = threading.RLock()
         self.active = None           # dict: pass_id, name, engine, store, adapter, thread, stop, source
         self.phase = "idle"          # idle | capturing | finalizing | merging | ready | error
@@ -44,95 +46,167 @@ class ScanRunner:
         self.last_preview = None
         self._finalizer = None
         self._merger = None
+        self._finalizing_pass_id = None
+        self.last_pass_id = None
+        self.last_frames = 0
+        self.last_keyframes = 0
 
     # ----- запуск -----------------------------------------------------------
     def start(self, adapter, *, source: str, settings: ScanSettings, intrinsics: Intrinsics,
               name: str = "", resume_pass_id: str | None = None, up_world=None) -> dict:
         with self.lock:
-            if self.active is not None or (self._finalizer and self._finalizer.is_alive()):
+            if self.active is not None or self._working():
                 raise RuntimeError("Предыдущий проход ещё не завершён. Дождитесь окончания или отмените его.")
+            settings.validate()
+            store = None
+            engine = None
+            try:
+                if resume_pass_id:
+                    store = self.storage.store(resume_pass_id)
+                    manifest = store.manifest()
+                    if manifest.get("state") not in ("interrupted", "running", "finished"):
+                        raise ValueError("Этот проход нельзя продолжить.")
+                    if manifest.get("source") != source:
+                        raise ValueError("Для продолжения выберите тот же источник, которым снят проход.")
+                    saved_intrinsics = Intrinsics.from_dict(manifest["intrinsics"])
+                    if (saved_intrinsics.width, saved_intrinsics.height) != (intrinsics.width, intrinsics.height):
+                        raise ValueError("Разрешение датчика не совпадает с сохранённым проходом.")
+                    saved = ScanSettings(**{k: v for k, v in manifest["settings"].items()
+                                            if k in ScanSettings.__dataclass_fields__})
+                    engine = ScanEngine(saved.validate(), saved_intrinsics, store=None, clock=time.monotonic)
+                    replayed = engine.resume_from(store.load_keyframes())
+                    engine.store = store
+                    pass_id = resume_pass_id
+                    name = manifest.get("name", name)
+                    store.update_manifest(state="running", error="", resumes=manifest.get("resumes", 0) + 1,
+                                          replayedKeyframes=replayed)
+                else:
+                    pass_id = self.storage.new_pass_id()
+                    store = self.storage.store(pass_id)
+                    if self.storage.free_mb() < 512:
+                        raise RuntimeError("Мало места на диске для сохранения прохода (нужно не меньше 512 МБ).")
+                    # Не оставлять пустой проход на диске, если Open3D не загрузился.
+                    engine = ScanEngine(settings, intrinsics, store=None, clock=time.monotonic)
+                    name = name or f"Проход {len(self.storage_list_ids()) + 1}"
+                    store.create(pass_id, name, settings, intrinsics, source, up_world=up_world)
+                    engine.store = store
+                    replayed = 0
+            except Exception:
+                if engine is not None:
+                    engine.release()
+                raise
+            stop = threading.Event()
+            engine_lock = threading.RLock()
+            thread = threading.Thread(target=self._capture_loop,
+                                      args=(adapter, engine, engine_lock, store, stop, pass_id, source),
+                                      name="depth-studio-scanner", daemon=True)
+            self.active = {"pass_id": pass_id, "name": name, "engine": engine, "engine_lock": engine_lock,
+                           "store": store, "adapter": adapter, "thread": thread, "stop": stop, "source": source,
+                           "replayed": replayed, "resumed": bool(resume_pass_id), "frames_at_save": 0}
             self.phase = "capturing"
             self.error = ""
             self.merged = None
-            self.results.clear()  # смена прохода освобождает результаты предыдущего
+            self.results.clear()
             self.last_result_id = None
+            self.last_pass_id = pass_id
+            self.last_frames = 0
+            self.last_keyframes = replayed
             self.last_preview = None
-            if resume_pass_id:
-                store = self.storage.store(resume_pass_id)
-                manifest = store.manifest()
-                if manifest.get("state") not in ("interrupted", "running", "finished"):
-                    raise ValueError("Этот проход нельзя продолжить.")
-                saved = ScanSettings(**{k: v for k, v in manifest["settings"].items()
-                                        if k in ScanSettings.__dataclass_fields__})
-                engine = ScanEngine(saved.validate(), Intrinsics.from_dict(manifest["intrinsics"]),
-                                    store=None, clock=time.monotonic)
-                replayed = engine.resume_from(store.load_keyframes())
-                engine.store = store
-                pass_id = resume_pass_id
-                name = manifest.get("name", name)
-                store.update_manifest(state="running", resumes=manifest.get("resumes", 0) + 1,
-                                      replayedKeyframes=replayed)
-            else:
-                pass_id = self.storage.new_pass_id()
-                store = self.storage.store(pass_id)
-                if self.storage.free_mb() < 512:
-                    raise RuntimeError("Мало места на диске для сохранения прохода (нужно не меньше 512 МБ).")
-                store.create(pass_id, name or f"Проход {len(self.storage_list_ids()) + 1}",
-                             settings, intrinsics, source, up_world=up_world)
-                engine = ScanEngine(settings, intrinsics, store=store, clock=time.monotonic)
-                replayed = 0
-            stop = threading.Event()
-            thread = threading.Thread(target=self._capture_loop, args=(adapter, engine, store, stop, pass_id),
-                                      name="depth-studio-scanner", daemon=True)
-            self.active = {"pass_id": pass_id, "name": name, "engine": engine, "store": store,
-                           "adapter": adapter, "thread": thread, "stop": stop, "source": source,
-                           "replayed": replayed, "errors": 0, "frames_at_save": 0}
-            thread.start()
+            self.last_event = {}
+            try:
+                thread.start()
+            except Exception:
+                self.active = None
+                self.phase = "error"
+                engine.release()
+                store.update_manifest(state="interrupted")
+                raise
             return {"passId": pass_id, "name": name, "replayedKeyframes": replayed}
 
+    def _working(self):
+        return bool((self._finalizer and self._finalizer.is_alive()) or
+                    (self._merger and self._merger.is_alive()))
+
+    def list_passes(self):
+        with self.lock:
+            live = [self.active["pass_id"]] if self.active else []
+            if self._finalizing_pass_id:
+                live.append(self._finalizing_pass_id)
+            return self.storage.list_passes(live_ids=live)
+
     def storage_list_ids(self):
-        return [p["id"] for p in self.storage.list_passes()]
+        return [p["id"] for p in self.list_passes()]
 
     # ----- поток захвата ----------------------------------------------------
-    def _capture_loop(self, adapter, engine, store, stop, pass_id):
+    def _capture_loop(self, adapter, engine, engine_lock, store, stop, pass_id, source):
         consecutive = 0
         try:
             while not stop.is_set():
                 try:
                     with self.capture_lock:
+                        if stop.is_set():
+                            break
                         frame = adapter.capture()
                     consecutive = 0
                 except Exception as exc:  # noqa: BLE001 - ошибка датчика должна стать видимой
+                    if stop.is_set():
+                        break
                     consecutive += 1
-                    self._set_warning(f"Ошибка чтения кадра ({consecutive}/{MAX_CONSECUTIVE_ERRORS}): {exc}")
+                    hint = getattr(exc, "hint", "")
+                    self._set_warning(f"Ошибка чтения кадра ({consecutive}/{MAX_CONSECUTIVE_ERRORS}): {exc} {hint}".strip())
                     if consecutive >= MAX_CONSECUTIVE_ERRORS:
-                        self._fail(f"Датчик перестал отдавать кадры: {exc}")
+                        self._fail(f"Датчик перестал отдавать кадры: {exc} {hint}".strip(),
+                                   detail=traceback.format_exc())
                         return
-                    time.sleep(0.2)
+                    stop.wait(0.2)
                     continue
-                event = engine.process(frame.depth_mm, frame.color_rgb, frame.captured_at)
+                with engine_lock:
+                    event = engine.process(frame.depth_mm, frame.color_rgb, frame.captured_at)
+                    warning = engine.warning
+                    frames_seen = engine.frames_seen
                 with self.lock:
                     self.last_event = event
                     self.last_preview = {"color": frame.color_rgb, "depth": frame.depth_mm}
-                    if engine.warning:
-                        self._sync_warning(engine)
-                if engine.frames_seen - self.active["frames_at_save"] >= SAVE_EVERY_FRAMES:
-                    self.active["frames_at_save"] = engine.frames_seen
+                    warnings = [text for text in (getattr(frame, "warning", ""), warning) if text]
+                    if warnings:
+                        self.last_event = {**self.last_event, "warning": " ".join(warnings)}
+                    active = self.active
+                    should_save = active is not None and frames_seen - active["frames_at_save"] >= SAVE_EVERY_FRAMES
+                    if should_save:
+                        active["frames_at_save"] = frames_seen
+                if should_save:
                     self._save_manifest_progress(engine, store)
         except Exception as exc:  # noqa: BLE001
             self._fail(f"Внутренняя ошибка конвейера: {exc}", detail=traceback.format_exc())
         finally:
             self._release_sensor(adapter)
             self._save_manifest_progress(engine, store)
-
-    def _sync_warning(self, engine):
-        self.last_event = {**self.last_event, "warning": engine.warning}
+            with self.lock:
+                failed = self.phase == "error" and self.active is not None and self.active["pass_id"] == pass_id
+                error = self.error if failed else ""
+                self.last_frames = engine.frames_seen
+                self.last_keyframes = engine.integrated
+            # Invalidate the server's connection before clearing active. Otherwise
+            # /api/frame could reopen the adapter in between those two operations.
+            if self.on_sensor_release:
+                try:
+                    self.on_sensor_release(source, error)
+                except Exception:  # noqa: BLE001 - освобождение не должно скрывать ошибку захвата
+                    traceback.print_exc()
+            if failed:
+                with self.lock:
+                    if self.active is not None and self.active["pass_id"] == pass_id:
+                        engine.release()
+                        self.active = None
 
     def _set_warning(self, text):
         with self.lock:
             self.last_event = {**self.last_event, "warning": text}
 
     def _fail(self, text, detail=""):
+        print(f"[Depth Studio] Ошибка сканирования: {text}", flush=True)
+        if detail:
+            print(detail, flush=True)
         with self.lock:
             self.error = text
             self.phase = "error"
@@ -164,32 +238,48 @@ class ScanRunner:
             pass
 
     # ----- завершение -------------------------------------------------------
+    def _join_capture(self, active):
+        active["stop"].set()
+        active["thread"].join(timeout=5.0)
+        if active["thread"].is_alive():
+            # Нельзя освобождать TSDF/удалять файлы, пока поток ещё их использует.
+            raise RuntimeError("Обработка текущего кадра ещё завершается. Подождите и повторите.")
+
     def stop(self, *, finish: bool = True) -> dict:
-        """Остановить захват. finish=True — извлечь меш и сохранить проход (асинхронно)."""
+        """Остановить захват; меш и цвет вычисляются асинхронно."""
         with self.lock:
             active = self.active
             if active is None:
+                if self.phase == "error":
+                    return {"ok": False, "message": self.error or "Захват остановлен с ошибкой."}
                 return {"ok": True, "message": "Сканирование не запущено."}
-            active["stop"].set()
-        active["thread"].join(timeout=5.0)
+            if self.phase != "error":
+                self.phase = "stopping"
+        self._join_capture(active)
         with self.lock:
+            if self.active is not active:
+                return {"ok": False, "message": self.error or "Захват остановлен с ошибкой."}
             self.active = None
         engine, store = active["engine"], active["store"]
         if not finish:
             engine.release()
+            store.update_manifest(state="interrupted")
+            with self.lock:
+                self.phase = "idle"
             return {"ok": True}
         if engine.integrated == 0:
             engine.release()
             store.update_manifest(state="empty")
             with self.lock:
-                self.phase = "error" if self.error else "idle"
+                self.phase = "error"
                 self.error = self.error or "Проход пуст: ни один кадр не интегрирован. Попробуйте ещё раз."
             return {"ok": False, "message": self.error}
         with self.lock:
             self.phase = "finalizing"
-        self._finalizer = threading.Thread(target=self._finalize, args=(active,),
-                                           name="depth-studio-finalizer", daemon=True)
-        self._finalizer.start()
+            self._finalizing_pass_id = active["pass_id"]
+            self._finalizer = threading.Thread(target=self._finalize, args=(active,),
+                                               name="depth-studio-finalizer", daemon=True)
+            self._finalizer.start()
         return {"ok": True, "phase": "finalizing", "passId": active["pass_id"]}
 
     def _finalize(self, active):
@@ -206,13 +296,18 @@ class ScanRunner:
                 self.last_result_id = pass_id
                 self.phase = "ready"
         except Exception as exc:  # noqa: BLE001
+            engine.release()
             with self.lock:
                 self.phase = "error"
                 self.error = f"Не удалось извлечь меш прохода: {exc}"
+            print(f"[Depth Studio] {self.error}\n{traceback.format_exc()}", flush=True)
             try:
                 store.update_manifest(state="interrupted", error=str(exc))
             except OSError:
                 pass
+        finally:
+            with self.lock:
+                self._finalizing_pass_id = None
 
     @staticmethod
     def _write_result(store, arrays, metrics):
@@ -229,24 +324,39 @@ class ScanRunner:
         with self.lock:
             active = self.active
             if active is None:
+                if self._working():
+                    raise RuntimeError("Обработка прохода уже началась; дождитесь её окончания.")
                 return {"ok": True}
-            active["stop"].set()
-        active["thread"].join(timeout=5.0)
+            self.phase = "stopping"
+        self._join_capture(active)
         with self.lock:
+            if self.active is not active:
+                raise RuntimeError(self.error or "Захват остановлен с ошибкой.")
             self.active = None
             self.phase = "idle"
             self.last_event = {}
+            self.last_pass_id = None
+            self.last_frames = self.last_keyframes = 0
+            self.last_preview = None
         active["engine"].release()
+        if active["resumed"]:
+            # A resumed pass already contained saved keyframes before this
+            # capture. Cancelling must never delete the user's earlier work.
+            active["store"].update_manifest(state="interrupted")
+            return {"ok": True, "keptPass": True, "passId": active["pass_id"]}
         active["store"].delete()
-        return {"ok": True}
+        return {"ok": True, "keptPass": False}
 
     def clear_view(self) -> dict:
-        """Очистить то, что показано на экране (сохранённые проходы остаются на диске)."""
+        """Очистить экран, не удаляя сохранённые проходы."""
         with self.lock:
-            if self.active is not None:
-                raise RuntimeError("Сначала завершите или отмените текущий проход.")
+            if self.active is not None or self._working():
+                raise RuntimeError("Сначала завершите обработку или отмените текущий проход.")
             self.results.clear()
             self.merged = None
+            self.last_result_id = None
+            self.last_pass_id = None
+            self.last_frames = self.last_keyframes = 0
             self.phase = "idle"
             self.error = ""
             self.last_event = {}
@@ -255,25 +365,59 @@ class ScanRunner:
 
     def delete_pass(self, pass_id: str) -> dict:
         with self.lock:
-            if self.active is not None and self.active["pass_id"] == pass_id:
-                raise RuntimeError("Нельзя удалить проход, который сейчас сканируется.")
+            if self.active is not None or self._working():
+                raise RuntimeError("Нельзя удалить проход во время захвата или обработки.")
+            store = self.storage.store(pass_id)
+            if not store.manifest_path.exists():
+                raise ValueError("Проход не найден.")
             self.results.pop(pass_id, None)
-        self.storage.store(pass_id).delete()
+            if self.last_result_id == pass_id:
+                self.last_result_id = None
+                self.last_pass_id = None
+                self.last_frames = self.last_keyframes = 0
+                self.last_event = {}
+                self.phase = "idle"
+            store.delete()
         return {"ok": True}
+
+    def select_pass(self, pass_id: str) -> dict:
+        """Загрузить завершённый проход с диска в просмотр и для экспорта."""
+        with self.lock:
+            if self.active is not None or self._working():
+                raise RuntimeError("Дождитесь окончания текущего прохода.")
+            arrays, manifest = self._load_result(pass_id)
+            if manifest.get("state") != "finished":
+                raise ValueError("Для просмотра выберите завершённый проход.")
+            metrics_path = self.storage.store(pass_id).directory / "metrics.json"
+            metrics = json.loads(metrics_path.read_text("utf-8"))
+            self.results = {pass_id: {"arrays": arrays, "metrics": metrics}}
+            self.merged = None
+            self.last_result_id = self.last_pass_id = pass_id
+            self.last_frames = manifest.get("frames", 0)
+            self.last_keyframes = manifest.get("keyframes", 0)
+            self.last_event = {}
+            self.error = ""
+            self.phase = "ready"
+            return {"ok": True, "passId": pass_id}
 
     # ----- слияние проходов (KScan3D) ---------------------------------------
     def merge(self, pass_ids: list[str], *, remove_floor: bool = False) -> dict:
-        if len(pass_ids) < 2:
-            raise ValueError("Для объединения выберите не меньше двух проходов.")
+        if not isinstance(pass_ids, list) or len(pass_ids) < 2 or len(set(pass_ids)) != len(pass_ids):
+            raise ValueError("Для объединения выберите не меньше двух разных проходов.")
         with self.lock:
-            if self.active is not None:
-                raise RuntimeError("Сначала завершите текущий проход.")
-            if self._finalizer and self._finalizer.is_alive():
-                raise RuntimeError("Проход ещё обрабатывается.")
+            if self.active is not None or self._working():
+                raise RuntimeError("Сначала завершите текущий проход и его обработку.")
+            for pass_id in pass_ids:
+                store = self.storage.store(pass_id)
+                if not store.manifest_path.exists() or store.manifest().get("state") != "finished":
+                    raise ValueError("Объединять можно только завершённые проходы.")
+                if not (store.directory / "result.npz").exists():
+                    raise ValueError("У одного из проходов отсутствует сохранённый результат.")
             self.phase = "merging"
-        self._merger = threading.Thread(target=self._merge_worker, args=(list(pass_ids), remove_floor),
-                                        name="depth-studio-merger", daemon=True)
-        self._merger.start()
+            self.error = ""
+            self._merger = threading.Thread(target=self._merge_worker, args=(list(pass_ids), remove_floor),
+                                            name="depth-studio-merger", daemon=True)
+            self._merger.start()
         return {"ok": True, "phase": "merging"}
 
     def _load_result(self, pass_id):
@@ -338,6 +482,7 @@ class ScanRunner:
             with self.lock:
                 self.phase = "error"
                 self.error = f"Объединение не удалось: {exc}"
+            print(f"[Depth Studio] {self.error}\n{traceback.format_exc()}", flush=True)
 
     # ----- экспорт ----------------------------------------------------------
     def export(self, fmt: str, target: str | None = None):
@@ -357,8 +502,11 @@ class ScanRunner:
                     entry = self.results[pass_id]
                     arrays, metrics = entry["arrays"], entry["metrics"]
                 else:
+                    store = self.storage.store(pass_id)
+                    if store.manifest().get("state") != "finished":
+                        raise RuntimeError("Экспорт доступен только для завершённого прохода.")
                     arrays, manifest = self._load_result(pass_id)
-                    metrics = json.loads((self.storage.store(pass_id).directory / "metrics.json").read_text("utf-8"))
+                    metrics = json.loads((store.directory / "metrics.json").read_text("utf-8"))
                 stem = f"depth-studio-{pass_id}"
         args = (arrays["vertices"], arrays["normals"], arrays["colors"], arrays["faces"], metrics)
         if fmt == "ply":
@@ -381,14 +529,20 @@ class ScanRunner:
             pipeline = None
             quality = None
             if engine is not None:
-                count = engine.fusion.surface_voxels_estimate
-                pipeline = engine.pipeline_info()
-                quality = engine.quality_summary()
-                points = _preview(engine.model_points(preview_points))
-            elif self.merged is not None:
+                with active["engine_lock"]:
+                    count = engine.fusion.surface_voxels_estimate
+                    pipeline = engine.pipeline_info()
+                    quality = engine.quality_summary()
+                    points = _preview(engine.model_points(preview_points))
+                    frames = engine.frames_seen
+                    keyframes = engine.integrated
+                    speed = float(engine.last_step[0]) * TARGET_FPS
+            else:
+                frames, keyframes, speed = self.last_frames, self.last_keyframes, 0.0
+            if engine is None and self.merged is not None:
                 count = self.merged["metrics"]["points"]
                 points = _preview_mesh(self.merged["arrays"]["vertices"], preview_points)
-            elif self.last_result_id and self.last_result_id in self.results:
+            elif engine is None and self.last_result_id and self.last_result_id in self.results:
                 arrays = self.results[self.last_result_id]["arrays"]
                 count = len(arrays["vertices"])
                 points = _preview_mesh(arrays["vertices"], preview_points)
@@ -396,15 +550,14 @@ class ScanRunner:
             preview = None
             if running and self.last_preview is not None:
                 preview = _encode_preview(self.last_preview)
-            speed = float(engine.last_step[0]) * TARGET_FPS if engine is not None else 0.0
             tracking = event.get("state", "idle") if running else ("stopped" if phase == "ready" else "idle")
             return {
                 "running": running,
                 "phase": phase,
-                "passId": pass_id,
+                "passId": pass_id or self.last_pass_id,
                 "source": active["source"] if active else None,
-                "frames": engine.frames_seen if engine else 0,
-                "keyframes": engine.integrated if engine else 0,
+                "frames": frames,
+                "keyframes": keyframes,
                 "pointCount": int(count),
                 "error": error,
                 "warning": event.get("warning", "") if running else "",
@@ -435,11 +588,14 @@ class ScanRunner:
             if active is None:
                 return
             active["stop"].set()
-        active["thread"].join(timeout=5.0)
+        self._join_capture(active)
         active["engine"].release()
         self._save_manifest_progress(active["engine"], active["store"])
+        active["store"].update_manifest(state="interrupted")
         with self.lock:
-            self.active = None
+            if self.active is active:
+                self.active = None
+            self.phase = "idle"
 
 
 def _summary(metrics):
