@@ -1,28 +1,37 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import {
-  createIcons,
-  Box,
-  Radio,
-  Settings2,
-  HelpCircle,
-  ChevronDown,
-  Maximize2,
-  Activity,
-  RotateCcw,
-  Move3d,
-  MousePointer2,
-  Download,
-  Play,
-  Pause,
-  Check,
-  CircleHelp,
-  SlidersHorizontal,
-  ScanLine,
-  ArrowUpRight,
-  Menu,
-} from "lucide";
+import Box from "lucide/dist/esm/icons/box.js";
+import Radio from "lucide/dist/esm/icons/radio.js";
+import Settings2 from "lucide/dist/esm/icons/settings-2.js";
+import CircleHelpIcon from "lucide/dist/esm/icons/circle-help.js";
+import ChevronDown from "lucide/dist/esm/icons/chevron-down.js";
+import Maximize2 from "lucide/dist/esm/icons/maximize-2.js";
+import Activity from "lucide/dist/esm/icons/activity.js";
+import RotateCcw from "lucide/dist/esm/icons/rotate-ccw.js";
+import Move3d from "lucide/dist/esm/icons/move-3d.js";
+import MousePointer2 from "lucide/dist/esm/icons/mouse-pointer-2.js";
+import Download from "lucide/dist/esm/icons/download.js";
+import Play from "lucide/dist/esm/icons/play.js";
+import Pause from "lucide/dist/esm/icons/pause.js";
+import Check from "lucide/dist/esm/icons/check.js";
+import SlidersHorizontal from "lucide/dist/esm/icons/sliders-horizontal.js";
+import ScanLine from "lucide/dist/esm/icons/scan-line.js";
+import ArrowUpRight from "lucide/dist/esm/icons/arrow-up-right.js";
+import Menu from "lucide/dist/esm/icons/menu.js";
+import replaceIcon from "lucide/dist/esm/replaceElement.js";
 import "./style.css";
+
+const HelpCircle = CircleHelpIcon;
+const CircleHelp = CircleHelpIcon;
+function createIcons({
+  icons = {},
+  nameAttr = "data-lucide",
+  attrs = {},
+} = {}) {
+  document.querySelectorAll(`[${nameAttr}]`).forEach((element) => {
+    replaceIcon(element, { nameAttr, icons, attrs });
+  });
+}
 
 document.querySelector("#app").innerHTML = `
   <header class="topbar">
