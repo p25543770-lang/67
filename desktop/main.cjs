@@ -661,6 +661,31 @@ function argValue(argv, name) {
   return index >= 0 ? argv[index + 1] : null;
 }
 
+function directorySize(root) {
+  let total = 0;
+  const walk = (current) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const target = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(target);
+      else {
+        try {
+          total += fs.statSync(target).size;
+        } catch {
+          /* пропускаем недоступные файлы */
+        }
+      }
+    }
+  };
+  walk(root);
+  return total;
+}
+
 async function runSelfTest(argv) {
   const reportPath = argValue(argv, "--report");
   const repair = argv.includes("--repair");
@@ -713,6 +738,7 @@ async function runSelfTest(argv) {
     python: result.python || null,
     packages: result.packages || null,
     logFile: result.logFile || ENV_PATHS.setupLog,
+    envSizeBytes: directorySize(ENV_PATHS.envRoot),
   };
 
   if (result.ok && !skipBridge) {

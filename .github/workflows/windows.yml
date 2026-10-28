@@ -34,6 +34,10 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
+      - name: Install lock validator dependency
+        run: python -m pip install --quiet packaging
+      - name: Windows dependency lock is complete and installable
+        run: npm run check:python-lock
       - name: Python bridge tests
         run: npm run test:python
       - name: First-run environment tests (repeat run, repair, failure)
@@ -69,6 +73,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
+      - run: python -m pip install --quiet packaging
+      - run: npm run check:python-lock
       - run: npm run test:python
       - run: npm run test:desktop
       - uses: actions/download-artifact@v4
@@ -278,7 +284,8 @@ jobs:
             }
             exit 1
           }
-          Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version)"
+          $sizeMb = [math]::Round($data.environment.envSizeBytes / 1MB, 1)
+          Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version); среда занимает $sizeMb MiB"
 
       - name: Second launch reuses the prepared environment
         shell: pwsh

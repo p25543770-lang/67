@@ -124,7 +124,14 @@ async function main() {
     sha256: sha256File(args.pipWheel),
   };
 
-  const direct = locked.filter((pkg) => pkg.direct);
+  // pip ставится распаковкой колеса, а не через `pip install pip`, поэтому он
+  // не должен попадать в список runtime-пакетов.
+  const runtimePackages = locked.filter((pkg) => pkg.name !== pipMeta.name);
+  if (runtimePackages.length === locked.length) {
+    console.warn("warning: колесо pip не найдено в наборе — проверьте --pip-wheel");
+  }
+
+  const direct = runtimePackages.filter((pkg) => pkg.direct);
   for (const name of DIRECT_REQUIREMENTS) {
     if (!direct.some((pkg) => pkg.name === name)) throw new Error(`Missing direct requirement ${name} in resolved wheel set`);
   }
@@ -147,8 +154,8 @@ async function main() {
       requires: "Windows x64, официальная сборка python.org (embeddable package)",
     },
     bootstrapWheels: [pipWheel],
-    packages: locked,
-    requirements: DIRECT_REQUIREMENTS.map((name) => `${name}==${locked.find((pkg) => pkg.name === name).version}`),
+    packages: runtimePackages,
+    requirements: DIRECT_REQUIREMENTS.map((name) => `${name}==${runtimePackages.find((pkg) => pkg.name === name).version}`),
   };
 
   writeFileSync("python-lock.json", `${JSON.stringify(lock, null, 2)}\n`);
@@ -158,14 +165,14 @@ async function main() {
     "# Полный набор зависимостей Depth Studio для Windows x64 / CPython 3.11.",
     "# Установка: python -m pip install --only-binary=:all: --require-hashes -r requirements-scan.lock.txt",
   ];
-  for (const pkg of locked) {
+  for (const pkg of runtimePackages) {
     lines.push(`${pkg.name}==${pkg.version} \\`);
     for (const hash of pkg.allowedHashes) lines.push(`    --hash=sha256:${hash}`);
   }
   writeFileSync("requirements-scan.lock.txt", `${lines.join("\n").replace(/ \\\n$/, "")}\n`);
 
   console.log(
-    `Locked ${locked.length} packages (${locked.filter((pkg) => pkg.direct).length} direct) from ${files.length} wheels.`,
+    `Locked ${runtimePackages.length} runtime packages (${runtimePackages.filter((pkg) => pkg.direct).length} direct) from ${files.length} wheels; pip ${pipWheel.version} in bootstrapWheels.`,
   );
   console.log(`python ${PYTHON_VERSION}: ${pythonSha256 || "<sha256 not pinned yet>"}`);
 }

@@ -15,7 +15,9 @@
     "prepare:python": "node scripts/prepare-python-runtime.mjs",
     "check:python-bundle": "node scripts/prepare-python-runtime.mjs --check",
     "lock:python": "node scripts/make-python-lock.mjs --wheels python-bundle/wheels --pip-wheel python-bundle/wheels/pip-24.2-py3-none-any.whl",
-    "build:win": "npm run prepare:python && npm run build && electron-builder --win nsis --x64"
+    "build:win": "npm run prepare:python && npm run build && electron-builder --win nsis --x64",
+    "check:python-lock": "python scripts/check-windows-lock.py",
+    "resolve:python": "python scripts/resolve-windows-deps.py --dest python-bundle/wheels"
   },
   "dependencies": {
     "lucide": "^0.468.0",
