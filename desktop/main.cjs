@@ -644,6 +644,15 @@ ipcMain.handle("setup:quit", () => {
 /* Самопроверка установки (CI / диагностика)                                 */
 /* ------------------------------------------------------------------------- */
 
+/** GUI-приложение на Windows может не иметь консоли: вывод не должен ронять процесс. */
+function writeStdout(text) {
+  try {
+    if (process.stdout?.writable) process.stdout.write(text);
+  } catch {
+    /* отчёт всё равно записан в файл */
+  }
+}
+
 function argValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : null;
@@ -726,7 +735,7 @@ async function runSelfTest(argv) {
   } catch (error) {
     report.reportWriteError = String(error?.message || error);
   }
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  writeStdout(`${JSON.stringify(report, null, 2)}\n`);
   return report.ok ? 0 : 2;
 }
 
@@ -809,6 +818,9 @@ app.on("before-quit", () => {
   }
 });
 
+process.stdout?.on("error", () => {});
+process.stderr?.on("error", () => {});
+
 process.on("uncaughtException", (error) => {
   try {
     fs.appendFileSync(
@@ -819,7 +831,7 @@ process.on("uncaughtException", (error) => {
     /* ignore */
   }
   if (isSelfTest) {
-    process.stdout.write(`${JSON.stringify({ ok: false, error: String(error?.message || error) })}\n`);
+    writeStdout(`${JSON.stringify({ ok: false, error: String(error?.message || error) })}\n`);
     app.exit(3);
   }
 });

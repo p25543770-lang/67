@@ -236,8 +236,12 @@ jobs:
           Set-Content -Path (Join-Path $tripwire 'python3.bat') -Value '@echo off & echo PYTHON3 FROM PATH WAS USED 1>&2 & exit /b 42'
           $clean = "$tripwire;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
           "PATH=$clean" >> $env:GITHUB_ENV
+          if ($env:PATH -match 'hostedtoolcache' -or $env:PATH -match 'Python3') {
+            Write-Output "::error::PATH не очищен от Python: $env:PATH"
+            exit 1
+          }
           $leftover = (Get-Command python, py, python3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source) -join ', '
-          Write-Output "::notice::Python in sanitized PATH: $leftover"
+          Write-Output "::notice::Python resolutions still visible (tripwire first): $leftover"
 
       - name: First launch on a machine without Python
         shell: pwsh
@@ -262,6 +266,11 @@ jobs:
           if ($data.setup.cached) { $failures += 'первый запуск не должен считаться кэшированным' }
           if ($failures.Count -gt 0) {
             foreach ($failure in $failures) { Write-Output "::error::$failure" }
+            Write-Output "::error::Отчёт самопроверки: $((Get-Content $report -Raw) -replace '\r?\n', ' ')"
+            $logPath = Join-Path $env:LOCALAPPDATA 'DepthStudio\logs\setup.log'
+            if (Test-Path $logPath) {
+              Write-Output "::error::Журнал установки: $((Get-Content $logPath -Raw) -replace '\r?\n', ' | ')"
+            }
             exit 1
           }
           Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version)"
@@ -287,8 +296,7 @@ jobs:
           $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report -Wait -PassThru
           $data = Get-Content $report -Raw | ConvertFrom-Json
           if ($process.ExitCode -ne 0 -or -not $data.setup.ok) {
-            Get-Content $report -Raw | Write-Output
-            Write-Output '::error::Повреждённая среда не была восстановлена.'
+            Write-Output "::error::Повреждённая среда не была восстановлена: $((Get-Content $report -Raw) -replace '\r?\n', ' ')"
             exit 1
           }
           if ($data.setup.cached) { Write-Output '::error::Повреждённая среда не должна считаться готовой.'; exit 1 }
@@ -305,7 +313,7 @@ jobs:
           $process = Start-Process -FilePath $exe -ArgumentList '--depth-studio-selftest', '--report', $report, '--repair' -Wait -PassThru
           $data = Get-Content $report -Raw | ConvertFrom-Json
           if ($process.ExitCode -eq 0) { Write-Output '::error::Смоделированный сбой установки не отразился в коде выхода.'; exit 1 }
-          if ($data.setup.error.code -ne 'packages_failed') { Write-Output "::error::Ожидался код packages_failed, получено $($data.setup.error.code)"; exit 1 }
+          if ($data.setup.error.code -ne 'packages_failed') { Write-Output "::error::Ожидался код packages_failed, получено $($data.setup.error.code): $($data.setup.error.message)"; exit 1 }
           if (-not $data.demoAvailable) { Write-Output '::error::При ошибке установки деморежим должен оставаться доступным.'; exit 1 }
           $logPath = Join-Path $envRoot 'logs\setup.log'
           if (-not (Test-Path $logPath)) { Write-Output '::error::Журнал установки не создан.'; exit 1 }
@@ -323,7 +331,10 @@ jobs:
           $uninstaller = Join-Path $installDir 'Uninstall Depth Studio.exe'
           if (Test-Path $uninstaller) {
             Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait
-            Start-Sleep -Seconds 8
+            # NSIS-деинсталлятор перезапускается из временного каталога, поэтому
+            # ждём фактического удаления, а не только завершения процесса.
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Test-Path $envRoot) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
             if (Test-Path $envRoot) {
               Write-Output "::error::После удаления остался каталог среды: $envRoot"
               exit 1

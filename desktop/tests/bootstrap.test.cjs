@@ -128,6 +128,26 @@ function createRunner(options = {}) {
       const data = typeof probe === "function" ? probe() : probe;
       return { code: 0, stdout: `DEPTH_STUDIO_PROBE=${JSON.stringify(data)}\n`, stderr: "" };
     }
+    if (String(args[0]).endsWith("/pip") && args.includes("install")) {
+      if (options.failPipViaWheel) return { code: 1, stdout: "", stderr: "Unable to execute pip from the wheel" };
+      for (const name of ["numpy", "open3d", "pip"]) {
+        fs.mkdirSync(path.join(envPaths.sitePackages, name), { recursive: true });
+      }
+      return { code: 0, stdout: "Successfully installed pip\n", stderr: "" };
+    }
+    if (args[0] === "-m" && args[1] === "pip" && args.includes("install")) {
+      if (options.failPip) {
+        return {
+          code: 1,
+          stdout: "Collecting numpy==1.26.4\n",
+          stderr: "ERROR: Could not find a version that satisfies the requirement numpy==1.26.4",
+        };
+      }
+      for (const name of ["numpy", "open3d", "pip"]) {
+        fs.mkdirSync(path.join(envPaths.sitePackages, name), { recursive: true });
+      }
+      return { code: 0, stdout: "Successfully installed\n", stderr: "" };
+    }
     if (args.includes("pip") && args.includes("install")) {
       if (options.failPip) {
         return {
@@ -306,6 +326,21 @@ test("ошибка установки пакетов даёт понятный �
   const log = fs.readFileSync(context.envPaths.setupLog, "utf8");
   assert.match(log, /ERROR/);
   assert.match(log, /packages/);
+});
+
+test("pip ставится из колеса, а при сбое — резервным способом через PYTHONPATH", async () => {
+  const context = setupOptions({ runner: { failPipViaWheel: true } });
+  const result = await bootstrap.runSetup(context.options);
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+
+  const pipCalls = context.calls.filter((call) => call.args.includes("install"));
+  const wheelCall = pipCalls.find((call) => String(call.args[0]).endsWith("/pip"));
+  const moduleCall = pipCalls.find((call) => call.args[0] === "-m" && call.args[1] === "pip");
+  assert.ok(wheelCall, "первая попытка должна запускать pip из колеса");
+  assert.match(String(wheelCall.args[0]), /\/pip$/);
+  assert.ok(moduleCall, "должна быть резервная попытка через -m pip");
+  assert.ok(moduleCall.env.PYTHONPATH.endsWith(".whl"), "PYTHONPATH должен указывать на колесо pip");
+  assert.equal(moduleCall.command, context.envPaths.pythonExe);
 });
 
 test("без закреплённого SHA-256 архив Python не загружается", async () => {

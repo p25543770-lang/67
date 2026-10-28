@@ -724,19 +724,15 @@ async function runSetup(rawOptions = {}) {
           await downloadFromPyPI(pipInfo, pipWheelPath, opts);
         }
       }
-      const pipInstall = await opts.runCommand(
-        paths.pythonExe,
-        [pipWheelPath + path.sep + "pip", "install", "--no-index", "--no-warn-script-location", pipWheelPath],
-        { env: childEnvironment(opts.env), timeoutMs: 5 * 60 * 1000, onLine: (line) => logger.line(`pip: ${line}`) },
-      );
-      if (pipInstall.code !== 0) {
+      const pipBootstrap = await installPip(paths, pipWheelPath, opts, logger);
+      if (!pipBootstrap.ok) {
         return await fail(
           "packages",
           new SetupError(
             "pip_install_failed",
             "Не удалось установить pip в изолированную среду.",
             "Нажмите «Восстановить среду». Если не помогает, приложите журнал установки.",
-            tailText(pipInstall),
+            tailText(pipBootstrap.result),
           ),
         );
       }
@@ -973,6 +969,41 @@ async function runSetup(rawOptions = {}) {
   }
 }
 
+
+/**
+ * Install pip into the embeddable interpreter.
+ *
+ * The embeddable distribution ships without pip. Two equivalent approaches are
+ * tried: executing the pip wheel directly and, as a fallback, importing pip
+ * from the wheel through PYTHONPATH. Both stay inside the managed environment.
+ */
+async function installPip(paths, pipWheelPath, opts, logger) {
+  const installArgs = ["install", "--no-index", "--no-warn-script-location", pipWheelPath];
+  const attempts = [
+    {
+      args: [`${pipWheelPath}/pip`, ...installArgs],
+      env: childEnvironment(opts.env),
+      note: "запуск pip из колеса",
+    },
+    {
+      args: ["-m", "pip", ...installArgs],
+      env: { ...childEnvironment(opts.env), PYTHONPATH: pipWheelPath },
+      note: "запуск pip через PYTHONPATH",
+    },
+  ];
+  let lastResult = null;
+  for (const attempt of attempts) {
+    lastResult = await opts.runCommand(paths.pythonExe, attempt.args, {
+      env: attempt.env,
+      timeoutMs: 5 * 60 * 1000,
+      onLine: (line) => logger.line(`pip(${attempt.note}): ${line}`),
+    });
+    if (lastResult.code === 0) return { ok: true, result: lastResult, method: attempt.note };
+    logger.warn(`Не удалось установить pip (${attempt.note}), код ${lastResult.code}.`);
+  }
+  return { ok: false, result: lastResult, method: null };
+}
+
 async function enableSitePackages(paths, lock, logger) {
   const pthFile = path.join(paths.pythonRoot, lock.python.pthFile || "python311._pth");
   let content = "";
@@ -1172,4 +1203,5 @@ module.exports = {
   downloadFromPyPI,
   collectBundledWheels,
   defaultUnpack,
+  installPip,
 };
