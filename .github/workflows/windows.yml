@@ -265,7 +265,12 @@ jobs:
           $failures = @()
           if ($process.ExitCode -ne 0) { $failures += "код выхода $($process.ExitCode)" }
           if (-not $data.setup.ok) { $failures += "setup: $($data.setup.error.code) $($data.setup.error.message)" }
-          if (-not $data.bridge.ok) { $failures += "bridge: $($data.bridge.error)" }
+          if (-not $data.bridge.ok) {
+            $failures += "bridge: $($data.bridge.error)"
+            if ($data.bridge.logTail) {
+              Write-Output "::error::bridge.log: $((($data.bridge.logTail) -join ' / ').Substring(0, [Math]::Min(1200, (($data.bridge.logTail) -join ' / ').Length)))"
+            }
+          }
           $expectedEnv = Join-Path $env:LOCALAPPDATA 'DepthStudio'
           if ($data.envDir -ne $expectedEnv) { $failures += "envDir=$($data.envDir), ожидался $expectedEnv" }
           if (-not ("$($data.pythonExe)".StartsWith($expectedEnv))) { $failures += "python.exe вне среды: $($data.pythonExe)" }

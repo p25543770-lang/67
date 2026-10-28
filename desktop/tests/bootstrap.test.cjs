@@ -327,6 +327,26 @@ test("site-packages включён для встроенного Python", async 
   assert.match(pth, /^import site$/m);
 });
 
+test("._pth подключает каталог приложения и обновляется без дублей", async () => {
+  const context = setupOptions();
+  await bootstrap.runSetup(context.options);
+  const pthFile = path.join(context.envPaths.pythonRoot, "python311._pth");
+  const content = fs.readFileSync(pthFile, "utf8");
+  // Встроенный Python изолирован: без явного пути импорт sensor_drivers не работает.
+  assert.ok(content.includes(context.resources.root), "каталог приложения должен быть в ._pth");
+  assert.match(content, /^import site$/m);
+  assert.match(content, /Lib\\site-packages/);
+
+  await bootstrap.syncInterpreterPaths(context.envPaths, context.resources.lock, [context.resources.root]);
+  assert.equal(fs.readFileSync(pthFile, "utf8"), content, "повторная синхронизация не должна менять файл");
+
+  const moved = makeTempDir("moved-resources");
+  await bootstrap.syncInterpreterPaths(context.envPaths, context.resources.lock, [moved]);
+  const movedContent = fs.readFileSync(pthFile, "utf8");
+  assert.ok(!movedContent.includes(context.resources.root), "старый путь установки должен исчезнуть");
+  assert.ok(movedContent.includes(moved));
+});
+
 test("повторный запуск использует готовую среду и ничего не переустанавливает", async () => {
   const context = setupOptions();
   const first = await bootstrap.runSetup(context.options);

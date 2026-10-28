@@ -761,7 +761,7 @@ async function runSetup(rawOptions = {}) {
       }
       // The embeddable distribution ignores site-packages until "import site"
       // is enabled in the ._pth file.
-      await enableSitePackages(paths, lock, logger);
+      await enableSitePackages(paths, lock, logger, [opts.appRuntimeDir || opts.resourcesRoot]);
     } else {
       logger.info("Интерпретатор уже установлен, повторная распаковка не требуется.");
     }
@@ -1130,28 +1130,54 @@ async function installPip(paths, pipWheelPath, opts, logger) {
   return { ok: false, result: lastResult, method: null };
 }
 
-async function enableSitePackages(paths, lock, logger) {
-  const pthFile = path.join(paths.pythonRoot, lock.python.pthFile || "python311._pth");
+/**
+ * (Re)write the embeddable interpreter's python311._pth.
+ *
+ * A ._pth file puts CPython into isolated mode: sys.path contains exactly the
+ * listed entries and the script directory is *not* added. Depth Studio therefore
+ * adds its own application directory (the folder with server.py and
+ * sensor_drivers) explicitly. The file is refreshed on every launch because the
+ * installation directory may differ from the one used during setup.
+ */
+async function syncInterpreterPaths(paths, lock, extraDirs = [], logger = null) {
+  const pthFile = path.join(paths.pythonRoot, lock?.python?.pthFile || "python311._pth");
   let content = "";
   try {
     content = await fsp.readFile(pthFile, "utf8");
   } catch {
-    content = `python311.zip\n.\n`;
+    content = "";
   }
-  const lines = content.split(/\r?\n/);
-  const additions = [];
-  if (!lines.some((line) => line.trim().toLowerCase() === "lib\\site-packages")) additions.push("Lib\\site-packages");
-  const enabled = lines.some((line) => line.trim() === "import site");
-  const next = [...lines.filter((line) => line.trim() !== "" || true)];
-  const merged = [...next];
-  for (const line of additions) merged.push(line);
-  if (!enabled) merged.push("import site");
-  const payload = `${merged.filter((line, index, array) => !(line === "" && index === array.length - 1)).join("\r\n")}\r\n`;
-  if (payload !== content) {
-    await fsp.writeFile(pthFile, payload, "utf8");
-    logger.info("Включён импорт site-packages для встроенного Python.");
+  const existing = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const zipLine = existing.find((line) => line.toLowerCase().endsWith(".zip")) || "python311.zip";
+  const lines = [];
+  const seen = new Set();
+  const push = (line) => {
+    const key = line.toLowerCase().replace(/[\\/]+$/, "");
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    lines.push(line);
+  };
+  push(zipLine);
+  push(".");
+  push("Lib\\site-packages");
+  for (const dir of extraDirs) {
+    if (dir) push(path.resolve(dir));
+  }
+  const next = `${lines.join("\r\n")}\r\nimport site\r\n`;
+  if (next !== content) {
+    await fsp.mkdir(paths.sitePackages, { recursive: true });
+    await fsp.writeFile(pthFile, next, "utf8");
+    logger?.info?.(`Пути интерпретатора обновлены: ${lines.join(" | ")}`);
   }
   await fsp.mkdir(paths.sitePackages, { recursive: true });
+  return { pthFile, entries: lines };
+}
+
+async function enableSitePackages(paths, lock, logger, extraDirs = []) {
+  return syncInterpreterPaths(paths, lock, extraDirs, logger);
 }
 
 async function collectBundledWheels(wheelsDir, lock, logger, warnings) {
@@ -1307,6 +1333,7 @@ module.exports = {
   runSetup,
   resetEnvironment,
   enableSitePackages,
+  syncInterpreterPaths,
   bundledRuntimeInfo,
   parseProbe,
   summarizePipFailure,

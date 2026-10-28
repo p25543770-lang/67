@@ -338,6 +338,20 @@ function waitForBridgeHealth(token, timeoutMs = 45_000) {
   });
 }
 
+/**
+ * The embeddable interpreter uses a ._pth file (isolated sys.path), so the
+ * application folder must be listed there for `import sensor_drivers` to work.
+ * It is refreshed on every launch: the install directory may have changed.
+ */
+async function prepareInterpreterPaths() {
+  const lock = bootstrap.readLock(RESOURCES_ROOT);
+  const paths = bootstrap.resolveEnvironmentPaths({
+    appDataRoot: APP_DATA_ROOT,
+    platform: process.platform,
+  });
+  return bootstrap.syncInterpreterPaths(paths, lock, [RESOURCES_ROOT]);
+}
+
 async function startBridge() {
   if (bridgeStatus.running) return bridgeStatus;
   if (!fs.existsSync(ENV_PATHS.pythonExe)) {
@@ -346,6 +360,18 @@ async function startBridge() {
       ready: false,
       error:
         "Среда Depth Studio не готова: интерпретатор Python отсутствует. Приложение работает в деморежиме — повторите настройку среды.",
+      python: null,
+      instance: BRIDGE_INSTANCE,
+    };
+    return bridgeStatus;
+  }
+  try {
+    await prepareInterpreterPaths();
+  } catch (error) {
+    bridgeStatus = {
+      running: false,
+      ready: false,
+      error: `Не удалось настроить пути интерпретатора Depth Studio: ${error?.message || error}`,
       python: null,
       instance: BRIDGE_INSTANCE,
     };
@@ -750,6 +776,7 @@ async function runSelfTest(argv) {
       environment: status.environment || null,
       modules: status.modules || null,
       port: bridgePort,
+      logTail: readTail(ENV_PATHS.bridgeLog, 40),
     };
   } else {
     report.bridge = { ok: false, skipped: true, reason: result.ok ? "--no-bridge" : "setup failed" };
