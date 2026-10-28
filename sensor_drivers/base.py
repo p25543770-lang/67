@@ -21,6 +21,27 @@ class SensorFrame:
     calibration: str = ""
 
 
+REQUIREMENT_KINDS = ("driver", "python")
+
+
+def requirement(*, requirement_id: str, kind: str, title: str, detail: str,
+                satisfied: bool | None = None) -> dict[str, Any]:
+    """Describe one requirement, separated into device driver vs Python package.
+
+    The application never installs drivers, SDKs or system components itself, so
+    the interface must say plainly which half of the stack is missing. ``kind`` is
+    either ``driver`` (installed by the user) or ``python`` (shipped by Depth
+    Studio's own environment).
+    """
+    return {
+        "id": requirement_id,
+        "kind": kind if kind in REQUIREMENT_KINDS else "python",
+        "title": title,
+        "detail": detail,
+        "satisfied": None if satisfied is None else bool(satisfied),
+    }
+
+
 class SensorAdapter:
     id = ""
     name = ""
@@ -31,6 +52,9 @@ class SensorAdapter:
     limitations = ""
     package_names: tuple[str, ...] = ()
     not_implemented_reason = ""
+    # Adapters that open the same physical device share a family, so the
+    # interface can offer one of them instead of opening the sensor twice.
+    device_family = ""
 
     def dependencies_available(self) -> bool:
         return False
@@ -38,8 +62,15 @@ class SensorAdapter:
     def dependency_error(self) -> str:
         return ""
 
+    def requirements(self) -> list[dict[str, Any]]:
+        """Split requirements into «Драйвер устройства» and «Компоненты Python»."""
+        return []
+
     def capture(self) -> SensorFrame:
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release the device. Adapters without a persistent handle do nothing."""
 
     def public_info(self, probe: dict[str, Any] | None = None) -> dict[str, Any]:
         dependencies_available = self.dependencies_available() if self.implemented else False
@@ -64,6 +95,7 @@ class SensorAdapter:
             "limitations": self.limitations,
             "notImplementedReason": self.not_implemented_reason,
             "packageNames": list(self.package_names),
+            "requirements": self.requirements() if self.implemented else [],
         }
 
 

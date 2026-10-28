@@ -17,7 +17,7 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
 from urllib.parse import parse_qs, urlparse
 
-from sensor_drivers.registry import ADAPTERS, catalog, get_adapter
+from sensor_drivers.registry import ADAPTERS, catalog, device_family, get_adapter, preferred_source
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DEPTH_STUDIO_PORT", "8765"))
@@ -55,7 +55,7 @@ scan = {
 
 def _optional_modules():
     result = {}
-    for module in ("numpy", "open3d", "freenect"):
+    for module in ("numpy", "open3d", "freenect", "clr"):
         try:
             result[module] = find_spec(module) is not None
         except (ImportError, ValueError):
@@ -66,7 +66,12 @@ def _optional_modules():
 def _module_versions():
     """Read package metadata without importing heavy native modules."""
     versions = {}
-    for distribution, module in (("numpy", "numpy"), ("open3d", "open3d"), ("freenect", "freenect")):
+    for distribution, module in (
+        ("numpy", "numpy"),
+        ("open3d", "open3d"),
+        ("freenect", "freenect"),
+        ("pythonnet", "clr"),
+    ):
         try:
             if find_spec(module) is None:
                 versions[module] = None
@@ -148,7 +153,7 @@ def _encode_array(array, max_side=320, dtype=None):
     }
 
 
-def _frame_response(frame):
+def _frame_response(frame, source_id="kinect_v1"):
     import numpy as np
 
     xyz = np.asarray(frame.points, dtype=np.float32).reshape((-1, 3))
@@ -159,13 +164,24 @@ def _frame_response(frame):
                round(float(math.sqrt(x * x + y * y + z * z)), 3)]
               for x, y, z in xyz]
     return {
-        "source": "kinect_v1",
+        "source": source_id,
         "capturedAt": frame.captured_at,
         "color": _encode_array(frame.color_rgb, dtype=np.uint8),
         "depth": _encode_array(frame.depth_mm, dtype="<u2"),
         "points": points,
         "calibration": frame.calibration,
     }
+
+
+def _release_adapter(source_id):
+    """Close the device handle of an adapter; safe for unknown or demo sources."""
+    adapter = get_adapter(source_id) if source_id else None
+    if adapter is None:
+        return
+    try:
+        adapter.close()
+    except Exception:  # noqa: BLE001 - освобождение не должно ломать HTTP-ответ
+        pass
 
 
 def _scan_snapshot():
@@ -215,6 +231,7 @@ def _scan_snapshot():
 
 def _scan_worker(source_id):
     """Accumulate frames using pairwise ICP; report, don't hide, tracking loss."""
+    adapter = None
     try:
         import numpy as np
         import open3d as o3d
@@ -320,6 +337,12 @@ def _scan_worker(source_id):
             scan["tracking"] = "lost"
             scan["running"] = False
     finally:
+        # Сенсор должен быть освобождён всегда: иначе другое приложение не сможет его открыть.
+        if adapter is not None:
+            try:
+                adapter.close()
+            except Exception:  # noqa: BLE001 - закрытие не должно скрывать исходную ошибку
+                pass
         with state_lock:
             scan["running"] = False
             if scan["tracking"] in ("tracking", "moving") and not scan["error"]:
@@ -360,7 +383,14 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             if url.path == "/api/devices":
-                self.respond(200, {"devices": catalog(probe_results), "demoAvailable": True})
+                self.respond(
+                    200,
+                    {
+                        "devices": catalog(probe_results),
+                        "demoAvailable": True,
+                        "preferredSource": preferred_source(probe_results),
+                    },
+                )
                 return
             if url.path == "/api/frame":
                 params = parse_qs(url.query)
@@ -374,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                     frame = adapter.capture()
                 with state_lock:
                     probe_results[source_id] = {"state": "connected", "connected": True, "error": ""}
-                self.respond(200, _frame_response(frame))
+                self.respond(200, _frame_response(frame, source_id))
                 return
             if url.path == "/api/scan":
                 self.respond(200, _scan_snapshot())
@@ -403,7 +433,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.respond(400, {"error": str(exc)})
         except Exception as exc:
-            self.respond(503, {"error": str(exc)})
+            # Подсказка адаптера (что именно сделать) полезна интерфейсу не меньше текста ошибки.
+            self.respond(503, {"error": str(exc), "hint": getattr(exc, "hint", "")})
 
     def do_POST(self):
         url = urlparse(self.path)
@@ -411,8 +442,21 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_json()
             if url.path == "/api/devices/probe":
                 devices = []
+                busy_families = {}
                 for sensor_id, adapter in list(ADAPTERS.items()):
                     if not adapter.implemented:
+                        continue
+                    family = device_family(sensor_id)
+                    if family in busy_families:
+                        # Kinect 360 уже открыт другим адаптером: второй раз сенсор не трогаем.
+                        probe_results[sensor_id] = {
+                            "state": "no_device",
+                            "connected": False,
+                            "error": (
+                                "Датчик Kinect 360 уже открыт адаптером "
+                                f"«{busy_families[family]}». Выберите один источник Kinect 360."
+                            ),
+                        }
                         continue
                     if not adapter.dependencies_available():
                         probe_results[sensor_id] = {
@@ -426,6 +470,14 @@ class Handler(BaseHTTPRequestHandler):
                         if len(frame.points) < 1:
                             raise RuntimeError("Драйвер не вернул точки глубины.")
                         probe_results[sensor_id] = {"state": "connected", "connected": True, "error": ""}
+                        busy_families[family] = adapter.name
+                        # Тот же физический сенсор нельзя держать открытым двумя адаптерами.
+                        for other_id, other in ADAPTERS.items():
+                            if other_id != sensor_id and device_family(other_id) == family:
+                                try:
+                                    other.close()
+                                except Exception:  # noqa: BLE001
+                                    pass
                     except Exception as exc:
                         probe_results[sensor_id] = {
                             "state": "no_device", "connected": False, "error": str(exc),
@@ -472,8 +524,10 @@ class Handler(BaseHTTPRequestHandler):
                 with state_lock:
                     scan["running"] = False
                     worker = scan["worker"]
+                    source_id = scan["source"]
                 if worker and worker.is_alive():
                     worker.join(timeout=1.5)
+                _release_adapter(source_id)
                 with state_lock:
                     if scan["tracking"] in ("tracking", "moving") and not scan["error"]:
                         scan["tracking"] = "stopped"
@@ -484,8 +538,10 @@ class Handler(BaseHTTPRequestHandler):
                 with state_lock:
                     scan["running"] = False
                     worker = scan["worker"]
+                    source_id = scan["source"]
                 if worker and worker.is_alive():
                     worker.join(timeout=1.5)
+                _release_adapter(source_id)
                 with state_lock:
                     scan.update(source=None, cloud=None, latest_frame=None, last=None, pose=None, frames=0,
                                 error="", warning="", tracking="idle", speed_mps=0.0)
@@ -497,7 +553,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.respond(400, {"error": str(exc)})
         except Exception as exc:
-            self.respond(503, {"error": str(exc)})
+            # Подсказка адаптера (что именно сделать) полезна интерфейсу не меньше текста ошибки.
+            self.respond(503, {"error": str(exc), "hint": getattr(exc, "hint", "")})
 
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -547,6 +604,11 @@ def main():
     finally:
         with state_lock:
             scan["running"] = False
+        for adapter in ADAPTERS.values():
+            try:
+                adapter.close()
+            except Exception:  # noqa: BLE001
+                pass
         server.server_close()
 
 

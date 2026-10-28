@@ -37,8 +37,10 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
-      - name: Install lock validator dependency
-        run: python -m pip install --quiet packaging
+      - name: Install test and lock validator dependencies
+        # NumPy нужен тестам адаптера Kinect SDK: они проверяют реальное
+        # преобразование кадра глубины и облака точек, без железа и SDK.
+        run: python -m pip install --quiet packaging numpy
       - name: Windows dependency lock is complete and installable
         run: npm run check:python-lock
       - name: Python bridge tests
@@ -76,7 +78,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
-      - run: python -m pip install --quiet packaging
+      - run: python -m pip install --quiet packaging numpy
       - run: npm run check:python-lock
       - run: npm run test:python
       - run: npm run test:desktop
@@ -280,6 +282,8 @@ jobs:
           if ($data.environment.python.version -ne '3.11.9') { $failures += "версия Python: $($data.environment.python.version)" }
           if (-not $data.environment.packages.numpy.available) { $failures += 'NumPy недоступен' }
           if (-not $data.environment.packages.open3d.available) { $failures += "Open3D недоступен: $($data.environment.packages.open3d.error)" }
+          # pythonnet — мост к .NET для адаптера Kinect 360 через Microsoft Kinect SDK.
+          if (-not $data.environment.packages.pythonnet.available) { $failures += "pythonnet недоступен: $($data.environment.packages.pythonnet.error)" }
           if (-not $data.bridge.environment.isolated) { $failures += 'мост запущен не из среды Depth Studio' }
           if ($data.setup.cached) { $failures += 'первый запуск не должен считаться кэшированным' }
           if ($data.systemPathPython.Count -gt 0) { $failures += "в PATH приложения остались каталоги Python: $($data.systemPathPython -join ', ')" }

@@ -35,6 +35,23 @@ const APP_FOLDER_NAME = "DepthStudio";
 const LOCK_FILE_NAME = "python-lock.json";
 const STATE_SCHEMA = 2;
 const LOG_LIMIT_BYTES = 2 * 1024 * 1024;
+// pip распаковывается, а NumPy/Open3D затем устанавливаются в site-packages.
+// Запас нужен до распаковки, иначе первый запуск падает посреди записи файлов.
+const SITE_PACKAGES_REQUIRED_BYTES = 600 * 1024 * 1024;
+const PIP_INSTALL_ATTEMPTS = 2;
+
+// Диагностика неудачной установки pip: что интерпретатор видит в sys.path и
+// импортируется ли модуль. Без этого сообщение «pip недоступен» ничего не даёт.
+const PIP_DIAGNOSTIC_SCRIPT = [
+  "import json, sys",
+  "result = {'executable': sys.executable, 'prefix': sys.prefix, 'path': list(sys.path), 'pip': None, 'error': None}",
+  "try:",
+  "    import pip",
+  "    result['pip'] = getattr(pip, '__file__', None)",
+  "except Exception as exc:",
+  "    result['error'] = '%s: %s' % (type(exc).__name__, exc)",
+  "print('DEPTH_STUDIO_PIP_DIAG=' + json.dumps(result))",
+];
 
 const STEP_DEFINITIONS = [
   {
@@ -73,7 +90,7 @@ const PYTHON_PROBE_SCRIPT = [
   "  'machine': platform.machine(),",
   "  'packages': {},",
   "}",
-  "for name in ('numpy', 'open3d', 'freenect'):",
+  "for name in ('numpy', 'open3d', 'pythonnet', 'freenect'):",
   "  entry = {'available': False, 'version': None, 'error': None}",
   "  try:",
   "    module = __import__(name)",
@@ -87,12 +104,23 @@ const PYTHON_PROBE_SCRIPT = [
 ];
 
 class SetupError extends Error {
-  constructor(code, message, hint = "", details = "") {
+  /**
+   * @param {string} code machine-readable code shown as «Код: …»
+   * @param {string} message one-line explanation for the banner
+   * @param {string} hint what the user can do next
+   * @param {string} details technical tail (pip output, errno) for the expandable block
+   * @param {{cause?: string, remedies?: Array<{id: string, title: string, text: string, relevant?: boolean}>}} [options]
+   */
+  constructor(code, message, hint = "", details = "", options = {}) {
     super(message);
     this.name = "SetupError";
     this.code = code;
     this.hint = hint;
     this.details = details;
+    // cause — уточнение внутри кода (disk_full, access_denied, file_locked…),
+    // remedies — типовые причины, которые интерфейс показывает отдельными пунктами.
+    this.cause = options.cause || null;
+    this.remedies = Array.isArray(options.remedies) ? options.remedies : [];
   }
 
   toJSON() {
@@ -101,8 +129,71 @@ class SetupError extends Error {
       message: this.message,
       hint: this.hint,
       details: this.details,
+      cause: this.cause,
+      remedies: this.remedies,
     };
   }
+}
+
+/**
+ * Типовые причины сбоя установки. Пользователь видит их отдельными пунктами,
+ * поэтому диагноз не сводится к одной фразе «не удалось установить pip».
+ */
+const REMEDY_CATALOG = {
+  antivirus: {
+    id: "antivirus",
+    title: "Антивирус или защита в реальном времени",
+    text:
+      "Сторонние антивирусы и «Защита от вирусов и угроз» Windows иногда блокируют запись файлов .pyd и .dll в профиль пользователя. " +
+      "Добавьте %LOCALAPPDATA%\\DepthStudio в исключения антивируса, повторите установку и верните исключение после успешного запуска.",
+  },
+  disk_space: {
+    id: "disk_space",
+    title: "Свободное место на диске",
+    text:
+      "Изолированной среде нужно около 1 ГБ на диске с профилем пользователя: распаковка Python, pip, NumPy и Open3D идёт в %LOCALAPPDATA%\\DepthStudio. " +
+      "Освободите место на системном диске и нажмите «Повторить».",
+  },
+  permissions: {
+    id: "permissions",
+    title: "Права на каталог",
+    text:
+      "Приложению нужна запись в %LOCALAPPDATA%\\DepthStudio. Проверьте, что каталог принадлежит вашему пользователю и не защищён политикой " +
+      "контролируемого доступа к папкам (Controlled folder access). Права администратора при этом не требуются.",
+  },
+  network: {
+    id: "network",
+    title: "Сеть, прокси или профиль сети",
+    text:
+      "Если встроенных колёс в установщике нет, компоненты скачиваются с python.org и pypi.org по HTTPS с проверкой TLS. " +
+      "Проверьте прокси, VPN, «общедоступный» сетевой профиль и корпоративный фильтр — отключение проверки TLS не требуется и не поддерживается.",
+  },
+  locked_files: {
+    id: "locked_files",
+    title: "Файлы заняты другим процессом",
+    text:
+      "Другой экземпляр Depth Studio, индексатор или сканер могли удерживать файлы среды. Закройте Depth Studio и повторите установку.",
+  },
+};
+
+function remedyById(id) {
+  const item = REMEDY_CATALOG[id];
+  return item ? { ...item } : null;
+}
+
+/** Список типовых причин: первая — вероятная для текущего сбоя. */
+function buildRemedies(causeId, extraIds = []) {
+  const priority = [causeId, ...extraIds, "antivirus", "disk_space", "permissions", "network"].filter(Boolean);
+  const seen = new Set();
+  const result = [];
+  for (const id of priority) {
+    if (seen.has(id)) continue;
+    const item = remedyById(id);
+    if (!item) continue;
+    seen.add(id);
+    result.push({ ...item, relevant: result.length === 0 });
+  }
+  return result;
 }
 
 function defaultAppDataRoot(options = {}) {
@@ -134,6 +225,9 @@ function resolveEnvironmentPaths({ appDataRoot, platform = process.platform }) {
     logsDir: path.join(envRoot, "logs"),
     setupLog: path.join(envRoot, "logs", "setup.log"),
     bridgeLog: path.join(envRoot, "logs", "bridge.log"),
+    // Отдельный журнал попыток установки pip: он остаётся, даже если setup.log
+    // не удалось записать, и содержит вывод интерпретатора и sys.path.
+    pipBootstrapLog: path.join(envRoot, "logs", "pip-bootstrap.log"),
     cacheDir: path.join(envRoot, "cache"),
     downloadsDir: path.join(envRoot, "cache", "downloads"),
   };
@@ -204,6 +298,153 @@ async function pathExists(target) {
 
 async function removePath(target) {
   await fsp.rm(target, { recursive: true, force: true, maxRetries: 3 });
+}
+
+/** Free space of the volume that holds `target`, or null when unavailable. */
+async function freeSpaceBytes(target, statfs = fsp.statfs) {
+  try {
+    const stats = await statfs(target);
+    const blockSize = Number(stats.bsize || stats.frsize || 0);
+    const available = Number(stats.bavail ?? stats.bfree ?? 0);
+    if (!blockSize || !available) return null;
+    return { free: available * blockSize, total: Number(stats.blocks || 0) * blockSize };
+  } catch {
+    return null;
+  }
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 МБ";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} КБ`;
+  const megabytes = bytes / (1024 * 1024);
+  if (megabytes < 1024) return `${megabytes.toFixed(0)} МБ`;
+  return `${(megabytes / 1024).toFixed(1)} ГБ`;
+}
+
+/**
+ * Translate a filesystem errno into an actionable SetupError.
+ *
+ * ENOSPC/EACCES/EPERM/EBUSY are the failures users actually hit on Windows:
+ * antivirus interception, full system drive and folder permissions.
+ */
+function mapFileSystemError(error, context = {}) {
+  const errno = String(error?.code || "");
+  const target = context.target ? ` (${context.target})` : "";
+  const detail = [`${errno || error?.name || "ERROR"}: ${error?.message || error}`, context.action || ""]
+    .filter(Boolean)
+    .join(" | ");
+
+  if (errno === "ENOSPC") {
+    return new SetupError(
+      "pip_disk_full",
+      "На диске закончилось свободное место во время подготовки среды Depth Studio.",
+      "Освободите около 1 ГБ на диске с профилем пользователя и нажмите «Повторить». Права администратора не нужны.",
+      detail,
+      { cause: "disk_full", remedies: buildRemedies("disk_space", ["antivirus"]) },
+    );
+  }
+  if (errno === "EACCES" || errno === "EPERM" || errno === "EBUSY" || errno === "ETXTBSY") {
+    const locked =
+      errno === "EBUSY" || errno === "ETXTBSY" || /EBUSY|ETXTBSY|being used|занят|locked/i.test(String(error?.message || ""));
+    return new SetupError(
+      locked ? "pip_file_locked" : "pip_access_denied",
+      locked
+        ? "Файлы среды Depth Studio заняты другим процессом."
+        : "Нет прав на запись в каталог среды Depth Studio.",
+      locked
+        ? "Закройте другие экземпляры Depth Studio и повторите установку."
+        : "Проверьте права на %LOCALAPPDATA%\\DepthStudio и исключения антивируса, затем нажмите «Повторить».",
+      detail,
+      {
+        cause: locked ? "file_locked" : "access_denied",
+        remedies: buildRemedies(locked ? "locked_files" : "permissions", ["antivirus"]),
+      },
+    );
+  }
+  return new SetupError(
+    context.code || "unpack_failed",
+    context.message || `Не удалось записать файлы среды Depth Studio${target}.`,
+    context.hint || "Нажмите «Повторить». Если ошибка повторяется, откройте журнал установки.",
+    detail,
+    { cause: "io_error", remedies: buildRemedies("antivirus", ["permissions"]) },
+  );
+}
+
+/**
+ * Verify that site-packages can actually be written *before* unpacking pip.
+ *
+ * A directory can exist and still be read-only (folder permissions, Controlled
+ * folder access, antivirus). Checking early turns a mid-install crash into a
+ * specific, fixable message.
+ */
+async function ensureDirectoryWritable(directory, options = {}) {
+  const fileSystem = options.fileSystem || fsp;
+  const probeDir = directory;
+  try {
+    await fileSystem.mkdir(probeDir, { recursive: true });
+  } catch (error) {
+    throw mapFileSystemError(error, {
+      target: probeDir,
+      action: "mkdir",
+      code: "site_packages_not_writable",
+      message: "Не удалось создать каталог site-packages среды Depth Studio.",
+      hint: "Проверьте права на %LOCALAPPDATA%\\DepthStudio и повторите установку.",
+    });
+  }
+  const probe = path.join(probeDir, `.depth-studio-write-probe-${process.pid}-${Date.now()}`);
+  try {
+    await fileSystem.writeFile(probe, "depth-studio-write-probe", "utf8");
+    const echo = await fileSystem.readFile(probe, "utf8");
+    if (echo !== "depth-studio-write-probe") {
+      throw new SetupError(
+        "site_packages_not_writable",
+        "Каталог site-packages среды Depth Studio не сохраняет записанные файлы.",
+        "Проверьте антивирус и права на %LOCALAPPDATA%\\DepthStudio, затем повторите установку.",
+        `проверочный файл прочитан как ${JSON.stringify(echo.slice(0, 80))}`,
+        { cause: "access_denied", remedies: buildRemedies("antivirus", ["permissions"]) },
+      );
+    }
+  } catch (error) {
+    if (error instanceof SetupError) throw error;
+    throw mapFileSystemError(error, {
+      target: probe,
+      action: "write probe",
+      code: "site_packages_not_writable",
+      message: "Нет прав на запись в site-packages среды Depth Studio.",
+      hint: "Проверьте антивирус и права на %LOCALAPPDATA%\\DepthStudio, затем повторите установку.",
+    });
+  } finally {
+    await Promise.resolve(fileSystem.rm(probe, { force: true })).catch(() => {});
+  }
+}
+
+/**
+ * Disk-space and write-access preflight for the managed site-packages.
+ * @returns {{freeBytes: number|null}} diagnostics for the setup log
+ */
+async function prepareSitePackages(paths, opts, logger = null) {
+  const statfs = opts?.statfs || fsp.statfs;
+  await ensureDirectoryWritable(paths.sitePackages, { fileSystem: opts?.fileSystem });
+  const space = await freeSpaceBytes(paths.envRoot, statfs);
+  const required = opts?.requiredBytes || SITE_PACKAGES_REQUIRED_BYTES;
+  if (space && space.free < required) {
+    logger?.warn?.(
+      `Свободного места ${formatBytes(space.free)} при рекомендуемых ${formatBytes(required)} — распаковка может не удаться.`,
+    );
+    throw new SetupError(
+      "pip_disk_full",
+      `Недостаточно свободного места: нужно около ${formatBytes(required)}, доступно ${formatBytes(space.free)}.`,
+      "Освободите место на диске с профилем пользователя и нажмите «Повторить». Права администратора не нужны.",
+      `свободно ${space.free} байт, требуется ${required} байт (${paths.envRoot})`,
+      { cause: "disk_full", remedies: buildRemedies("disk_space", ["antivirus"]) },
+    );
+  }
+  if (!space) {
+    logger?.info?.("Свободное место проверить не удалось — продолжаю с проверкой записи.");
+  } else {
+    logger?.info?.(`Свободно на диске среды: ${formatBytes(space.free)} (требуется ~${formatBytes(required)}).`);
+  }
+  return { freeBytes: space?.free ?? null };
 }
 
 function createLogger(paths, emit) {
@@ -448,7 +689,11 @@ function readZipEntryData(buffer, entry) {
 async function extractZip(archivePath, destination, options = {}) {
   const buffer = await fsp.readFile(archivePath);
   const entries = listZipEntries(buffer);
-  await fsp.mkdir(destination, { recursive: true });
+  try {
+    await fsp.mkdir(destination, { recursive: true });
+  } catch (error) {
+    throw mapFileSystemError(error, { target: destination, action: "mkdir destination" });
+  }
   let written = 0;
   for (const entry of entries) {
     const isDirectory = entry.name.endsWith("/") || entry.name.endsWith("\\");
@@ -457,12 +702,20 @@ async function extractZip(archivePath, destination, options = {}) {
       throw new SetupError("unpack_failed", `Архив содержит недопустимый путь: ${entry.name}`);
     }
     if (isDirectory) {
-      await fsp.mkdir(target, { recursive: true });
+      try {
+        await fsp.mkdir(target, { recursive: true });
+      } catch (error) {
+        throw mapFileSystemError(error, { target, action: `mkdir ${entry.name}` });
+      }
       continue;
     }
     const data = readZipEntryData(buffer, entry);
-    await fsp.mkdir(path.dirname(target), { recursive: true });
-    await fsp.writeFile(target, data);
+    try {
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await fsp.writeFile(target, data);
+    } catch (error) {
+      throw mapFileSystemError(error, { target, action: `write ${entry.name}` });
+    }
     written += 1;
     if (options.onEntry && written % 50 === 0) options.onEntry(written, entries.length);
   }
@@ -548,6 +801,9 @@ function normalizeSetupOptions(options = {}) {
     runCommand: options.runCommand || runStreaming,
     download: options.download || downloadFile,
     unpack: options.unpack || defaultUnpack,
+    statfs: options.statfs || fsp.statfs,
+    fileSystem: options.fileSystem || fsp,
+    extractWheel: options.extractWheel || extractZip,
     confirmSensorComponents: Boolean(options.confirmSensorComponents),
     testHooks: options.testHooks || {},
   };
@@ -557,6 +813,25 @@ function bundledRuntimeInfo(bundleRoot) {
   const pythonDir = path.join(bundleRoot, "python-runtime");
   const wheelsDir = path.join(bundleRoot, "python-wheels");
   return { pythonDir, wheelsDir };
+}
+
+/**
+ * Where Kinect for Windows SDK 1.8 puts Microsoft.Kinect.dll.
+ * Read-only discovery: Depth Studio never installs or modifies SDK components.
+ */
+const KINECT_SDK_RELATIVE_PATH = path.join("Microsoft SDKs", "Kinect", "v1.8", "Assemblies", "Microsoft.Kinect.dll");
+
+function kinectSdkCandidates(env = process.env) {
+  const roots = [env.ProgramW6432, env.ProgramFiles, env["ProgramFiles(x86)"]].filter(Boolean);
+  return [...new Set(roots.map((root) => path.join(root, KINECT_SDK_RELATIVE_PATH)))];
+}
+
+async function detectKinectSdk(env = process.env) {
+  const candidates = kinectSdkCandidates(env);
+  for (const candidate of candidates) {
+    if (await pathExists(candidate)) return { available: true, assembly: candidate, checked: candidates };
+  }
+  return { available: false, assembly: null, checked: candidates };
 }
 
 function stepProgress(index, fraction) {
@@ -649,6 +924,7 @@ async function runSetup(rawOptions = {}) {
           warnings: [],
           sensorNotes: [],
           sources: status.state?.sources || null,
+          sensors: status.state?.sensors || null,
           demoAvailable: true,
         };
         emit({ type: "done", result: cachedResult });
@@ -798,7 +1074,19 @@ async function runSetup(rawOptions = {}) {
       );
     }
 
-    currentStepFraction(0.02, "проверка pip");
+    currentStepFraction(0.02, "проверка записи и свободного места");
+    try {
+      await prepareSitePackages(paths, opts, logger);
+    } catch (error) {
+      return await fail(
+        "packages",
+        error instanceof SetupError
+          ? error
+          : new SetupError("packages_failed", "Не удалось подготовить site-packages.", "", String(error)),
+      );
+    }
+
+    currentStepFraction(0.04, "проверка pip");
     const pipReady = await pathExists(path.join(paths.sitePackages, "pip"));
     if (!pipReady) {
       let pipWheelPath = bundleWheels.get(pipInfo.filename) || null;
@@ -820,17 +1108,22 @@ async function runSetup(rawOptions = {}) {
       }
       const pipBootstrap = await installPip(paths, pipWheelPath, opts, logger);
       if (!pipBootstrap.ok) {
-        return await fail(
-          "packages",
-          new SetupError(
-            "pip_install_failed",
-            "Не удалось установить pip в изолированную среду.",
-            "Нажмите «Восстановить среду». Если не помогает, приложите журнал установки.",
-            tailText(pipBootstrap.result),
-          ),
-        );
+        // Отдельный журнал именно для pip: он нужен, даже если setup.log недоступен.
+        try {
+          await fsp.writeFile(
+            path.join(paths.logsDir, "pip-bootstrap.log"),
+            `[${new Date().toISOString()}] попытки установки pip\n${(pipBootstrap.attempts || []).join("\n")}\n\n${tailText(
+              pipBootstrap.result,
+              4000,
+            )}\n`,
+            "utf8",
+          );
+        } catch {
+          /* журнал не критичен для сообщения об ошибке */
+        }
+        return await fail("packages", pipBootstrapFailure(pipBootstrap, paths));
       }
-      logger.info("pip установлен в среду Depth Studio.");
+      logger.info(`pip установлен в среду Depth Studio (${pipBootstrap.method}, попыток: ${pipBootstrap.attemptsCount}).`);
     }
 
     let installSource = "bundled";
@@ -918,7 +1211,7 @@ async function runSetup(rawOptions = {}) {
 
     if (installResult.code === 0 && !(await pathExists(path.join(paths.sitePackages, "numpy")))) {
       // pip считает пакет установленным, если остался только dist-info, —
-      // при повреждённой среде помогае�� только принудительная переустановка.
+      // при повреждённой среде помогает только принудительная переустановка.
       logger.warn("NumPy отсутствует после установки: повтор с --force-reinstall.");
       warnings.push({
         code: "packages_force_reinstalled",
@@ -934,13 +1227,27 @@ async function runSetup(rawOptions = {}) {
       } catch {
         /* журнал не критичен для сообщения об ошибке */
       }
+      const details = summarizePipFailure(pipLines, installResult);
+      const diagnosis = diagnosePipOutput(`${details}\n${pipLines.join("\n")}`);
+      const specificHint = {
+        disk_full: "Освободите около 1 ГБ на диске с профилем пользователя и нажмите «Повторить».",
+        access_denied:
+          "Проверьте права на %LOCALAPPDATA%\\DepthStudio и исключения антивируса, затем нажмите «Повторить».",
+        file_locked: "Закройте другие экземпляры Depth Studio и повторите установку.",
+        network:
+          "Проверьте интернет, прокси, VPN и сетевой профиль, затем нажмите «Повторить». Отключение проверки TLS не поддерживается.",
+      }[diagnosis.cause];
       return await fail(
         "packages",
         new SetupError(
           "packages_failed",
-          "Не удалось установить NumPy/Open3D в изолированную среду.",
-          "Нажмите «Повторить». Если ошибка повторяется, проверьте интернет, прокси, антивирус и свободное место, затем откройте журнал установки.",
-          summarizePipFailure(pipLines, installResult),
+          diagnosis.cause === "disk_full"
+            ? "Не удалось установить NumPy/Open3D: на диске закончилось свободное место."
+            : "Не удалось установить NumPy/Open3D в изолированную среду.",
+          specificHint ||
+            "Нажмите «Повторить». Если ошибка повторяется, проверьте интернет, прокси, антивирус и свободное место, затем откройте журнал установки.",
+          details,
+          { cause: diagnosis.cause, remedies: diagnosis.remedies },
         ),
       );
     }
@@ -952,6 +1259,7 @@ async function runSetup(rawOptions = {}) {
           "NumPy не появился в среде после установки, хотя pip сообщил об успехе.",
           "Нажмите «Восстановить среду». Если ошибка повторяется, проверьте антивирус: он может блокировать установку файлов .pyd.",
           tailText(installResult),
+          { cause: "access_denied", remedies: buildRemedies("antivirus", ["permissions", "disk_space"]) },
         ),
       );
     }
@@ -1032,23 +1340,68 @@ async function runSetup(rawOptions = {}) {
     currentIndex = 4;
     updateStep("sensors", { status: "running" });
     const sensorNotes = [];
-    if (!packagesState.freenect?.available) {
-      sensorNotes.push(
-        "Модуль freenect (libfreenect) не найден. Depth Studio не устанавливает USB-драйверы, SDK и системные компоненты датчиков автоматически: " +
-          "для экспериментального Kinect 360 подготовьте совместимый драйвер вручную (см. README).",
-      );
+    // Требования разделены намеренно: «драйвер устройства» ставится пользователем,
+    // «компоненты Python» приходят вместе с установщиком Depth Studio.
+    const kinectSdk = await detectKinectSdk(opts.env);
+    const pythonComponents = [
+      { id: "numpy", title: "NumPy", available: Boolean(packagesState.numpy?.available), version: packagesState.numpy?.version || null },
+      { id: "open3d", title: "Open3D", available: Boolean(packagesState.open3d?.available), version: packagesState.open3d?.version || null },
+      {
+        id: "pythonnet",
+        title: "pythonnet",
+        available: Boolean(packagesState.pythonnet?.available),
+        version: packagesState.pythonnet?.version || null,
+      },
+      {
+        id: "freenect",
+        title: "freenect (libfreenect)",
+        available: Boolean(packagesState.freenect?.available),
+        version: packagesState.freenect?.version || null,
+      },
+    ];
+
+    sensorNotes.push(
+      kinectSdk.available
+        ? `Драйвер устройства: Kinect for Windows SDK 1.8 найден (${kinectSdk.assembly}).`
+        : "Драйвер устройства: Kinect for Windows SDK 1.8 не найден. Этот SDK нужен адаптеру Microsoft Kinect SDK и не устанавливается приложением автоматически.",
+    );
+    const missingPython = pythonComponents.filter((item) => !item.available).map((item) => item.title);
+    sensorNotes.push(
+      missingPython.length
+        ? `Компоненты Python: отсутствуют ${missingPython.join(", ")}.`
+        : "Компоненты Python: NumPy, Open3D и pythonnet доступны.",
+    );
+
+    if (opts.platform === "win32" && !kinectSdk.available) {
       warnings.push({
-        code: "sensor_driver_missing",
-        message: "USB-драйвер датчика глубины не настроен — доступен только деморежим.",
-        hint: "Kinect 360 требует libfreenect с Python-привязками и совместимый USB-драйвер. Приложение не ставит их без вашего согласия.",
+        code: "kinect_sdk_missing",
+        message: "Драйвер устройства: не установлен Kinect for Windows SDK 1.8.",
+        hint:
+          "Адаптер «Kinect 360 · Microsoft Kinect SDK» требует установленный Kinect for Windows SDK 1.8 (runtime) с файлом " +
+          "%ProgramFiles%\\Microsoft SDKs\\Kinect\\v1.8\\Assemblies\\Microsoft.Kinect.dll. Установите SDK вручную с сайта Microsoft — " +
+          "Depth Studio не скачивает и не устанавливает драйверы и SDK датчиков. Деморежим работает без них.",
       });
     }
+    if (!packagesState.pythonnet?.available) {
+      warnings.push({
+        code: "sensor_python_component_missing",
+        message: "Компонент Python: pythonnet не импортируется в среде Depth Studio.",
+        hint:
+          "pythonnet входит в установщик Depth Studio. Нажмите «Восстановить среду», чтобы установить пакеты заново; " +
+          "драйверы датчика это не затрагивает.",
+      });
+    }
+    sensorNotes.push(
+      "Альтернатива libfreenect не включена: она требует отдельный USB-драйвер libusbK/WinUSB, который заменяет драйвер Microsoft Kinect и может сломать другие Kinect-приложения.",
+    );
     if (opts.confirmSensorComponents) {
       sensorNotes.push("Пользователь разрешил установку компонентов датчиков — этот релиз таких установок не выполняет.");
     }
     updateStep("sensors", {
       status: "done",
-      detailText: packagesState.freenect?.available ? "freenect найден" : "датчики не настроены · деморежим",
+      detailText: kinectSdk.available
+        ? "драйвер Kinect SDK 1.8 найден · деморежим доступен"
+        : "драйвер Kinect SDK 1.8 не найден · деморежим",
     });
 
     const state = {
@@ -1059,6 +1412,7 @@ async function runSetup(rawOptions = {}) {
       python: { version: probeData.version, executable: probeData.executable, prefix: probeData.prefix },
       packages: packagesState,
       sources: { python: pythonSource, packages: installSource },
+      sensors: { kinectSdk, pythonComponents },
       warnings: warnings.map((warning) => warning.code),
       completedAt: new Date().toISOString(),
       appVersion: opts.appVersion || null,
@@ -1079,6 +1433,7 @@ async function runSetup(rawOptions = {}) {
       warnings,
       sensorNotes,
       sources: state.sources,
+      sensors: state.sensors,
       demoAvailable: true,
     };
     emit({ type: "done", result });
@@ -1100,54 +1455,225 @@ async function runSetup(rawOptions = {}) {
 
 
 /**
- * Install pip into the embeddable interpreter.
- *
- * The embeddable distribution ships without pip. Two equivalent approaches are
- * tried: executing the pip wheel directly and, as a fallback, importing pip
- * from the wheel through PYTHONPATH. Both stay inside the managed environment.
+ * Remove a partially unpacked pip so a retry starts from a clean state.
+ * Only pip's own files are touched — nothing else in site-packages.
  */
-async function installPip(paths, pipWheelPath, opts, logger) {
-  // pip защищает себя от установки «из zip» (To modify pip, please run ... -m pip),
-  // поэтому колёса pip распаковываются прямо в Lib\site-packages — так же, как это
-  // сделала бы установка из колеса, но без запуска pip до его установки.
-  const attempts = [
-    {
-      note: "распаковка колеса pip",
-      run: async () => {
-        const extracted = await extractZip(pipWheelPath, paths.sitePackages);
-        return { code: 0, stdout: `Распаковано файлов: ${extracted.files}`, stderr: "" };
-      },
-    },
-    {
-      note: "запуск pip из колеса",
-      run: () =>
-        opts.runCommand(paths.pythonExe, [`${pipWheelPath}/pip`, "install", "--no-index", "--no-warn-script-location", pipWheelPath], {
-          env: childEnvironment(opts.env),
-          timeoutMs: 5 * 60 * 1000,
-          onLine: (line) => logger.line(`pip: ${line}`),
-        }),
-    },
-  ];
-  let lastResult = null;
-  for (const attempt of attempts) {
-    try {
-      lastResult = await attempt.run();
-    } catch (error) {
-      lastResult = { code: -1, stdout: "", stderr: String(error?.message || error) };
+async function removePartialPip(paths, logger = null) {
+  const removed = [];
+  const entries = await fsp.readdir(paths.sitePackages).catch(() => []);
+  for (const name of entries) {
+    if (name === "pip" || /^pip-[0-9][^\\/]*\.(dist-info|egg-info)$/i.test(name)) {
+      await removePath(path.join(paths.sitePackages, name));
+      removed.push(name);
     }
-    const check = await opts.runCommand(paths.pythonExe, ["-m", "pip", "--version"], {
+  }
+  if (removed.length) logger?.warn?.(`Удалены неполные файлы pip перед повтором: ${removed.join(", ")}`);
+  return removed;
+}
+
+async function checkPipAvailable(paths, opts, logger = null) {
+  try {
+    return await opts.runCommand(paths.pythonExe, ["-m", "pip", "--version"], {
       env: childEnvironment(opts.env),
       timeoutMs: 120_000,
-      onLine: (line) => logger.line(`pip: ${line}`),
+      onLine: (line) => logger?.line?.(`pip: ${line}`),
     });
-    if (check.code === 0) {
-      logger.info(`pip доступен (${attempt.note}): ${check.stdout.trim()}`);
-      return { ok: true, result: check, method: attempt.note };
-    }
-    logger.warn(`Способ «${attempt.note}» не дал рабочего pip, код ${lastResult.code}.`);
-    lastResult = check;
+  } catch (error) {
+    return { code: -1, stdout: "", stderr: String(error?.message || error) };
   }
-  return { ok: false, result: lastResult, method: null };
+}
+
+/**
+ * Install pip into the embeddable interpreter.
+ *
+ * The embeddable distribution ships without pip, and pip refuses to modify itself
+ * from a zip archive, so the wheel is unpacked straight into Lib\site-packages.
+ * A partially written wheel (antivirus interception, interrupted write) is
+ * removed and unpacked once more before giving up. Returns structured attempts so
+ * the setup screen can show what exactly was tried and why it failed.
+ */
+async function installPip(paths, pipWheelPath, opts, logger) {
+  const attempts = [];
+  let lastResult = null;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= PIP_INSTALL_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) await removePartialPip(paths, logger);
+    const note = `распаковка колеса pip (попытка ${attempt} из ${PIP_INSTALL_ATTEMPTS})`;
+    logger?.info?.(`pip: ${note}`);
+    try {
+      const extracted = await (opts.extractWheel || extractZip)(pipWheelPath, paths.sitePackages);
+      attempts.push(`${note}: распаковано файлов ${extracted?.files ?? "?"}`);
+    } catch (error) {
+      const setupError =
+        error instanceof SetupError
+          ? error
+          : new SetupError("pip_install_failed", "Не удалось распаковать колесо pip.", "", String(error?.message || error));
+      // Нехватка места и отказ доступа не исчезнут от повтора — сразу объясняем причину.
+      if (setupError.cause === "disk_full" || setupError.cause === "access_denied") {
+        attempts.push(`${note}: ${setupError.message}`);
+        return { ok: false, result: { code: -1, stdout: "", stderr: setupError.details }, error: setupError, method: null, attempts };
+      }
+      attempts.push(`${note}: ${setupError.message}`);
+      logger?.warn(`Распаковка колеса pip не удалась: ${setupError.message}`);
+      lastError = setupError;
+      lastResult = { code: -1, stdout: "", stderr: setupError.details || setupError.message };
+      continue;
+    }
+
+    const check = await checkPipAvailable(paths, opts, logger);
+    if (check.code === 0) {
+      logger?.info?.(`pip доступен (распаковка колеса, попытка ${attempt}): ${check.stdout.trim()}`);
+      return { ok: true, result: check, method: "распаковка колеса pip", attempts, attemptsCount: attempt };
+    }
+    attempts.push(
+      `${note}: python -m pip --version не сработал (${check.code}): ${tailText(check, 300) || "без вывода"}`,
+    );
+    logger?.warn(`После распаковки pip не запускается (код ${check.code}).`);
+    lastResult = check;
+    lastError = new SetupError(
+      "pip_install_failed",
+      "Колесо pip распаковано, но интерпретатор не видит модуль pip.",
+      "Нажмите «Повторить»; если ошибка повторяется, проверьте антивирус и журнал установки.",
+      tailText(check, 800),
+    );
+  }
+
+  // Последняя попытка: запуск pip напрямую из колеса (на случай нестандартной распаковки).
+  const note = "запуск pip из колеса";
+  logger?.info?.(`pip: ${note}`);
+  try {
+    lastResult = await opts.runCommand(
+      paths.pythonExe,
+      [`${pipWheelPath}/pip`, "install", "--no-index", "--no-warn-script-location", pipWheelPath],
+      {
+        env: childEnvironment(opts.env),
+        timeoutMs: 5 * 60 * 1000,
+        onLine: (line) => logger?.line?.(`pip: ${line}`),
+      },
+    );
+    attempts.push(`${note}: код ${lastResult?.code ?? -1} ${tailText(lastResult, 300)}`.trim());
+  } catch (error) {
+    lastResult = { code: -1, stdout: "", stderr: String(error?.message || error) };
+    attempts.push(`${note}: ${String(error?.message || error)}`);
+  }
+  const check = await checkPipAvailable(paths, opts, logger);
+  if (check.code === 0) {
+    logger?.info?.(`pip доступен (${note}): ${check.stdout.trim()}`);
+    return { ok: true, result: check, method: note, attempts, attemptsCount: PIP_INSTALL_ATTEMPTS + 1 };
+  }
+  attempts.push(`${note}: python -m pip --version не сработал (${check.code})`);
+  logger?.warn(`Способ «${note}» не дал рабочего pip.`);
+  try {
+    const diagnostics = await opts.runCommand(paths.pythonExe, ["-c", PIP_DIAGNOSTIC_SCRIPT.join("\n")], {
+      env: childEnvironment(opts.env),
+      timeoutMs: 120_000,
+    });
+    const line = String(diagnostics.stdout || "")
+      .split(/\r?\n/)
+      .find((entry) => entry.startsWith("DEPTH_STUDIO_PIP_DIAG="));
+    if (line) {
+      const data = JSON.parse(line.slice("DEPTH_STUDIO_PIP_DIAG=".length));
+      attempts.push(
+        `диагностика: pip=${data.pip || "не импортируется"}${data.error ? ` (${data.error})` : ""}; ` +
+          `sys.path=${(data.path || []).slice(0, 6).join(" | ")}`,
+      );
+    } else {
+      attempts.push(`диагностика: ${tailText(diagnostics, 400) || "интерпретатор не ответил"}`);
+    }
+  } catch (error) {
+    attempts.push(`диагностика не удалась: ${String(error?.message || error)}`);
+  }
+  return {
+    ok: false,
+    result: check,
+    error: lastError,
+    method: null,
+    attempts,
+  };
+}
+
+/**
+ * Turn pip output into a specific, actionable diagnosis instead of one vague line.
+ * Windows-specific errno and antivirus messages are recognised explicitly.
+ */
+function diagnosePipOutput(text) {
+  const value = String(text || "");
+  const checks = [
+    {
+      cause: "disk_full",
+      relevant: "disk_space",
+      pattern: /ENOSPC|Errno 28|No space left on device|недостаточно места|There is not enough space/i,
+    },
+    {
+      cause: "file_locked",
+      relevant: "locked_files",
+      pattern: /EBUSY|WinError 32|being used by another process|файл занят/i,
+    },
+    {
+      cause: "access_denied",
+      relevant: "permissions",
+      pattern: /EACCES|EPERM|Errno 13|Permission denied|Access is denied|WinError 5\b|отказано в доступе/i,
+    },
+    {
+      cause: "access_denied",
+      relevant: "antivirus",
+      pattern: /0x80070005|blocked by|заблокирован|antivirus|антивирус|Controlled folder access/i,
+    },
+    {
+      cause: "network",
+      relevant: "network",
+      pattern:
+        /TLS|SSL:|CERTIFICATE_VERIFY_FAILED|proxy|ProxyError|timed out|ReadTimeout|NewConnectionError|Max retries exceeded|HTTP 5\d\d|HTTP 4\d\d|Temporary failure in name resolution|Name or service not known/i,
+    },
+  ];
+  const matched = checks.find((entry) => entry.pattern.test(value)) || null;
+  return {
+    cause: matched?.cause || "unknown",
+    remedies: buildRemedies(matched?.relevant || null, ["antivirus", "disk_space", "permissions", "network"]),
+  };
+}
+
+function pipBootstrapFailure(pipBootstrap, paths) {
+  const detailLines = [...(pipBootstrap.attempts || [])];
+  const tail = tailText(pipBootstrap.result, 1200);
+  if (tail) detailLines.push(tail);
+  const details = detailLines.filter(Boolean).join("\n").slice(-2400) || "нет вывода";
+  const cause = pipBootstrap.error?.cause || diagnosePipOutput(details).cause;
+  const remedies = pipBootstrap.error?.remedies?.length
+    ? pipBootstrap.error.remedies
+    : diagnosePipOutput(details).remedies;
+  const code = pipBootstrap.error?.code && pipBootstrap.error.code !== "unpack_failed"
+    ? pipBootstrap.error.code
+    : "pip_install_failed";
+  const messages = {
+    disk_full: {
+      message: "Не удалось установить pip: на диске закончилось свободное место.",
+      hint: "Освободите около 1 ГБ на диске с профилем пользователя и нажмите «Повторить».",
+    },
+    access_denied: {
+      message: "Не удалось установить pip: нет прав на запись в среду Depth Studio.",
+      hint:
+        "Проверьте права на " + paths.sitePackages + " и исключения антивируса, затем нажмите «Повторить».",
+    },
+    file_locked: {
+      message: "Не удалось установить pip: файлы среды заняты другим процессом.",
+      hint: "Закройте другие экземпляры Depth Studio и повторите установку.",
+    },
+    network: {
+      message: "Не удалось установить pip: сетевое соединение прервалось или заблокировано.",
+      hint: "Проверьте прокси, VPN и сетевой профиль, затем нажмите «Повторить». Отключение проверки TLS не поддерживается.",
+    },
+  };
+  const specific = messages[cause];
+  return new SetupError(
+    code,
+    specific?.message || "Не удалось установить pip в изолированную среду.",
+    specific?.hint ||
+      "Нажмите «Восстановить среду». Если не помогает, откройте журнал установки и приложите файл %LOCALAPPDATA%\\DepthStudio\\logs\\setup.log.",
+    details,
+    { cause, remedies },
+  );
 }
 
 /**
@@ -1356,7 +1882,19 @@ module.exports = {
   syncInterpreterPaths,
   bundledRuntimeInfo,
   parseProbe,
+  readState,
   summarizePipFailure,
+  diagnosePipOutput,
+  buildRemedies,
+  REMEDY_CATALOG,
+  freeSpaceBytes,
+  formatBytes,
+  mapFileSystemError,
+  ensureDirectoryWritable,
+  prepareSitePackages,
+  removePartialPip,
+  detectKinectSdk,
+  kinectSdkCandidates,
   isInside,
   sha256File,
   childEnvironment,

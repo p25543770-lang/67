@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-const DIRECT_REQUIREMENTS = ["numpy", "open3d"];
+const DIRECT_REQUIREMENTS = ["numpy", "open3d", "pythonnet"];
 const PYTHON_VERSION = "3.11.9";
 const PYTHON_ARCHIVE_URL = `https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-embed-amd64.zip`;
 

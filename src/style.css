@@ -1752,3 +1752,161 @@ input[type="range"] {
   margin-top: 10px;
   flex-wrap: wrap;
 }
+
+/* --- Требования источника: драйвер устройства против компонентов Python ---- */
+.requirements-block {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+.requirements-group {
+  padding: 10px 11px;
+  border: 1px solid #edf1ed;
+  border-radius: 7px;
+  background: #fbfdfb;
+}
+.requirements-group[data-kind="driver"] {
+  border-color: #f0e6d2;
+  background: #fffdf7;
+}
+.requirements-group-title {
+  display: block;
+  font: 500 8px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7e8f86;
+  margin-bottom: 7px;
+}
+.requirements-group[data-kind="driver"] .requirements-group-title {
+  color: #9a7c50;
+}
+.requirements-group ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.requirements-group li {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+}
+.requirements-group li small {
+  display: block;
+  font-size: 8.5px;
+  line-height: 1.55;
+  color: #819188;
+  margin-top: 2px;
+  word-break: break-word;
+}
+.requirements-group li strong {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #33463d;
+  line-height: 1.4;
+}
+.requirements-group li a {
+  color: var(--green);
+  text-decoration: underline;
+  word-break: break-all;
+}
+.requirement-mark {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-top: 1px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 8px;
+  font-weight: 700;
+  border: 1px solid #dbe5dd;
+  color: #7e8f86;
+}
+.requirements-group li[data-status="ok"] .requirement-mark {
+  border-color: #cfe2d3;
+  background: #eef6ef;
+  color: var(--green);
+}
+.requirements-group li[data-status="missing"] .requirement-mark {
+  border-color: #e9c9be;
+  background: #fdf3f0;
+  color: #b4462f;
+}
+.requirements-group li[data-status="missing"] strong {
+  color: #8c4a38;
+}
+.requirements-note {
+  display: block;
+  margin-top: 8px;
+  font-size: 8px;
+  line-height: 1.5;
+  color: #9aa79f;
+}
+
+/* --- Баннер настройки: типовые причины, подробности, копирование журнала --- */
+.setup-banner-remedies {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #eddfc0;
+  border-radius: 8px;
+  background: #fffdf7;
+}
+.setup-banner[data-phase="failed"] .setup-banner-remedies {
+  border-color: #edc9be;
+  background: #fffaf8;
+}
+.setup-banner-remedies-title {
+  display: block;
+  font: 500 8.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8c6154;
+  margin-bottom: 6px;
+}
+.setup-banner-remedies ul {
+  margin: 0;
+  padding-left: 15px;
+  display: grid;
+  gap: 6px;
+}
+.setup-banner-remedies li {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #6c6152;
+}
+.setup-banner-remedies li strong {
+  display: block;
+  font-size: 11px;
+  color: #4b4438;
+}
+.setup-banner-remedies li[data-relevant="true"] strong {
+  color: #b4462f;
+}
+.setup-banner-remedies li[data-relevant="true"] strong::after {
+  content: " · вероятная причина";
+  font-weight: 400;
+  font-size: 9.5px;
+}
+.setup-banner-details {
+  margin-top: 9px;
+}
+.setup-banner-details summary {
+  font: 500 10px var(--mono);
+  letter-spacing: 0.04em;
+  color: #8c6154;
+  cursor: pointer;
+}
+.setup-banner-details pre {
+  margin: 7px 0 0;
+  max-height: 190px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid #f0d8d0;
+  border-radius: 7px;
+  background: #fff;
+  font: 10px var(--mono);
+  white-space: pre-wrap;
+  color: #6c4136;
+}
