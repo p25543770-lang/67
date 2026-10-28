@@ -39,16 +39,33 @@ jobs:
         with:
           name: depth-studio-renderer
           path: dist/
-      - name: Package Windows installer
+      - uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-builder-
+      - name: Package Windows application
         shell: pwsh
         timeout-minutes: 10
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
-          npx electron-builder --win nsis --x64 2>&1 | Tee-Object -FilePath package-win.log
+          npx electron-builder --win --x64 --dir 2>&1 | Tee-Object -FilePath package-win.log
           $buildExitCode = $LASTEXITCODE
           if ($buildExitCode -ne 0) {
             Get-Content package-win.log | Select-Object -Last 40 | ForEach-Object {
+              Write-Output "::error::$_"
+            }
+            exit $buildExitCode
+          }
+      - name: Create NSIS installer
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked 2>&1 | Tee-Object -FilePath nsis-win.log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            Get-Content nsis-win.log | Select-Object -Last 40 | ForEach-Object {
               Write-Output "::error::$_"
             }
             exit $buildExitCode
