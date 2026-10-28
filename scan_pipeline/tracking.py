@@ -51,6 +51,10 @@ RECOVERY_RADIUS_M = 0.05
 RECOVERY_ROTATION_DEG = 5.0
 PREDICTION_CORRECTION_MIN_M = 0.025
 PREDICTION_CORRECTION_RATIO = 0.35
+MAX_RELIABLE_FRAME_GAP_S = 0.5
+SLOW_MOTION_MIN_SPEED_MPS = 0.15
+SLOW_MOTION_ERROR_MIN_M = 0.035
+SLOW_MOTION_ERROR_RATIO = 0.6
 # Once tracking is repeatedly lost, automatic re-lock requires a similar view
 # near the last trusted pose. This cannot prove correctness on repeated walls.
 RECOVERY_SIGNATURE_HEIGHT = 30
@@ -98,6 +102,28 @@ def _recovery_view_matches(reference, current):
                 float(np.mean(color_delta <= 60.0)) < RECOVERY_MIN_COLOR_INLIERS):
             return False
     return True
+
+
+def _slow_motion_disagreement(previous_pose, pose, candidate, dt, previous_dt):
+    """Return an implausible translation disagreement, without changing ICP's initial guess.
+
+    A slow, noisy step is not reliable enough to extrapolate for ICP itself, but
+    it can still rule out a large sudden slide. Scale by the full capture gap:
+    the processed frames may be far apart even if the previous pair was close.
+    This conservative check can also reject a real abrupt turn or acceleration.
+    """
+    previous_step = pose[:3, 3] - previous_pose[:3, 3]
+    previous_speed = float(np.linalg.norm(previous_step)) / previous_dt
+    if not SLOW_MOTION_MIN_SPEED_MPS <= previous_speed < PREDICT_MIN_SPEED_MPS:
+        return None
+    expected = previous_step * min(dt / previous_dt, 15.0)
+    expected_length = float(np.linalg.norm(expected))
+    if expected_length <= 0.02:
+        return None
+    actual = candidate[:3, 3] - pose[:3, 3]
+    disagreement = float(np.linalg.norm(actual - expected))
+    allowed = max(SLOW_MOTION_ERROR_MIN_M, expected_length * SLOW_MOTION_ERROR_RATIO)
+    return (disagreement, allowed) if disagreement > allowed else None
 
 
 @dataclass
@@ -326,6 +352,19 @@ class FrameToModelTracker:
             self._recovery_state = "too_fast"
             return self._reject("too_fast", predicted, "speed_limit", fitness, rmse, step_m, step_deg,
                                 method=method)
+        if dt > MAX_RELIABLE_FRAME_GAP_S and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
+            # A large jump after a long interruption is not reliably localized
+            # by ICP just because it falls below the average speed limit.
+            self._recovery_state = "lost"
+            return self._reject("lost", predicted, "long_capture_gap", fitness, rmse, step_m, step_deg, method=method)
+        if (self._previous_pose is not None and self._last_accepted_dt and not self._recovery_state and
+                self.last_result is not None and self.last_result.state == "ok" and dt <= MAX_RELIABLE_FRAME_GAP_S):
+            mismatch = _slow_motion_disagreement(self._previous_pose, self.pose, candidate, dt, self._last_accepted_dt)
+            if mismatch is not None:
+                self._recovery_state = "lost"
+                return self._reject("lost", predicted, "slow_motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                    method=method, extra={"motionDisagreementM": mismatch[0],
+                                                          "motionAllowedM": mismatch[1], "eigenRatio": ratio})
         predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
         correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
         if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,

@@ -151,6 +151,16 @@ def main() -> None:
                 error_mm, _ = pose_error(engine.last_pose, expected_pose)
             else:
                 error_mm = None
+            # Inspect every persisted, integrated keyframe, not just the last
+            # accepted pose: a later recovery can otherwise hide earlier drift.
+            integrated_errors = []
+            for keyframe in active["store"].load_keyframes():
+                index = round((keyframe["t"] - sensor.start) * 30)
+                if 0 <= index < len(trajectory.poses):
+                    expected = invert_pose(trajectory.poses[sensor.first_index]) @ trajectory.poses[index]
+                    keyframe_error, _ = pose_error(keyframe["pose"], expected)
+                    integrated_errors.append((keyframe_error, index))
+            worst_error, worst_index = max(integrated_errors, default=(None, None))
             result = {
                 "profile": name,
                 "processingIsolation": "process" if use_process else "inprocess",
@@ -170,6 +180,8 @@ def main() -> None:
                 "rejected": quality["rejected"],
                 "lastAcceptedFrame": last_index,
                 "lastAcceptedPoseErrorMm": None if error_mm is None else round(error_mm, 2),
+                "worstIntegratedPoseErrorMm": None if worst_error is None else round(worst_error, 2),
+                "worstIntegratedFrame": worst_index,
                 "uiPollMedianMs": round(statistics.median(poll_times), 2) if poll_times else None,
                 "hardwareVerified": False,
             }

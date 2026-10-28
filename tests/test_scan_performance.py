@@ -62,6 +62,23 @@ class FrameRateTests(unittest.TestCase):
         self.assertTrue(_recovery_view_matches(reference, _view_signature(depth, None)))
         self.assertFalse(_recovery_view_matches(reference, _view_signature(depth + 500, None)))
 
+    def test_slow_motion_guard_scales_for_skipped_frames_but_rejects_large_slides(self):
+        from scan_pipeline.tracking import _slow_motion_disagreement
+
+        previous = np.eye(4)
+        current = np.eye(4)
+        current[0, 3] = 0.018  # 0.54 m/s over one 30-Hz frame
+        plausible = current.copy()
+        plausible[0, 3] += 0.16  # ten frame intervals, with modest ICP noise
+        self.assertIsNone(_slow_motion_disagreement(previous, current, plausible, 10 / 30, 1 / 30))
+        implausible = current.copy()
+        implausible[0, 3] += 0.35  # below 7 km/h on average, but inconsistent with the previous motion
+        error, allowed = _slow_motion_disagreement(previous, current, implausible, 10 / 30, 1 / 30)
+        self.assertGreater(error, allowed)
+        fast = current.copy()
+        fast[0, 3] = 0.05  # fast movement is handled by the existing prediction guard
+        self.assertIsNone(_slow_motion_disagreement(previous, fast, implausible, 0.1, 1 / 30))
+
     def test_preview_preserves_coordinate_convention_rounding_and_empty_input(self):
         from scan_pipeline.runner import _preview
 
@@ -368,6 +385,36 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertLess(error_mm, 20.0)
         self.assertLess(self.engine.integrated, self.engine.frames_tracked // 2)
         self.assertFalse(self.engine.pipeline_info()["verifiedOnHardware"])
+
+    def test_long_gap_does_not_silently_integrate_a_large_jump(self):
+        _, depth, color = self.frame_at(0.0, 0)
+        self.engine.process(depth, color, 0.0)
+        previous_pose, before = self.engine.last_pose.copy(), self.engine.integrated
+        _, depth, color = self.frame_at(0.08, 5)
+        event = self.engine.process(depth, color, 0.6)
+        self.assertEqual(event["state"], "lost", self.engine.tracker.last_result.reason)
+        self.assertEqual(self.engine.tracker.last_result.reason, "long_capture_gap")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        np.testing.assert_array_equal(previous_pose, self.engine.last_pose)
+        # Returning to the trusted view is allowed even after a long gap.
+        _, depth, color = self.frame_at(0.0, 111)
+        self.assertEqual(self.engine.process(depth, color, 0.7)["state"], "tracking")
+
+    def test_slow_motion_disagreement_prevents_integration(self):
+        _, depth, color = self.frame_at(0.0, 0)
+        self.engine.process(depth, color, 0.0)
+        _, depth, color = self.frame_at(0.018, 1)
+        self.assertEqual(self.engine.process(depth, color, 1 / 30)["state"], "tracking")
+        previous_pose, before = self.engine.last_pose.copy(), self.engine.integrated
+        _, depth, color = self.frame_at(0.16, 10)
+        with mock.patch("scan_pipeline.tracking._slow_motion_disagreement", return_value=(0.2, 0.05)):
+            event = self.engine.process(depth, color, 10 / 30)
+        self.assertEqual(event["state"], "lost", self.engine.tracker.last_result.reason)
+        self.assertEqual(self.engine.tracker.last_result.reason, "slow_motion_inconsistent")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        np.testing.assert_array_equal(previous_pose, self.engine.last_pose)
 
     def test_repeated_bad_frames_require_a_return_to_the_trusted_view(self):
         _, depth, color = self.frame_at(0.0, 0)
