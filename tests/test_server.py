@@ -1,7 +1,10 @@
 import json
+import os
+import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
+from unittest import mock
 from urllib.request import urlopen
 
 import server
@@ -55,6 +58,21 @@ class ApiTests(unittest.TestCase):
         self.assertIn("python", health)
         self.assertEqual(health["host"], "127.0.0.1")
 
+    def test_health_reports_the_managed_environment_honestly(self):
+        health = self.get_json("/api/health")
+        environment = health["environment"]
+        self.assertIn("executable", environment)
+        self.assertIn("isolated", environment)
+        self.assertIn("packages", environment)
+        # Тесты запускаются системным Python, а не средой Depth Studio.
+        self.assertFalse(environment["isolated"])
+        self.assertFalse(environment["managed"])
+        self.assertIn("setup_state_missing", environment["warnings"])
+
+    def test_health_exposes_the_instance_token_for_the_desktop_shell(self):
+        health = self.get_json("/api/health")
+        self.assertIn("instance", health)
+
     def test_scan_status_is_available_without_optional_native_libraries(self):
         status = self.get_json("/api/scan")
         self.assertFalse(status["running"])
@@ -70,6 +88,38 @@ class ApiTests(unittest.TestCase):
         for sensor_id in ("kinect_v2", "azure_kinect", "intel_realsense"):
             self.assertEqual(devices[sensor_id]["state"], "not_implemented")
             self.assertFalse(devices[sensor_id]["implemented"])
+
+
+class EnvironmentGuardTests(unittest.TestCase):
+    def test_is_inside_rejects_sibling_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            inside = os.path.join(root, "runtime", "python", "python.exe")
+            outside = root + "-other"
+            self.assertTrue(server._is_inside(root, inside))
+            self.assertFalse(server._is_inside(root, outside))
+            self.assertFalse(server._is_inside("", inside))
+
+    def test_environment_info_reads_the_setup_manifest(self):
+        with tempfile.TemporaryDirectory() as root:
+            state_file = os.path.join(root, "state", "environment.json")
+            os.makedirs(os.path.dirname(state_file))
+            with open(state_file, "w", encoding="utf-8") as handle:
+                json.dump({"completedAt": "2026-01-01T00:00:00Z", "warnings": ["sensor_driver_missing"]}, handle)
+            with mock.patch.object(server, "ENV_ROOT", root), mock.patch.object(server, "STATE_FILE", state_file):
+                info = server._environment_info()
+            self.assertEqual(info["envRoot"], root)
+            self.assertEqual(info["setupCompletedAt"], "2026-01-01T00:00:00Z")
+            # Системный интерпретатор тестов не находится внутри среды.
+            self.assertFalse(info["isolated"])
+            self.assertFalse(info["managed"])
+
+    def test_bridge_refuses_to_serve_from_a_system_interpreter(self):
+        with mock.patch.object(server, "REQUIRE_APP_ENV", True), mock.patch.object(
+            server, "ENV_ROOT", os.path.join(tempfile.gettempdir(), "depth-studio-expected-env")
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                server.main()
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

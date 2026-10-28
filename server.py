@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +23,16 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("DEPTH_STUDIO_PORT", "8765"))
 MAX_PREVIEW_POINTS = 9000
 MAX_SCAN_PREVIEW_POINTS = 14000
+
+# Depth Studio always launches this bridge from its own isolated environment in
+# %LOCALAPPDATA%\DepthStudio. The guard below refuses to serve sensor data from
+# a random system interpreter so a wrong "python server.py" cannot silently
+# masquerade as a configured installation.
+ENV_ROOT = os.environ.get("DEPTH_STUDIO_ENV_ROOT", "")
+STATE_FILE = os.environ.get("DEPTH_STUDIO_STATE", "")
+REQUIRE_APP_ENV = os.environ.get("DEPTH_STUDIO_REQUIRE_APP_ENV") == "1"
+INSTANCE = os.environ.get("DEPTH_STUDIO_INSTANCE", "")
+SETUP_STEPS = ("prepare", "python", "packages", "verify", "sensors")
 
 capture_lock = threading.Lock()
 state_lock = threading.RLock()
@@ -50,6 +61,70 @@ def _optional_modules():
         except (ImportError, ValueError):
             result[module] = False
     return result
+
+
+def _module_versions():
+    """Read package metadata without importing heavy native modules."""
+    versions = {}
+    for distribution, module in (("numpy", "numpy"), ("open3d", "open3d"), ("freenect", "freenect")):
+        try:
+            if find_spec(module) is None:
+                versions[module] = None
+                continue
+            versions[module] = package_version(distribution)
+        except (PackageNotFoundError, ImportError, ValueError):
+            versions[module] = "unknown"
+        except Exception:
+            versions[module] = None
+    return versions
+
+
+def _is_inside(root, candidate):
+    if not root or not candidate:
+        return False
+    try:
+        root_path = os.path.realpath(root)
+        candidate_path = os.path.realpath(candidate)
+    except OSError:
+        return False
+    return os.path.commonpath([root_path, candidate_path]) == root_path
+
+
+def _read_setup_state():
+    if not STATE_FILE:
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _environment_info():
+    """Describe the interpreter and explain whether it is the managed one."""
+    executable = os.sys.executable
+    prefix = os.sys.prefix
+    isolated = _is_inside(ENV_ROOT, executable) and _is_inside(ENV_ROOT, prefix)
+    setup_state = _read_setup_state()
+    packages = _module_versions()
+    warnings = []
+    if setup_state:
+        warnings.extend(setup_state.get("warnings", []) or [])
+    else:
+        warnings.append("setup_state_missing")
+    if not packages.get("open3d"):
+        warnings.append("open3d_unavailable")
+    return {
+        "executable": executable,
+        "prefix": prefix,
+        "version": os.sys.version.split()[0],
+        "envRoot": ENV_ROOT,
+        "isolated": isolated,
+        "managed": isolated and bool(setup_state),
+        "packages": packages,
+        "warnings": sorted(set(warnings)),
+        "setupCompletedAt": (setup_state or {}).get("completedAt"),
+    }
 
 
 def _encode_array(array, max_side=320, dtype=None):
@@ -275,8 +350,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/health":
                 modules = _optional_modules()
-                self.respond(200, {"ok": True, "python": os.sys.version.split()[0],
-                                   "modules": modules, "host": HOST})
+                self.respond(200, {
+                    "ok": True,
+                    "python": os.sys.version.split()[0],
+                    "modules": modules,
+                    "host": HOST,
+                    "instance": INSTANCE,
+                    "environment": _environment_info(),
+                })
                 return
             if url.path == "/api/devices":
                 self.respond(200, {"devices": catalog(probe_results), "demoAvailable": True})
@@ -362,9 +443,14 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError(adapter.dependency_error())
                 modules = _optional_modules()
                 if not modules.get("numpy"):
-                    raise RuntimeError("Для сканирования требуется NumPy: python -m pip install -r requirements-scan.txt")
+                    raise RuntimeError(
+                        "В среде Depth Studio нет NumPy. Откройте «Настройка среды» и нажмите «Восстановить среду»."
+                    )
                 if not modules.get("open3d"):
-                    raise RuntimeError("Для совмещения кадров установите Open3D: python -m pip install -r requirements-scan.txt")
+                    raise RuntimeError(
+                        "Open3D не импортируется в среде Depth Studio, поэтому совмещение кадров недоступно. "
+                        "Проверьте Microsoft Visual C++ Redistributable (x64) и повторите настройку среды."
+                    )
                 # Fail early with a readable sensor error rather than starting a dead worker.
                 with capture_lock:
                     test_frame = adapter.capture()
@@ -438,9 +524,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    environment = _environment_info()
+    if REQUIRE_APP_ENV and not environment["isolated"]:
+        print(
+            "Depth Studio: запуск из чужого интерпретатора запрещён. "
+            "Ожидалась среда в " + (ENV_ROOT or "%LOCALAPPDATA%\\DepthStudio") + ", "
+            "получено " + environment["executable"] + ".",
+            flush=True,
+        )
+        raise SystemExit(2)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    print(f"Depth Studio API: http://{HOST}:{PORT} (localhost only)", flush=True)
+    print(
+        f"Depth Studio API: http://{HOST}:{PORT} (localhost only) | python={environment['executable']} | "
+        f"isolated={environment['isolated']}",
+        flush=True,
+    )
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

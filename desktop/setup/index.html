@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Depth Studio — настройка среды</title>
+    <link rel="stylesheet" href="setup.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">✳</span>
+        <span class="brand-word">depth<span>studio</span><small>ПЕРВЫЙ ЗАПУСК</small></span>
+      </div>
+      <span class="version" id="appVersion">BETA · 1.2</span>
+    </header>
+
+    <main class="shell">
+      <section class="intro">
+        <span class="kicker">ПОДГОТОВКА СРЕДЫ / WINDOWS x64</span>
+        <h1>Настраиваем Depth Studio<span class="dot">.</span></h1>
+        <p class="lead" id="leadText">
+          Приложение готовит изолированную среду Python в
+          <code>%LOCALAPPDATA%\DepthStudio</code>. Права администратора не нужны, системный
+          PATH и глобальные пакеты Python не изменяются.
+        </p>
+        <div class="progress-block">
+          <div class="progress-head">
+            <span id="phaseLabel">Проверка установки…</span>
+            <strong id="progressPercent">0%</strong>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <div class="progress-meta">
+            <span id="envPath">%LOCALAPPDATA%\DepthStudio</span>
+            <span id="elapsed">00:00</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="steps-card card">
+        <div class="card-head">
+          <h2>Этапы</h2>
+          <button class="link-button" id="toggleLog" aria-expanded="false">Журнал установки</button>
+        </div>
+        <ol class="steps" id="steps" aria-live="polite"></ol>
+      </section>
+
+      <section class="notice" id="notice" hidden>
+        <span class="notice-mark" id="noticeMark">!</span>
+        <div class="notice-body">
+          <strong id="noticeTitle">Ошибка</strong>
+          <p id="noticeMessage"></p>
+          <p class="notice-hint" id="noticeHint" hidden></p>
+          <details class="notice-details" id="noticeDetails" hidden>
+            <summary>Технические подробности</summary>
+            <pre id="noticeDetailsText"></pre>
+          </details>
+          <p class="notice-code" id="noticeCode" hidden></p>
+        </div>
+      </section>
+
+      <section class="warnings" id="warnings" hidden>
+        <h2>Что работает не полностью</h2>
+        <ul id="warningList"></ul>
+      </section>
+
+      <section class="log-panel" id="logPanel" hidden>
+        <div class="log-head">
+          <strong>Журнал установки</strong>
+          <span id="logPath" class="log-path"></span>
+        </div>
+        <pre class="log-body" id="logBody" tabindex="0"></pre>
+      </section>
+
+      <footer class="actions">
+        <button class="button primary" id="primaryAction">Открыть Depth Studio</button>
+        <button class="button" id="retryAction" hidden>Повторить</button>
+        <button class="button" id="repairAction">Восстановить среду</button>
+        <button class="button ghost" id="logAction">Открыть папку журнала</button>
+        <button class="button ghost" id="demoAction">Продолжить в деморежиме</button>
+      </footer>
+      <p class="footnote">
+        USB-драйверы, SDK и системные компоненты датчиков не устанавливаются автоматически.
+        Без настроенного датчика приложение работает в деморежиме.
+      </p>
+    </main>
+
+    <script src="setup.js"></script>
+  </body>
+</html>

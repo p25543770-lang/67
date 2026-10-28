@@ -1,6 +1,6 @@
 {
   "name": "depth-studio",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Experimental depth-camera room scanning and point-cloud viewer.",
   "author": "Depth Studio contributors",
@@ -9,8 +9,13 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "test": "npm run test:python && npm run test:desktop",
     "test:python": "python -m unittest discover -s tests -p 'test_*.py'",
-    "build:win": "npm run build && electron-builder --win nsis --x64"
+    "test:desktop": "node --test desktop/tests/bootstrap.test.cjs",
+    "prepare:python": "node scripts/prepare-python-runtime.mjs",
+    "check:python-bundle": "node scripts/prepare-python-runtime.mjs --check",
+    "lock:python": "node scripts/make-python-lock.mjs --wheels python-bundle/wheels --pip-wheel python-bundle/wheels/pip-24.2-py3-none-any.whl",
+    "build:win": "npm run prepare:python && npm run build && electron-builder --win nsis --x64"
   },
   "dependencies": {
     "lucide": "^0.468.0",
@@ -28,7 +33,9 @@
     "productName": "Depth Studio",
     "files": [
       "dist/**/*",
-      "desktop/**/*"
+      "desktop/**/*",
+      "!desktop/tests/**",
+      "!desktop/**/*.test.cjs"
     ],
     "extraResources": [
       {
@@ -42,6 +49,26 @@
       {
         "from": "requirements-scan.txt",
         "to": "requirements-scan.txt"
+      },
+      {
+        "from": "requirements-scan.lock.txt",
+        "to": "requirements-scan.lock.txt"
+      },
+      {
+        "from": "python-lock.json",
+        "to": "python-lock.json"
+      },
+      {
+        "from": "python-bundle/manifest.json",
+        "to": "python-bundle-manifest.json"
+      },
+      {
+        "from": "python-bundle/runtime",
+        "to": "python-runtime"
+      },
+      {
+        "from": "python-bundle/wheels",
+        "to": "python-wheels"
       },
       {
         "from": "README.md",
@@ -62,7 +89,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Depth Studio",
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh"
     },
     "directories": {
       "output": "release"
