@@ -835,6 +835,12 @@ async function runSetup(rawOptions = {}) {
 
     let installSource = "bundled";
     const requiredPackages = lock.packages.map((pkg) => `${pkg.name}==${pkg.version}`);
+    const pipLines = [];
+    const collectPipLine = (line) => {
+      pipLines.push(line);
+      if (pipLines.length > 4000) pipLines.shift();
+      logger.line(`pip: ${line}`);
+    };
     currentStepFraction(0.15, "установка NumPy и Open3D");
     const useBundle = lock.packages.every((pkg) => bundleWheels.has(pkg.filename));
     let installResult;
@@ -850,13 +856,14 @@ async function runSetup(rawOptions = {}) {
           bundle.wheelsDir,
           "--only-binary=:all:",
           "--no-warn-script-location",
+          "--no-cache-dir",
           "--disable-pip-version-check",
           ...requiredPackages,
         ],
         {
           env: childEnvironment(opts.env),
           timeoutMs: 30 * 60 * 1000,
-          onLine: (line) => logger.line(`pip: ${line}`),
+          onLine: collectPipLine,
         },
       );
     } else {
@@ -891,6 +898,7 @@ async function runSetup(rawOptions = {}) {
           "--only-binary=:all:",
           "--require-hashes",
           "--no-warn-script-location",
+          "--no-cache-dir",
           "--disable-pip-version-check",
           "-r",
           lockPath,
@@ -899,9 +907,10 @@ async function runSetup(rawOptions = {}) {
           env: childEnvironment(opts.env),
           timeoutMs: 60 * 60 * 1000,
           onLine: (line) => {
-            logger.line(`pip: ${line}`);
-            const progressMatch = /Collecting |Downloading |Installing collected/i.test(line);
-            if (progressMatch) currentStepFraction(0.3, line.slice(0, 120));
+            collectPipLine(line);
+            if (/Collecting |Downloading |Installing collected/i.test(line)) {
+              currentStepFraction(0.3, line.slice(0, 120));
+            }
           },
         },
       );
@@ -911,13 +920,19 @@ async function runSetup(rawOptions = {}) {
       installResult = { code: 1, stdout: "", stderr: "Смоделированный сбой установки пакетов." };
     }
     if (installResult.code !== 0) {
+      const pipLog = path.join(paths.logsDir, "pip-install.log");
+      try {
+        await fsp.writeFile(pipLog, `${pipLines.join("\n")}\n`, "utf8");
+      } catch {
+        /* журнал не критичен для сообщения об ошибке */
+      }
       return await fail(
         "packages",
         new SetupError(
           "packages_failed",
           "Не удалось установить NumPy/Open3D в изолированную среду.",
-          "Нажмите «Повторить». Если ошибка повторяется, проверьте интернет, прокси и антивирус, затем откройте журнал установки.",
-          tailText(installResult),
+          "Нажмите «Повторить». Если ошибка повторяется, проверьте интернет, прокси, антивирус и свободное место, затем откройте журнал установки.",
+          summarizePipFailure(pipLines, installResult),
         ),
       );
     }
@@ -1249,6 +1264,16 @@ function isInside(parent, child) {
   return root === target || target.startsWith(`${root}/`);
 }
 
+/** Extract the actionable part of pip output instead of a wall of "Processing" lines. */
+function summarizePipFailure(lines, result, limit = 1600) {
+  const interesting = (lines || []).filter((line) =>
+    /error|could not|conflict|no matching|not in '|denied|errno|Traceback|Failed/i.test(line),
+  );
+  const text = (interesting.length ? interesting : (lines || []).slice(-8)).join("\n").trim();
+  if (text) return text.slice(-limit);
+  return tailText(result, limit);
+}
+
 function tailText(result, limit = 1200) {
   const text = `${result?.stderr || ""}\n${result?.stdout || ""}`.trim();
   return text.length > limit ? text.slice(-limit) : text;
@@ -1284,6 +1309,7 @@ module.exports = {
   enableSitePackages,
   bundledRuntimeInfo,
   parseProbe,
+  summarizePipFailure,
   isInside,
   sha256File,
   childEnvironment,

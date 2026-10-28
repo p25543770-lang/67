@@ -271,7 +271,7 @@ jobs:
           if ($data.systemPathPython.Count -gt 0) { $failures += "в PATH приложения остались каталоги Python: $($data.systemPathPython -join ', ')" }
           if ($failures.Count -gt 0) {
             foreach ($failure in $failures) { Write-Output "::error::$failure" }
-            Write-Output "::error::Отчёт самопроверки: $((Get-Content $report -Raw) -replace '\r?\n', ' ')"
+            Write-Output "::error::$($data.setup.error.code): $($data.setup.error.message) | $((($data.setup.error.details) -replace '\r?\n', ' / ').Substring(0, [Math]::Min(900, ($data.setup.error.details).Length)))"
             $logPath = Join-Path $env:LOCALAPPDATA 'DepthStudio\logs\setup.log'
             if (Test-Path $logPath) {
               Write-Output "::error::Журнал установки: $((Get-Content $logPath -Raw) -replace '\r?\n', ' | ')"

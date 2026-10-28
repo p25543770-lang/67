@@ -258,6 +258,9 @@ function runEnvironmentSetup(mode = "retry") {
       setupPromise = null;
       if (result.ok) {
         await openMainWindow();
+        // Среда могла быть восстановлена уже после открытия окна: мост нужно
+        // поднять заново, иначе интерфейс остался бы в деморежиме навсегда.
+        if (!bridgeStatus.ready) await startBridge();
         setTimeout(() => {
           void closeSetupWindow();
         }, 1200);
