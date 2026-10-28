@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 
@@ -35,6 +36,14 @@ wheel_for = resolver.wheel_for
 
 LOCK = pathlib.Path("python-lock.json")
 LOCK_TXT = pathlib.Path("requirements-scan.lock.txt")
+GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+
+# Консоль Windows по умолчанию не в UTF-8 — русские сообщения не должны ронять проверку.
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 def main() -> int:
@@ -86,7 +95,7 @@ def main() -> int:
     if problems:
         print("Проверка замка зависимостей не пройдена:", file=sys.stderr)
         for problem in problems:
-            print(f"  - {problem}", file=sys.stderr)
+            print(f"::error::{problem}" if GITHUB_ACTIONS else f"  - {problem}", file=sys.stderr)
         return 1
 
     print(f"Замок зависимостей согласован: {len(pinned)} пакетов, Windows x64 / CPython 3.11.")

@@ -33,6 +33,12 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 ROOT_REQUIREMENTS = ("numpy==1.26.4", "open3d==0.18.0")
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 PYTHON_VERSION = "3.11.9"
 
 WINDOWS_MARKERS = {
