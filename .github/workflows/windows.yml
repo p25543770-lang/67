@@ -212,6 +212,7 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: Depth-Studio-Windows-Installer
@@ -298,6 +299,24 @@ jobs:
           }
           $sizeMb = [math]::Round($data.environment.envSizeBytes / 1MB, 1)
           Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version); среда занимает $sizeMb MiB"
+
+      - name: Smoke-test installed scan pipeline and real .NET pixel arrays
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $env:OMP_NUM_THREADS = '2'
+          $env:PYTHONIOENCODING = 'utf-8'
+          $env:DEPTH_STUDIO_EXPECT_RESOURCES = Join-Path '${{ steps.install.outputs.installDir }}' 'resources'
+          $python = Join-Path $env:LOCALAPPDATA 'DepthStudio\runtime\python\python.exe'
+          if (-not (Test-Path $python)) { Write-Output '::error::Встроенный Python не найден.'; exit 1 }
+          & $python -c "import os,server,scan_pipeline; root=os.path.normcase(os.path.abspath(os.environ['DEPTH_STUDIO_EXPECT_RESOURCES'])); paths=[os.path.normcase(os.path.abspath(server.__file__)),os.path.normcase(os.path.abspath(scan_pipeline.__file__))]; print('Installed modules:', paths); assert all(os.path.commonpath([root,p]) == root for p in paths), paths"
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка установленного Open3D-конвейера на синтетическом кадре.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами через pythonnet.'; exit 1 }
+          Write-Output '::notice::Установленный конвейер и .NET-массивы проверены без физического Kinect.'
 
       - name: Second launch reuses the prepared environment
         shell: pwsh
