@@ -22,6 +22,17 @@ const bridgeProxy = {
 };
 
 export default defineConfig({
+  build: {
+    reportCompressedSize: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("/node_modules/three/")) return "three-vendor";
+          if (id.includes("/node_modules/lucide/")) return "icons-vendor";
+        },
+      },
+    },
+  },
   server: {
     host: "0.0.0.0",
     allowedHosts: true,
