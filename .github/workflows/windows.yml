@@ -39,7 +39,8 @@ jobs:
         with:
           name: depth-studio-renderer
           path: dist/
-      - uses: actions/cache@v4
+      - id: electron-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~\AppData\Local\electron-builder\Cache
           key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
@@ -76,3 +77,10 @@ jobs:
           path: release/Depth-Studio-Setup-*.exe
           if-no-files-found: error
           retention-days: 14
+      - name: Save Electron tool cache
+        if: always() && steps.electron-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}

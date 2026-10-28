@@ -24,6 +24,7 @@
   "main": "desktop/main.cjs",
   "build": {
     "appId": "studio.depthstudio.desktop",
+    "compression": "store",
     "productName": "Depth Studio",
     "files": [
       "dist/**/*",
