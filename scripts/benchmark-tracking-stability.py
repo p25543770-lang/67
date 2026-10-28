@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--frames", type=int, default=150)
     parser.add_argument("--steps", type=int, nargs="+", default=[3, 5])
     parser.add_argument("--profile", choices=("max_fps", "standard"), default="max_fps")
+    parser.add_argument("--trajectory", choices=("default", "offset", "turns", "flat"), default="default")
+    parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument("--package-root", type=Path, default=ROOT)
     parser.add_argument("--color-shift-px", type=int, default=0,
                         help="synthetic horizontal RGB offset, not Kinect calibration")
@@ -35,6 +37,8 @@ def main():
         parser.error("--frames must be 4..330 and each --steps value 1..30")
     if abs(args.color_shift_px) > 100:
         parser.error("--color-shift-px must be between -100 and 100")
+    if args.seed_offset < 0:
+        parser.error("--seed-offset must be non-negative")
     sys.path.insert(0, str(ROOT / "tests"))
     sys.path.insert(0, str(args.package_root.resolve()))
     try:
@@ -51,11 +55,17 @@ def main():
     from scan_pipeline.engine import ScanEngine
 
     intrinsics = Intrinsics.kinect_v1()
-    trajectory = room.orbit(frames=330, look="inward")
+    trajectory_options = {
+        "default": {"look": "inward"},
+        "offset": {"look": "inward", "phase": 1.6, "centre": (0.15, -0.1)},
+        "turns": {"look": "inward", "phase": 0.5, "jitter_deg": 4.0},
+        "flat": {"look": "outward"},
+    }
+    trajectory = room.orbit(frames=330, **trajectory_options[args.trajectory])
     needed = sorted({index for step in args.steps for index in range(0, args.frames, step)})
     frames = {}
     for index in needed:
-        depth, color, _ = room.render(trajectory.poses[index], intrinsics, noise=True, seed=index)
+        depth, color, _ = room.render(trajectory.poses[index], intrinsics, noise=True, seed=index + args.seed_offset)
         if args.color_shift_px:
             color = np.roll(color, args.color_shift_px, axis=1)
         frames[index] = depth, color
@@ -85,6 +95,8 @@ def main():
             worst, worst_index = max(errors, default=(None, None))
             result = {
                 "profile": args.profile,
+                "trajectory": args.trajectory,
+                "seedOffset": args.seed_offset,
                 "scheduledFrames": args.frames,
                 "inputEveryNthFrame": step,
                 "framesProcessed": len(indices),

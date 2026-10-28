@@ -338,8 +338,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка продолжения прохода в отдельном процессе Open3D.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_worker_crash -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка освобождения ресурсов после сбоя процесса Open3D.'; exit 1 }
-          & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v
-          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка синтетических тестов скорости, пропусков или потери трекинга.'; exit 1 }
+          $trackingLog = Join-Path $env:RUNNER_TEMP 'installed-tracking-tests.log'
+          & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v 2>&1 | Tee-Object -FilePath $trackingLog
+          $trackingExitCode = $LASTEXITCODE
+          if ($trackingExitCode -ne 0) {
+            $trace = (Get-Content $trackingLog -Tail 80) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Installed synthetic tracking tests::$trace"
+            exit $trackingExitCode
+          }
           & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами и IntPtr через pythonnet.'; exit 1 }
           $bench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-synthetic-fps.py'

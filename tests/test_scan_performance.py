@@ -490,6 +490,26 @@ class SyntheticFastMotionTests(unittest.TestCase):
             self.engine.release()
         self.engine = ScanEngine(ScanSettings(), self.intr, clock=lambda: 0.0)
 
+    def test_regular_tracking_is_not_penalized_before_any_rescue(self):
+        self.engine.release()
+        clock = [0.0]
+        self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: clock[0])
+        trajectory = sr.orbit(frames=330, look="inward", phase=0.5, jitter_deg=4.0)
+        accepted, worst = [], 0.0
+        for k in range(0, 75, 3):
+            depth, color, _ = sr.render(trajectory.poses[k], self.intr, noise=True, seed=k + 2026)
+            clock[0] = k / 30.0
+            event = self.engine.process(depth, color, clock[0])
+            if event["state"] == "tracking":
+                accepted.append(k)
+                truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
+                worst = max(worst, pose_error(self.engine.last_pose, truth)[0])
+        self.assertGreaterEqual(len(accepted), 24)
+        self.assertGreaterEqual(accepted[-1], 69)
+        self.assertLess(worst, 50.0)
+        self.assertEqual(self.engine.tracker.frames_rescued, 0)
+        self.assertEqual(self.engine.tracker.frame_checks, 0)
+
     def test_nonfinite_registration_is_never_integrated(self):
         _, depth, color = self.frame_at(0.0, 0)
         self.engine.process(depth, color, 0.0)

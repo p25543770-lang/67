@@ -230,6 +230,7 @@ class FrameToModelTracker:
         self.frame_checks = 0
         self.frame_checks_passed = 0
         self.frames_rescued = 0
+        self._crosscheck_after_rescue = False
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
         self.last_result: TrackResult | None = None
@@ -243,6 +244,7 @@ class FrameToModelTracker:
         self._last_view = None
         self._last_reference = None
         self.frame_checks = self.frame_checks_passed = self.frames_rescued = 0
+        self._crosscheck_after_rescue = False
         self._prepared = None
         self.last_result = None
 
@@ -378,7 +380,8 @@ class FrameToModelTracker:
                 return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
                                     extra={"eigenRatio": ratio})
             rescued = True
-        elif (ratio < FRAME_CROSSCHECK_RATIO and physically_plausible and not self._recovery_state and
+        elif (ratio < FRAME_CROSSCHECK_RATIO and self._crosscheck_after_rescue and
+              physically_plausible and not self._recovery_state and
               observation is not None and self._last_reference is not None and
               has_usable_texture(observation[1]) and has_usable_texture(self._last_reference.color)):
             # A weakly constrained model estimate can have good ICP residuals
@@ -435,6 +438,7 @@ class FrameToModelTracker:
         self._last_reference = ReferenceFrame.capture(observation, candidate)
         if rescued:
             self.frames_rescued += 1
+            self._crosscheck_after_rescue = True
         self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
                                        method=method, extra={"viewPoints": view_size,
