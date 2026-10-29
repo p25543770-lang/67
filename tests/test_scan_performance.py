@@ -624,7 +624,7 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertFalse(self.engine.pipeline_info()["verifiedOnHardware"])
 
     def test_raw_frame_confirmation_rejects_wrong_or_missing_views(self):
-        from scan_pipeline.frame_validation import ReferenceFrame, confirm_model_pose
+        from scan_pipeline.frame_validation import ReferenceFrame, confirm_model_pose, reference_seed_pose
 
         trajectory = sr.orbit(frames=330, look="inward")
         d0, c0, _ = sr.render(trajectory.poses[0], self.intr, noise=True, seed=0)
@@ -643,6 +643,12 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertFalse(confirm_model_pose(depth, None, intr, truth, reference))
         self.assertFalse(confirm_model_pose(depth, np.full_like(color, 100), intr, truth, reference))
         self.assertFalse(confirm_model_pose(depth, color, intr, truth, None))
+        seed = reference_seed_pose(depth, color, intr, truth, reference)
+        self.assertIsNotNone(seed)
+        self.assertLess(pose_error(seed, truth)[0], 15.0)
+        self.assertIsNone(reference_seed_pose(depth, None, intr, truth, reference))
+        self.assertIsNone(reference_seed_pose(depth, np.full_like(color, 100), intr, truth, reference))
+        self.assertIsNone(reference_seed_pose(depth, color, intr, truth, None))
         # Repetitive texture on a flat wall must not turn a geometrically
         # unconstrained pose into a trusted one.
         flat = np.full((intr.height, intr.width), 2000, dtype=np.uint16)
@@ -651,6 +657,7 @@ class SyntheticFastMotionTests(unittest.TestCase):
         checker = np.repeat(checker[:, :, None], 3, axis=2)
         planar = ReferenceFrame.capture((flat, checker), np.eye(4))
         self.assertFalse(confirm_model_pose(flat, checker, intr, np.eye(4), planar))
+        self.assertIsNone(reference_seed_pose(flat, checker, intr, np.eye(4), planar))
 
     def test_skipped_frames_use_confirmation_without_fusing_large_errors(self):
         self.engine.release()

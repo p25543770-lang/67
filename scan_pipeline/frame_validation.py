@@ -114,21 +114,16 @@ def _projective_consistency(depth, color, reference, intrinsics, transform) -> b
     return bool(alternatives) and actual[2] - max(alternatives) >= 0.015
 
 
-def confirm_model_pose(depth, color, intrinsics, candidate, reference: ReferenceFrame | None) -> bool:
-    """Confirm, but never invent, a pose using the previous trusted frame.
-
-    Both registrations must agree to 15 mm / 1.5 degrees, the raw-frame ICP
-    must have usable geometry, and the projective view must be distinctive.
-    Failure or missing RGB simply returns False; no new pose is accepted here.
-    """
+def _register_reference(depth, color, intrinsics, candidate, reference: ReferenceFrame | None):
+    """Register against a trusted raw frame; return only well-constrained results."""
     if reference is None or color is None:
-        return False
+        return None
     depth, color = np.asarray(depth), np.asarray(color)
     if (depth.ndim != 2 or depth.shape != reference.depth.shape or
             depth.shape != (intrinsics.height, intrinsics.width) or
             reference.color is None or color.shape != reference.color.shape or
             not has_usable_texture(color) or not has_usable_texture(reference.color)):
-        return False
+        return None
     try:
         import open3d as o3d
         from .tracking import registration_diagnostics
@@ -138,7 +133,7 @@ def confirm_model_pose(depth, color, intrinsics, candidate, reference: Reference
             reference._cloud = _cloud_from_depth(reference.depth, intrinsics, normals=True)
         target = reference._cloud
         if len(source.points) < 400 or len(target.points) < 400:
-            return False
+            return None
         initial = invert_pose(reference.pose) @ candidate
         result = o3d.pipelines.registration.registration_icp(
             source, target, 0.10, initial,
@@ -147,17 +142,52 @@ def confirm_model_pose(depth, color, intrinsics, candidate, reference: Reference
         )
         transform = np.asarray(result.transformation)
         if not (np.isfinite(transform).all() and np.isfinite(result.fitness)):
-            return False
+            return None
         rmse, ratio = registration_diagnostics(source, target, transform, 0.02)
         if not (np.isfinite(rmse) and np.isfinite(ratio)):
-            return False
-        independent_pose = reference.pose @ transform
-        difference_mm, difference_deg = pose_error(independent_pose, candidate)
-        if (result.fitness < 0.85 or rmse > 0.014 or ratio < 0.003 or
-                difference_mm > 15.0 or difference_deg > 1.5):
-            return False
-        return _projective_consistency(depth, color, reference, intrinsics, initial)
+            return None
+        if result.fitness < 0.85 or rmse > 0.014 or ratio < 0.003:
+            return None
+        return depth, color, initial, transform
     except RuntimeError:
         # Open3D can fail on too few correspondences; fail closed instead of
         # crashing or integrating an unconfirmed estimate.
+        return None
+
+
+def confirm_model_pose(depth, color, intrinsics, candidate, reference: ReferenceFrame | None) -> bool:
+    """Require raw ICP, pose agreement and a distinctive projective view.
+
+    Both registrations must agree to 15 mm / 1.5 degrees. Missing or
+    unregistered RGB may make this unavailable; failure never accepts a pose.
+    """
+    registered = _register_reference(depth, color, intrinsics, candidate, reference)
+    if registered is None:
         return False
+    depth, color, initial, transform = registered
+    independent_pose = reference.pose @ transform
+    difference_mm, difference_deg = pose_error(independent_pose, candidate)
+    if difference_mm > 15.0 or difference_deg > 1.5:
+        return False
+    try:
+        return _projective_consistency(depth, color, reference, intrinsics, initial)
+    except RuntimeError:
+        return False
+
+
+def reference_seed_pose(depth, color, intrinsics, candidate, reference: ReferenceFrame | None):
+    """A raw-frame ICP seed, not an accepted pose or a bypass for any guard.
+
+    A retry is allowed only with a distinctive projective raw view. The new
+    model result must still pass all checks, including independent confirmation.
+    """
+    registered = _register_reference(depth, color, intrinsics, candidate, reference)
+    if registered is None:
+        return None
+    depth, color, _initial, transform = registered
+    try:
+        if not _projective_consistency(depth, color, reference, intrinsics, transform):
+            return None
+    except RuntimeError:
+        return None
+    return reference.pose @ transform

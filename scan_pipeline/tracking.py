@@ -31,7 +31,7 @@ import numpy as np
 
 from .camera import Intrinsics, invert_pose, relative_motion
 from .config import ROBOT_PROFILE, ScanSettings, TARGET_FPS
-from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture
+from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture, reference_seed_pose
 from .landmarks import LandmarkGuard
 
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
@@ -293,7 +293,7 @@ class FrameToModelTracker:
         return predicted
 
     def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None,
-              observation=None) -> TrackResult:
+              observation=None, *, _retry_seed=None) -> TrackResult:
         """Оценить позу кадра относительно подготовленной модели.
 
         Побочные эффекты только при принятии кадра: обновляются поза и скорость.
@@ -326,6 +326,10 @@ class FrameToModelTracker:
                 self._recovery_state is None):
             self._recovery_state = "lost"
             predicted = self.pose.copy()
+        # Keep the original prediction for the motion check even on a retry.
+        motion_prediction = predicted.copy()
+        if _retry_seed is not None:
+            predicted = _retry_seed
 
         # This is the *same mandatory recovery check* that was previously
         # performed after both ICP scales. A different view could never be
@@ -466,8 +470,8 @@ class FrameToModelTracker:
                                         method=method, extra={"motionDisagreementM": mismatch[0],
                                                               "motionAllowedM": mismatch[1], "eigenRatio": ratio})
                 rescued = True
-        predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
-        correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
+        predicted_step = float(np.linalg.norm(motion_prediction[:3, 3] - self.pose[:3, 3]))
+        correction = float(np.linalg.norm(candidate[:3, 3] - motion_prediction[:3, 3]))
         if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
                                                       predicted_step * PREDICTION_CORRECTION_RATIO):
             # A sudden stop/turn or weak geometry can make ICP confidently slide
@@ -486,7 +490,19 @@ class FrameToModelTracker:
         # any of the speed, residual or geometry checks above.
         gap_high_motion = (self.settings.profile == ROBOT_PROFILE or
                            step_m / dt >= GAP_FAST_SPEED_MPS or angular >= GAP_FAST_ANGULAR_RPS)
-        if needs_gap_confirmation and gap_high_motion and (not physically_plausible or not confirm_once()):
+        if needs_gap_confirmation and (gap_high_motion or _retry_seed is not None) and (
+                not physically_plausible or not confirm_once()):
+            # Try one different ICP starting point, never an accepted raw pose.
+            # The independent frame must itself be distinctive, and the retry
+            # must pass the *same* motion, geometry, residual, speed and RGB-D
+            # checks even if its estimated speed looks slow. Robot mode keeps
+            # its original conservative behavior and does not use this retry.
+            if (self.settings.profile != ROBOT_PROFILE and _retry_seed is None and
+                    physically_plausible and observation is not None):
+                seed = reference_seed_pose(observation[0], observation[1], intrinsics,
+                                           candidate, self._last_reference)
+                if seed is not None:
+                    return self.track(cam_points, cam_colors, intrinsics, dt, observation, _retry_seed=seed)
             self._recovery_state = "lost"
             return self._reject("lost", predicted, "gap_unconfirmed", fitness, rmse,
                                 step_m, step_deg, method=method, extra={"eigenRatio": ratio})

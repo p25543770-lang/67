@@ -198,6 +198,72 @@ class RobotGuardTests(unittest.TestCase):
                 finally:
                     engine.release()
 
+    def test_gap_retry_never_accepts_raw_seed_without_all_checks(self):
+        intr = Intrinsics.kinect_v1()
+        pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
+        depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
+                                      scene=robot.robot_scene("clutter"))
+        fast = np.eye(4)
+        fast[0, 3] = 0.1  # triggers the fast-profile gap confirmation
+        slow_seed = np.eye(4)
+        slow_seed[0, 3] = 0.04  # retry still has to confirm, despite looking slow
+        far_seed = np.eye(4)
+        far_seed[0, 3] = 0.3
+        cases = (
+            ("not_confirmed", slow_seed, [False, False], [(0.001, 0.01), (0.001, 0.01)], "gap_unconfirmed"),
+            ("confirmed", slow_seed, [False, True], [(0.001, 0.01), (0.001, 0.01)], "tracking"),
+            ("degenerate", slow_seed, [False], [(0.001, 0.01), (0.001, 0.0001)], "degenerate_geometry"),
+            ("too_fast", far_seed, [False], [(0.001, 0.01), (0.001, 0.01)], "speed_limit"),
+        )
+        for name, seed, confirmations, diagnostics, expected in cases:
+            with self.subTest(name=name):
+                engine = ScanEngine(ScanSettings.for_profile("max_fps"), intr, clock=lambda: 0.0)
+                try:
+                    self.assertEqual(engine.process(depth, color, 0.0)["state"], "tracking")
+                    trusted = engine.last_pose.copy()
+                    icps = [SimpleNamespace(transformation=m, fitness=1.0)
+                            for m in (fast, fast, np.eye(4), np.eye(4))]
+                    with patch("open3d.pipelines.registration.registration_icp", side_effect=icps), \
+                            patch("scan_pipeline.tracking.registration_diagnostics", side_effect=diagnostics), \
+                            patch("scan_pipeline.tracking.confirm_model_pose", side_effect=confirmations) as confirm, \
+                            patch("scan_pipeline.tracking.reference_seed_pose", return_value=seed) as raw_seed:
+                        event = engine.process(depth, color, 0.1)
+                    raw_seed.assert_called_once()
+                    self.assertEqual(confirm.call_count, len(confirmations))
+                    if expected == "tracking":
+                        self.assertEqual(event["state"], "tracking", event)
+                        np.testing.assert_allclose(engine.last_pose, seed)
+                    else:
+                        self.assertEqual(event["reason"], expected, event)
+                        self.assertFalse(event["integrated"])
+                        np.testing.assert_array_equal(engine.last_pose, trusted)
+                finally:
+                    engine.release()
+
+    def test_gap_retry_keeps_original_prediction_consistency_check(self):
+        intr = Intrinsics.kinect_v1()
+        pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
+        depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
+                                      scene=robot.robot_scene("clutter"))
+        engine = ScanEngine(ScanSettings.for_profile("max_fps"), intr, clock=lambda: 0.0)
+        try:
+            self.assertEqual(engine.process(depth, color, 0.0)["state"], "tracking")
+            prediction = np.eye(4)
+            prediction[0, 3] = 0.1
+            icp = SimpleNamespace(transformation=np.eye(4), fitness=1.0)
+            with patch.object(engine.tracker, "_predict", return_value=prediction), \
+                    patch("open3d.pipelines.registration.registration_icp", return_value=icp), \
+                    patch("scan_pipeline.tracking.registration_diagnostics", return_value=(0.001, 0.01)), \
+                    patch("scan_pipeline.tracking.confirm_model_pose", return_value=False) as confirm, \
+                    patch("scan_pipeline.tracking.reference_seed_pose", return_value=np.eye(4)):
+                event = engine.process(depth, color, 0.1)
+            self.assertEqual(confirm.call_count, 2)
+            self.assertEqual(event["reason"], "motion_inconsistent")
+            self.assertFalse(event["integrated"])
+            np.testing.assert_array_equal(engine.last_pose, np.eye(4))
+        finally:
+            engine.release()
+
     def test_gap_keeps_the_existing_prediction_consistency_guard(self):
         intr = Intrinsics.kinect_v1()
         pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
