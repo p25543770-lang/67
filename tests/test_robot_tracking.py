@@ -223,12 +223,15 @@ class RobotGuardTests(unittest.TestCase):
                     trusted = engine.last_pose.copy()
                     icps = [SimpleNamespace(transformation=m, fitness=1.0)
                             for m in (fast, fast, np.eye(4), np.eye(4))]
-                    with patch("open3d.pipelines.registration.registration_icp", side_effect=icps), \
+                    with patch("open3d.pipelines.registration.registration_icp", side_effect=icps) as register, \
                             patch("scan_pipeline.tracking.registration_diagnostics", side_effect=diagnostics), \
                             patch("scan_pipeline.tracking.confirm_model_pose", side_effect=confirmations) as confirm, \
                             patch("scan_pipeline.tracking.reference_seed_pose", return_value=seed) as raw_seed:
                         event = engine.process(depth, color, 0.1)
                     raw_seed.assert_called_once()
+                    self.assertEqual(register.call_count, 4)
+                    self.assertAlmostEqual(register.call_args_list[2].args[2], 0.04)
+                    self.assertAlmostEqual(register.call_args_list[3].args[2], 0.02)
                     self.assertEqual(confirm.call_count, len(confirmations))
                     if expected == "tracking":
                         self.assertEqual(event["state"], "tracking", event)

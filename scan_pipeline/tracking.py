@@ -389,9 +389,14 @@ class FrameToModelTracker:
                         o3d.pipelines.registration.TransformationEstimationForColoredICP(0.968), criteria)
                     method = "colored_icp"
                 else:
+                    search_distance = max(level["radius"] * 2,
+                                          min(0.25, self.settings.max_speed_mps * dt + 0.03))
+                    if _retry_seed is not None:
+                        # A guarded raw-view estimate permits a narrower search;
+                        # distant correspondences must not drag it across a wall.
+                        search_distance = level["radius"]
                     icp = o3d.pipelines.registration.registration_icp(
-                        source, target,
-                        max(level["radius"] * 2, min(0.25, self.settings.max_speed_mps * dt + 0.03)), transform,
+                        source, target, search_distance, transform,
                         o3d.pipelines.registration.TransformationEstimationPointToPlane(), criteria)
                     method = "point_to_plane_icp"
             except RuntimeError:

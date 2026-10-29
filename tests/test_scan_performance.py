@@ -672,11 +672,11 @@ class SyntheticFastMotionTests(unittest.TestCase):
             clock = [0.0]
             self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: clock[0])
             errors, accepted, first_rejection = [], [], None
-            confirmation_failure = None
+            confirmation_failures = []
             def traced_confirmation(depth, color, intrinsics, candidate, reference):
-                nonlocal confirmation_failure
                 result = original_confirmation(depth, color, intrinsics, candidate, reference)
-                if not result and confirmation_failure is None and reference is not None and color is not None:
+                if (not result and len(confirmation_failures) < 3 and
+                        reference is not None and color is not None):
                     try:
                         source = _cloud_from_depth(depth, intrinsics)
                         target = (reference._cloud if reference._cloud is not None
@@ -689,16 +689,16 @@ class SyntheticFastMotionTests(unittest.TestCase):
                         raw = reference.pose @ registration.transformation
                         truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
                         rmse, ratio = tracking.registration_diagnostics(source, target, registration.transformation, 0.02)
-                        confirmation_failure = {"frame": k,
+                        confirmation_failures.append({"frame": k,
                             "modelTruthMmDeg": tuple(round(v, 3) for v in pose_error(candidate, truth)),
                             "rawTruthMmDeg": tuple(round(v, 3) for v in pose_error(raw, truth)),
                             "modelRawMmDeg": tuple(round(v, 3) for v in pose_error(candidate, raw)),
                             "fitness": round(registration.fitness, 4), "rmseMm": round(rmse * 1000, 3),
                             "ratio": round(ratio, 5),
                             "modelProjective": _projective_consistency(depth, color, reference, intrinsics, initial),
-                            "rawProjective": _projective_consistency(depth, color, reference, intrinsics, registration.transformation)}
+                            "rawProjective": _projective_consistency(depth, color, reference, intrinsics, registration.transformation)})
                     except Exception as exc:  # diagnostics only, never affects the tracker
-                        confirmation_failure = {"frame": k, "diagnostic_error": repr(exc)}
+                        confirmation_failures.append({"frame": k, "diagnostic_error": repr(exc)})
                 return result
             for k in indices:
                 clock[0] = k / 30.0
@@ -715,7 +715,7 @@ class SyntheticFastMotionTests(unittest.TestCase):
             print(f"[tracking] stride={indices.step}, accepted={len(accepted)}/{len(indices)}, "
                   f"last={accepted[-1] if accepted else None}, worst_mm={max(errors) if errors else None}, "
                   f"rescued={self.engine.tracker.frames_rescued}, first_rejection={first_rejection}, "
-                  f"confirmation_failure={confirmation_failure}")
+                  f"confirmation_failures={confirmation_failures}")
             self.assertGreaterEqual(len(accepted), minimum)
             self.assertGreaterEqual(accepted[-1], last_min)
             self.assertLess(max(errors), 50.0)
