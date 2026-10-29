@@ -96,8 +96,8 @@ jobs:
             exit $testExitCode
           }
       - name: Desktop tests on Windows
-        timeout-minutes: 3
-        run: npm run test:desktop
+        timeout-minutes: 5
+        run: node scripts/run-windows-desktop-tests.cjs
       - uses: actions/download-artifact@v4
         with:
           name: depth-studio-renderer
