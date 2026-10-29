@@ -432,6 +432,18 @@ class FrameToModelTracker:
                     self.frame_checks_passed += 1
             return confirmed
 
+        def retry_from_reference():
+            # A seed is not a pose to integrate. At most one retry, only after
+            # an observed gap, and never in robot mode or during recovery.
+            if (not needs_gap_confirmation or self.settings.profile == ROBOT_PROFILE or
+                    _retry_seed is not None or not physically_plausible or observation is None):
+                return None
+            seed = reference_seed_pose(observation[0], observation[1], intrinsics,
+                                       candidate, self._last_reference)
+            if seed is None:
+                return None
+            return self.track(cam_points, cam_colors, intrinsics, dt, observation, _retry_seed=seed)
+
         if ratio < DEGENERACY_RATIO:
             can_check = (ratio >= FRAME_RESCUE_MIN_RATIO and physically_plausible and not self._recovery_state)
             if not can_check or not confirm_once():
@@ -470,6 +482,9 @@ class FrameToModelTracker:
             mismatch = _slow_motion_disagreement(self._previous_pose, self.pose, candidate, dt, self._last_accepted_dt)
             if mismatch is not None:
                 if not confirm_once():
+                    retry = retry_from_reference()
+                    if retry is not None:
+                        return retry
                     self._recovery_state = "lost"
                     return self._reject("lost", predicted, "slow_motion_inconsistent", fitness, rmse, step_m, step_deg,
                                         method=method, extra={"motionDisagreementM": mismatch[0],
@@ -483,6 +498,9 @@ class FrameToModelTracker:
             # along a wall. Only keep the estimate if the independent raw frame
             # and its RGB-D view corroborate it; the speed limit still applies.
             if not confirm_once():
+                retry = retry_from_reference()
+                if retry is not None:
+                    return retry
                 self._recovery_state = "lost"
                 return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
                                     method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
@@ -502,12 +520,9 @@ class FrameToModelTracker:
             # must pass the *same* motion, geometry, residual, speed and RGB-D
             # checks even if its estimated speed looks slow. Robot mode keeps
             # its original conservative behavior and does not use this retry.
-            if (self.settings.profile != ROBOT_PROFILE and _retry_seed is None and
-                    physically_plausible and observation is not None):
-                seed = reference_seed_pose(observation[0], observation[1], intrinsics,
-                                           candidate, self._last_reference)
-                if seed is not None:
-                    return self.track(cam_points, cam_colors, intrinsics, dt, observation, _retry_seed=seed)
+            retry = retry_from_reference()
+            if retry is not None:
+                return retry
             self._recovery_state = "lost"
             return self._reject("lost", predicted, "gap_unconfirmed", fitness, rmse,
                                 step_m, step_deg, method=method, extra={"eigenRatio": ratio})

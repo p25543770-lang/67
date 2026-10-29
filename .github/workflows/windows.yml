@@ -114,6 +114,15 @@ jobs:
             Set-Content $file $original -NoNewline -Encoding utf8
             exit $code
           }
+          $robotLog = Join-Path $env:RUNNER_TEMP 'robot-tracking-regression.log'
+          python -m unittest discover -s tests -p test_robot_tracking.py -v 2>&1 | Tee-Object -FilePath $robotLog
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $trace = (Get-Content $robotLog -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows robot tracking tests::$trace"
+            exit $code
+          }
 
   build:
     needs: [renderer, unit-tests, windows-tracking-regression]
