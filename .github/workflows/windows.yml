@@ -96,6 +96,22 @@ jobs:
             $trace = (Get-Content $log -Tail 22) -join "`n"
             $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Windows Open3D tracking tests::$trace"
+            # Diagnostics only: compare narrower ICP search radii on the same
+            # unchanged assertion. No alternate result can make this job pass.
+            $file = 'scan_pipeline/tracking.py'
+            $original = Get-Content $file -Raw
+            foreach ($factor in @('0.75', '1.25', '1.75', '2.0')) {
+              $variant = $original.Replace('search_distance = level["radius"] * 1.5', "search_distance = level[`"radius`"] * $factor")
+              if ($variant -eq $original) { throw 'Could not apply diagnostic search radius' }
+              Set-Content $file $variant -NoNewline -Encoding utf8
+              $variantLog = Join-Path $env:RUNNER_TEMP "tracking-variant-$factor.log"
+              python -m unittest discover -s tests -p test_scan_performance.py -k skipped_frames_use_confirmation -v 2>&1 | Tee-Object -FilePath $variantLog
+              $variantCode = $LASTEXITCODE
+              $summary = (Get-Content $variantLog -Tail 6) -join "`n"
+              $summary = $summary.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::notice title=ICP radius $factor exit $($variantCode)::$summary"
+            }
+            Set-Content $file $original -NoNewline -Encoding utf8
             exit $code
           }
 

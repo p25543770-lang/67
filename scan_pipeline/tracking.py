@@ -394,7 +394,7 @@ class FrameToModelTracker:
                     if _retry_seed is not None:
                         # A guarded raw-view estimate permits a narrower search;
                         # distant correspondences must not drag it across a wall.
-                        search_distance = level["radius"]
+                        search_distance = level["radius"] * 1.5
                     icp = o3d.pipelines.registration.registration_icp(
                         source, target, search_distance, transform,
                         o3d.pipelines.registration.TransformationEstimationPointToPlane(), criteria)

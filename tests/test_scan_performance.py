@@ -711,7 +711,8 @@ class SyntheticFastMotionTests(unittest.TestCase):
                     errors.append(pose_error(self.engine.last_pose, truth)[0])
                 elif first_rejection is None:
                     first_rejection = {"frame": k, "reason": event.get("reason"),
-                                       "stepMm": event.get("stepMm"), "stepDeg": event.get("stepDeg")}
+                                       "stepMm": event.get("stepMm"), "stepDeg": event.get("stepDeg"),
+                                       "fitness": event.get("fitness"), "rmseMm": event.get("rmseMm")}
             print(f"[tracking] stride={indices.step}, accepted={len(accepted)}/{len(indices)}, "
                   f"last={accepted[-1] if accepted else None}, worst_mm={max(errors) if errors else None}, "
                   f"rescued={self.engine.tracker.frames_rescued}, first_rejection={first_rejection}, "

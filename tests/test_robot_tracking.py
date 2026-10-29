@@ -230,8 +230,8 @@ class RobotGuardTests(unittest.TestCase):
                         event = engine.process(depth, color, 0.1)
                     raw_seed.assert_called_once()
                     self.assertEqual(register.call_count, 4)
-                    self.assertAlmostEqual(register.call_args_list[2].args[2], 0.04)
-                    self.assertAlmostEqual(register.call_args_list[3].args[2], 0.02)
+                    self.assertAlmostEqual(register.call_args_list[2].args[2], 0.06)
+                    self.assertAlmostEqual(register.call_args_list[3].args[2], 0.03)
                     self.assertEqual(confirm.call_count, len(confirmations))
                     if expected == "tracking":
                         self.assertEqual(event["state"], "tracking", event)
