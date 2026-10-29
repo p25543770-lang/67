@@ -1,6 +1,7 @@
 """Настройки конвейера и честные константы статуса."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, asdict
 
 # Пока интеграция не проверена на физическом датчике, UI и README не заявляют поддержку.
@@ -90,6 +91,11 @@ class ScanSettings:
             raise ValueError("Поддерживаются разрешения 640x480 и 320x240 (depth_stride 1 или 2).")
         if self.tracking_stride not in (1, 2, 4):
             raise ValueError("Недопустимое прореживание точек трекинга.")
+        if (isinstance(self.depth_max_m, bool) or not isinstance(self.depth_max_m, (int, float)) or
+                not math.isfinite(self.depth_max_m) or not 0.5 <= self.depth_max_m <= 10.0 or
+                isinstance(self.depth_min_m, bool) or not isinstance(self.depth_min_m, (int, float)) or
+                not math.isfinite(self.depth_min_m) or not 0.0 < self.depth_min_m < self.depth_max_m):
+            raise ValueError("Предел глубины должен быть в пределах 0,5–10 м.")
         if self.volume_budget_mb < 64:
             raise ValueError("Бюджет памяти объёма должен быть не меньше 64 МБ.")
         return self

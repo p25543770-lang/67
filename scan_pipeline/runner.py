@@ -14,6 +14,7 @@ import json
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -133,7 +134,10 @@ class ScanRunner:
             self.active = {"pass_id": pass_id, "name": name, "engine": engine, "engine_lock": engine_lock,
                            "store": store, "adapter": adapter, "thread": thread, "stop": stop, "source": source,
                            "replayed": replayed, "resumed": bool(resume_pass_id), "frames_at_save": 0,
-                           "mailbox": mailbox, "writer": writer, "capture_warning": ""}
+                           "mailbox": mailbox, "writer": writer, "capture_warning": "",
+                           # A resumed pass can reuse a model counter with a
+                           # different extraction. Tokens must not collide.
+                           "preview_generation": uuid.uuid4().hex}
             self.phase = "capturing"
             self.error = ""
             self.merged = None
@@ -148,7 +152,10 @@ class ScanRunner:
             self.last_event_captured_at = None
             self.last_event_updated_at = None
             with self._front_lock:
-                self._front_context = {"mailbox": mailbox, "stop": stop, "intrinsics": intrinsics,
+                effective_settings = saved if resume_pass_id else settings
+                front_intrinsics = saved_intrinsics if resume_pass_id else intrinsics
+                self._front_context = {"mailbox": mailbox, "stop": stop, "intrinsics": front_intrinsics,
+                                       "max_depth_mm": int(effective_settings.depth_max_m * 1000),
                                        "pass_id": pass_id, "tracking": "starting", "last_tracked_at": None,
                                        "last_processed_at": None, "updated_at": None}
             try:
@@ -651,7 +658,8 @@ class ScanRunner:
             result = empty_front("no_frame")
         else:
             frame, received_at = published
-            result = front_frame(frame, received_at, status["intrinsics"], include_color)
+            result = front_frame(frame, received_at, status["intrinsics"], include_color,
+                                 max_depth_mm=status.get("max_depth_mm", 4000))
         now = time.monotonic()
         tracked_age = monotonic_age(now, status["last_tracked_at"])
         processed_age = monotonic_age(now, status["last_processed_at"])
@@ -675,7 +683,8 @@ class ScanRunner:
                 return empty_front("scan_not_running")
         return result
 
-    def snapshot(self, preview_points=PREVIEW_POINTS, *, include_preview=True, include_color=False) -> dict:
+    def snapshot(self, preview_points=PREVIEW_POINTS, *, include_preview=True, include_color=False,
+                 include_points=True, known_points_version=None) -> dict:
         with self.lock:
             active = self.active
             event = dict(self.last_event)
@@ -683,7 +692,8 @@ class ScanRunner:
             pass_id = active["pass_id"] if active else None
             phase = self.phase
             error = self.error
-            points = []
+            points = [] if include_points else None
+            points_version = None
             count = 0
             pipeline = None
             quality = None
@@ -693,10 +703,30 @@ class ScanRunner:
                     count = engine.fusion.surface_voxels_estimate
                     pipeline = engine.pipeline_info()
                     quality = engine.quality_summary()
-                    model = (engine.model_points(preview_points, True) if include_color
-                             else engine.model_points(preview_points))
-                    points = _preview(model)
                     color_counts = (pipeline or {}).get("modelColorFrames")
+                    if include_points:
+                        version = getattr(engine, "model_version", getattr(engine, "_model_version", None))
+                        if isinstance(version, int) and not isinstance(version, bool):
+                            points_version = (f"{pass_id}:{active['preview_generation']}:{version}:"
+                                              f"{preview_points}:{'rgb' if include_color else 'xyz'}")
+                        if points_version and points_version == known_points_version:
+                            # The renderer already has this exact immutable TSDF
+                            # extraction. Avoid the IPC copy, JSON and GPU update.
+                            points = None
+                        else:
+                            cache = active.setdefault("preview_cache", {})
+                            if points_version and points_version in cache:
+                                points = cache[points_version]
+                            else:
+                                model = (engine.model_points(preview_points, True) if include_color
+                                         else engine.model_points(preview_points))
+                                points = _preview(model)
+                                if points_version:
+                                    # Two color variants are useful; older model
+                                    # generations are bounded and discarded.
+                                    if len(cache) >= 4:
+                                        cache.clear()
+                                    cache[points_version] = points
                     frames = engine.frames_seen
                     keyframes = engine.integrated
                     speed = getattr(engine, "last_speed_mps", None)
@@ -708,15 +738,17 @@ class ScanRunner:
                 arrays = self.merged["arrays"]
                 # A merged/legacy result may lack RGB-presence metadata.
                 color_counts = (self.merged.get("metrics", {}).get("pipeline") or {}).get("colorFrames")
-                colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
-                points = _preview_mesh(arrays["vertices"], preview_points, colors)
+                if include_points:
+                    colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
+                    points = _preview_mesh(arrays["vertices"], preview_points, colors)
             elif engine is None and self.last_result_id and self.last_result_id in self.results:
                 entry = self.results[self.last_result_id]
                 arrays = entry["arrays"]
                 count = len(arrays["vertices"])
                 color_counts = (entry.get("metrics", {}).get("pipeline") or {}).get("colorFrames")
-                colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
-                points = _preview_mesh(arrays["vertices"], preview_points, colors)
+                if include_points:
+                    colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
+                    points = _preview_mesh(arrays["vertices"], preview_points, colors)
             running = active is not None
             preview = None
             if include_preview and running and self.last_preview is not None:
@@ -772,7 +804,9 @@ class ScanRunner:
                 "lastEvent": {k: v for k, v in event.items() if k not in ("warning", "hint")},
                 "preview": preview,
                 "points": points,
-                "pointColor": _point_color_info(points, color_counts) if include_color else None,
+                "pointsVersion": points_version,
+                # None means unchanged/omitted, not "no RGB".
+                "pointColor": _point_color_info(points, color_counts) if include_color and points is not None else None,
                 "pipeline": pipeline,
                 "quality": quality,
                 "lastResultId": self.last_result_id,

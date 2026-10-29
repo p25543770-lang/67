@@ -24,6 +24,19 @@ test("camera projection uses source pixel spacing and omits unknown depth", () =
   ]);
 });
 
+test("front preview permits an explicit limit through 10 m but rejects excess", () => {
+  const data = frame();
+  const raw = Buffer.alloc(8);
+  [450, 5000, 10000, 10001].forEach((value, i) => raw.writeUInt16LE(value, i * 2));
+  data.depth.data = raw.toString("base64");
+  assert.equal(front.frontDepthToPackedPoints(data).length, 4, "old server defaults to 4 m");
+  assert.equal(front.frontDepthToPackedPoints({ ...data, maxDepthMm: 10000 }).length, 12);
+  assert.equal(front.frontDepthToPackedPoints({ ...data, maxDepthMm: 5000 }).length, 8);
+  for (const invalid of [10001, 450, -1, NaN, "10000"]) {
+    assert.equal(front.frontDepthToPackedPoints({ ...data, maxDepthMm: invalid }).length, 0);
+  }
+});
+
 test("bad, incomplete or unsafe frame payloads never render", () => {
   assert.deepEqual(front.frontDepthToPoints({ ...frame(), available: false }), []);
   assert.deepEqual(front.frontDepthToPoints({ ...frame(), notForNavigation: false }), []);

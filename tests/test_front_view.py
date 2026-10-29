@@ -58,6 +58,23 @@ class FrontViewTests(unittest.TestCase):
         values = np.frombuffer(base64.b64decode(encoded["data"]), dtype="<u2").reshape(2, 2)
         np.testing.assert_array_equal(values, [[0, 0], [1250, 2000]])
 
+    def test_extended_limit_is_explicit_bounded_and_inclusive(self):
+        self.depth[0, 0] = 450
+        self.depth[0, 4] = 5000
+        self.depth[4, 0] = 10000
+        self.depth[4, 4] = 10001
+        default = front_frame(self.frame, 99.99, self.intr, clock=lambda: 100.0)
+        values = np.frombuffer(base64.b64decode(default["depth"]["data"]), dtype="<u2")
+        np.testing.assert_array_equal(values, [450, 0, 0, 0])
+        extended = front_frame(self.frame, 99.99, self.intr, max_depth_mm=10000, clock=lambda: 100.0)
+        self.assertEqual(extended["maxDepthMm"], 10000)
+        values = np.frombuffer(base64.b64decode(extended["depth"]["data"]), dtype="<u2")
+        np.testing.assert_array_equal(values, [450, 5000, 10000, 0])
+        for invalid in (True, 0, 450, 10001, float("nan"), "10000"):
+            result = front_frame(self.frame, 99.99, self.intr, max_depth_mm=invalid, clock=lambda: 100.0)
+            self.assertFalse(result["available"])
+            self.assertEqual(result["reason"], "invalid_depth_limit")
+
     def test_optional_rgb_comes_from_latest_container_and_expires_with_depth(self):
         color = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
         self.frame.color_rgb = color
@@ -122,7 +139,7 @@ class FrontViewTests(unittest.TestCase):
         runner, frame, _ = self.make_live_runner()
         # Test the matching logic independently of OS scheduling pauses; the
         # actual encoder and age calculations are covered by the tests above.
-        with mock.patch.object(runner_module, "front_frame", side_effect=lambda *a: {"available": True}), \
+        with mock.patch.object(runner_module, "front_frame", side_effect=lambda *a, **kw: {"available": True}), \
                 mock.patch.object(runner_module, "monotonic_age", return_value=0.01):
             result = runner.front_snapshot()
             self.assertTrue(result["available"])

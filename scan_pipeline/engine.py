@@ -93,15 +93,26 @@ class ScanEngine:
         # rounding can alter the ICP trajectory across Open3D platforms.
         # Filter in original integer millimetres so exact boundary samples
         # (e.g. 450 mm) are not lost to float32 representation error.
+        invalid_depth = ((depth < self.settings.depth_min_m * 1000.0) |
+                         (depth > self.settings.depth_max_m * 1000.0))
         depth_m = depth.astype(np.float32) / 1000.0
-        depth_m[(depth < self.settings.depth_min_m * 1000.0) |
-                (depth > self.settings.depth_max_m * 1000.0)] = 0.0
+        depth_m[invalid_depth] = 0.0
+        # Independent view/landmark guards may use the raw observation. Never
+        # let them corroborate a pose using data outside this pass's limit.
+        observation_depth = depth
+        if np.any(invalid_depth & (depth != 0)):
+            observation_depth = depth.copy()
+            observation_depth[invalid_depth] = 0
+        # Geometry-only ICP never reads per-point RGB. Keep the full color
+        # observation for validation/TSDF, but avoid allocating and downsampling
+        # an extra point-color cloud on the common path.
+        icp_color = color if self.settings.use_color_icp else None
         cam_points, cam_colors = depth_to_points_rgb(
-            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS)
+            depth_m, icp_color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS)
 
         dt = self._dt(captured_at)
         result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt,
-                                    observation=(depth, color if color_rgb is not None else None))
+                                    observation=(observation_depth, color if color_rgb is not None else None))
         self.last_step = (result.step_m, result.step_deg)
         self.last_speed_mps = (result.step_m / dt if dt and result.state in ("ok", "too_fast")
                                and result.reason not in ("first_frame", "return_to_last_pose") else None)
@@ -134,7 +145,7 @@ class ScanEngine:
 
         integrated = False
         if self.policy.should_integrate(result.pose, now):
-            integrated = self._integrate(depth, color, result.pose, captured_at,
+            integrated = self._integrate(observation_depth, color, result.pose, captured_at,
                                          color_present=color_rgb is not None)
         self._set_state("tracking", "")
         return self._event(integrated, "tracking", result)
@@ -298,6 +309,7 @@ class ScanEngine:
             "frameChecks": self.tracker.frame_checks,
             "frameChecksPassed": self.tracker.frame_checks_passed,
             "framesRescued": self.tracker.frames_rescued,
+            "earlyRecoveryRejections": self.tracker.early_recovery_rejections,
             "landmarkChecks": self.tracker.landmark_checks,
             "landmarkVetoes": self.tracker.landmark_vetoes,
             "keyframesIntegrated": self.integrated,
@@ -320,6 +332,7 @@ class ScanEngine:
             "truncMm": round(self.settings.sdf_trunc_m * 1000.0, 2),
             "resolution": [self.intrinsics.width, self.intrinsics.height],
             "baseResolution": [self.base_intrinsics.width, self.base_intrinsics.height],
+            "configuredDepthMaxM": self.settings.depth_max_m,
             "trackingStride": self.settings.tracking_stride,
             "visualLandmarkVeto": self.settings.visual_landmark_veto,
             "colorFrames": self._color_counts(),

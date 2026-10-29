@@ -340,6 +340,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
           & $python -m unittest discover -s tests -p test_kinect_sdk_v1.py -k TiltMotorTests -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Fake SDK motor tests failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_kinect_sdk_v1.py -k sdk_out_of_range_codes -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::SDK unknown-depth sentinel test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k depth_limit -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Depth-limit API and resume test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k unchanged_model -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Versioned map and resume test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_pipeline.py -k synthetic_surface_is_integrated_only -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Synthetic extended-range TSDF boundary test failed.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k tilt -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Motor API interlock tests failed.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
@@ -527,7 +535,9 @@ jobs:
 
   release:
     needs: verify-installer
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Keep the existing installer-latest release untouched, including on a
+    # merge to main. Verified installers remain downloadable as CI artifacts.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -15,7 +15,7 @@ HINTS = {
     "ok": "",
     "sensor_covered": "Датчик, похоже, закрыт: уберите руку или предмет перед объективом.",
     "few_valid_pixels": "Мало валидных пикселей глубины: направьте датчик на поверхность "
-                        "в диапазоне 0.5–4 м и не на блестящие или тёмные материалы.",
+                        "в выбранном диапазоне и не на блестящие или тёмные материалы. SDK Kinect ограничен 4 м.",
     "too_fast": "Датчик движется слишком быстро. Вернитесь к последнему видимому положению, "
                 "замедлитесь и сохраняйте перекрытие кадров.",
     "lost": "Потеряно отслеживание. Верните датчик к последнему надёжному положению и виду, "
@@ -41,8 +41,10 @@ class FrameQuality:
 
 def assess_frame(depth_mm, color_rgb, settings: ScanSettings) -> FrameQuality:
     depth = np.asarray(depth_mm)
-    metres = depth.astype(np.float32) / 1000.0
-    in_range = (depth > 0) & (metres >= settings.depth_min_m) & (metres <= settings.depth_max_m)
+    # Use the original millimetres so exact inclusive boundaries cannot be
+    # rounded to the wrong side by float32 metre conversion.
+    in_range = ((depth > 0) & (depth >= settings.depth_min_m * 1000.0) &
+                (depth <= settings.depth_max_m * 1000.0))
     valid_ratio = float(in_range.mean()) if depth.size else 0.0
 
     brightness = 0.0

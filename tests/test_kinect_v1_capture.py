@@ -28,6 +28,22 @@ class FreenectScanCaptureTests(unittest.TestCase):
         np.testing.assert_array_equal(scan.color_rgb, preview.color_rgb)
         self.assertFalse(adapter.verified_on_hardware)
 
+    def test_extended_preview_is_only_a_raw_freenect_estimate(self):
+        raw = np.full((8, 8), 2047, dtype=np.uint16)  # no return
+        raw[:, 0] = 1000  # ~3.78 m
+        raw[:, 2] = 1050  # ~8.18 m; approximate and not hardware-verified
+        raw[:, 4] = 1060  # >10 m and omitted from the preview cloud
+        freenect = types.ModuleType("freenect")
+        freenect.sync_get_depth = lambda: (raw, 0)
+        freenect.sync_get_video = lambda: None
+        with mock.patch.dict(sys.modules, {"freenect": freenect}):
+            frame = KinectV1Adapter().capture()
+        self.assertTrue(np.all(frame.depth_mm[:, 6] == 0))
+        self.assertTrue(np.all((frame.depth_mm[:, 2] > 8000) & (frame.depth_mm[:, 2] < 8500)))
+        self.assertGreater(np.max(-frame.points[:, 2]), 8.0)
+        self.assertLessEqual(np.max(-frame.points[:, 2]), 10.0)
+        self.assertFalse(KinectV1Adapter.verified_on_hardware)
+
 
 if __name__ == "__main__":
     unittest.main()

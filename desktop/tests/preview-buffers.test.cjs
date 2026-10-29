@@ -24,6 +24,16 @@ test("reused point buffers include only visible, finite points in both formats",
   assert.ok(Math.abs(colors[1] - 0.86) < 1e-6);
 });
 
+test("depth palette spans the selected 10 m view without changing point geometry", () => {
+  const positions = new Float32Array(6), colors = new Float32Array(6), lut = new Float32Array(768);
+  for (let i = 0; i < 256; i++) lut[i * 3] = i;
+  const points = [[1, 2, 3, 5], [4, 5, 6, 10], [7, 8, 9, 10.1]];
+  assert.equal(buffers.fillPointBuffers(points, 10, "depth", positions, colors, lut), 2);
+  assert.deepEqual(Array.from(positions), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual([colors[0], colors[3]], [128, 255]);
+  assert.deepEqual(points[1], [4, 5, 6, 10]);
+});
+
 test("2D preview rejects malformed and oversized image payloads", () => {
   const good = { width: 2, height: 1, data: Buffer.from([1, 2, 3, 4, 5, 6]).toString("base64") };
   assert.deepEqual(Array.from(pixels.decodePixelFrame(good, 3), c => c.charCodeAt(0)), [1, 2, 3, 4, 5, 6]);

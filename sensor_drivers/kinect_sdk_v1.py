@@ -122,9 +122,9 @@ def find_sdk_assembly(env: dict[str, str] | None = None) -> str | None:
 def _pixels_to_bytes(pixels: Any, item_size: int = 2) -> bytes:
     """Read a .NET ``byte[]``/``short[]`` buffer as raw bytes.
 
-    ``short[]`` is what ``DepthImageFrame.CopyPixelDataTo`` fills; depth values above
-    8 m (``> 32767`` after the ``<< 3`` shift) arrive as negative ``Int16``, so the
-    conversion must accept both ranges — the two's-complement bytes are identical.
+    ``short[]`` is what ``DepthImageFrame.CopyPixelDataTo`` fills; packed values
+    above ``32767`` can arrive as negative ``Int16``, including unknown-depth
+    codes. Preserve the two's-complement bytes before normalising the codes.
     ``bytes(bytearray(...))`` is *not* usable for depth: it rejects values > 255.
     """
     if pixels is None:
@@ -180,12 +180,13 @@ def _dispose(frame: Any) -> None:
 def depth_pixels_to_metres(raw: Any) -> Any:
     """Convert DepthImageFrame pixels to metres.
 
-    Values are millimetres shifted left by :data:`PLAYER_INDEX_BITS`; zero means
-    "no measurement" and stays zero.
+    Values are millimetres shifted left by :data:`PLAYER_INDEX_BITS`.
+    Missing, overflow and undocumented SDK values beyond 4 m become zero.
     """
     import numpy as np
 
     millimetres = (np.asarray(raw, dtype=np.uint16) >> PLAYER_INDEX_BITS).astype(np.float32)
+    millimetres = np.where(millimetres <= int(MAX_DEPTH_M * 1000), millimetres, 0.0)
     return millimetres / 1000.0
 
 
@@ -216,6 +217,11 @@ def depth_and_color_to_frame(
     # Packed SDK depth is already integer millimetres in the upper bits.
     # Avoid a full-frame float conversion and a lossy round trip through metres.
     depth_mm = np.right_shift(depth_u16, PLAYER_INDEX_BITS)
+    # SDK 1.8's default Kinect v1 stream reports MaxDepth=4000 mm. Values
+    # 4095 (TooFarDepth) and -1 (unsigned 8191 after shifting) are sentinel
+    # codes, not distant surfaces. Do not let a 10 m application limit turn
+    # these or other undocumented >4 m SDK values into fabricated points.
+    depth_mm[depth_mm > int(MAX_DEPTH_M * 1000)] = 0
 
     color_rgb = None
     if color_bytes:
@@ -396,6 +402,7 @@ class KinectSdkV1Adapter(SensorAdapter):
     limitations = (
         "Kinect v1, не Kinect One. Модуль не проверен на физическом датчике. Цвет и глубина не совмещены в общей системе координат, "
         "калибровка приближённая, ICP может дрейфовать на однотонных стенах и при быстром движении. "
+        "SDK ограничен 4 м: программная настройка 10 м не увеличивает дальность датчика. "
         "Нужен штатный блок питания/USB-адаптер Kinect."
     )
     package_names = ("pythonnet", "numpy")

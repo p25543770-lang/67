@@ -52,7 +52,11 @@ export class PreviewClock {
 // preview frame. It is one frame only; no interpolation or old-depth blending.
 export function frontDepthToPackedPoints(payload, stride = 1) {
   const image = payload?.depth, intr = payload?.intrinsics, sample = payload?.sampleStride;
+  // Old servers omit the limit and remain capped at 4 m. A newer server can
+  // advertise an explicit pass limit but cannot lift the absolute 10 m bound.
+  const maxDepthMm = payload?.maxDepthMm ?? 4000;
   if (!payload?.available || payload.oneFrameOnly !== true || payload.notForNavigation !== true ||
+      !Number.isSafeInteger(maxDepthMm) || maxDepthMm <= 450 || maxDepthMm > 10000 ||
       !image || !intr || !Number.isSafeInteger(image.width) || !Number.isSafeInteger(image.height) ||
       image.width <= 0 || image.height <= 0 || image.width > 640 || image.height > 480 ||
       !Number.isSafeInteger(sample) || sample < 1 || sample > 16 ||
@@ -71,7 +75,7 @@ export function frontDepthToPackedPoints(payload, stride = 1) {
     for (let col = 0; col < image.width; col += stride) {
       const index = 2 * (row * image.width + col);
       const millimetres = bytes.charCodeAt(index) | (bytes.charCodeAt(index + 1) << 8);
-      if (millimetres < 450 || millimetres > 4000) continue;
+      if (millimetres < 450 || millimetres > maxDepthMm) continue;
       const z = millimetres / 1000;
       output[count++] = (col * sample - intr.cx) * z / intr.fx;
       output[count++] = 1.25 - (row * sample - intr.cy) * z / intr.fy;

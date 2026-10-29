@@ -88,6 +88,14 @@ test("конвейер попадает в состав Windows-сборки, б
   assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["lucide", "three"]);
 });
 
+test("слияние в main не перезаписывает installer-latest", () => {
+  const fs = require("node:fs");
+  const workflow = fs.readFileSync(path.join(__dirname, "../../.github/workflows/windows.yml"), "utf8");
+  const release = workflow.split(/\r?\n  release:\r?\n/)[1];
+  assert.ok(release, "release job must be present");
+  assert.match(release, /^    if:\s*\$\{\{\s*false\s*\}\}\s*$/m);
+});
+
 test("зависший мост или тело ответа не блокируют интерфейс навсегда", async () => {
   const { apiRequest, requestTimeout } = await import(pathToFileURL(path.join(__dirname, "../../src/api.js")));
   assert.equal(requestTimeout("/api/health"), 3000);

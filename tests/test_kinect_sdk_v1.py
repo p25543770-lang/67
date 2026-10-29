@@ -556,6 +556,19 @@ class ConversionTests(unittest.TestCase):
         self.assertAlmostEqual(float(metres[2]), 2.047, places=4)
 
     @REQUIRES_NUMPY
+    def test_sdk_out_of_range_codes_never_become_distant_surfaces(self):
+        # 4095 mm is TooFarDepth; a signed -1 buffer becomes 8191 after an
+        # unsigned shift. Neither is a 4.095 m/8.191 m measurement.
+        packed = np.array([0, (800 << 3) | 7, (4000 << 3) | 3, 4001 << 3,
+                           4095 << 3, 0xffff, 5000 << 3, 8191 << 3], dtype=np.uint16)
+        frame = sdk.depth_and_color_to_frame(packed, 8, 1, None, None, None, include_points=False)
+        np.testing.assert_array_equal(frame.depth_mm[0], [0, 800, 4000, 0, 0, 0, 0, 0])
+        np.testing.assert_allclose(sdk.depth_pixels_to_metres(packed), [0, 0.8, 4.0, 0, 0, 0, 0, 0])
+        preview = sdk.depth_and_color_to_frame(packed, 8, 1, None, None, None)
+        # Preview samples indices 0 and 4: both unknown, not fabricated geometry.
+        self.assertEqual(len(preview.points), 0)
+
+    @REQUIRES_NUMPY
     def test_short_depth_buffer_is_rejected(self):
         with self.assertRaises(RuntimeError):
             sdk.depth_and_color_to_frame(np.zeros(10, dtype=np.uint16), 640, 480, None, None, None)

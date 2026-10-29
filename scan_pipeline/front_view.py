@@ -18,7 +18,8 @@ import numpy as np
 FRONT_MAX_AGE_S = 0.25
 FRONT_SAMPLE_STRIDE = 4
 FRONT_MIN_DEPTH_MM = 450
-FRONT_MAX_DEPTH_MM = 4000
+FRONT_MAX_DEPTH_MM = 4000  # default; a pass may explicitly request up to 10 m
+FRONT_ABSOLUTE_MAX_DEPTH_MM = 10000
 FRONT_COLOR_MAX_SIDE = 320
 
 
@@ -50,7 +51,8 @@ def empty_front(reason: str) -> dict:
     }
 
 
-def front_frame(frame, received_at, intrinsics, include_color=False, *, clock=time.monotonic) -> dict:
+def front_frame(frame, received_at, intrinsics, include_color=False, *,
+                max_depth_mm=FRONT_MAX_DEPTH_MM, clock=time.monotonic) -> dict:
     """Prepare a fresh LE depth image and optional unregistered RGB preview.
 
     Color is sampled from the same published sensor-frame container, not a
@@ -60,6 +62,10 @@ def front_frame(frame, received_at, intrinsics, include_color=False, *, clock=ti
     now = clock()
     result = empty_front("no_frame")
     if frame is None or intrinsics is None:
+        return result
+    if (isinstance(max_depth_mm, bool) or not isinstance(max_depth_mm, int) or
+            not FRONT_MIN_DEPTH_MM < max_depth_mm <= FRONT_ABSOLUTE_MAX_DEPTH_MM):
+        result["reason"] = "invalid_depth_limit"
         return result
     capture_age = monotonic_age(now, getattr(frame, "captured_at", None))
     receive_age = monotonic_age(now, received_at)
@@ -82,7 +88,7 @@ def front_frame(frame, received_at, intrinsics, include_color=False, *, clock=ti
         result["reason"] = "invalid_depth"
         return result
     sampled = depth[::FRONT_SAMPLE_STRIDE, ::FRONT_SAMPLE_STRIDE]
-    valid = (sampled >= FRONT_MIN_DEPTH_MM) & (sampled <= FRONT_MAX_DEPTH_MM)
+    valid = (sampled >= FRONT_MIN_DEPTH_MM) & (sampled <= max_depth_mm)
     valid_count = int(np.count_nonzero(valid))
     result["validRatio"] = round(valid_count / sampled.size, 4) if sampled.size else 0.0
     if not valid_count:
@@ -127,6 +133,7 @@ def front_frame(frame, received_at, intrinsics, include_color=False, *, clock=ti
         "color": color_payload,
         "colorDepthRegistered": False,
         "sampleStride": FRONT_SAMPLE_STRIDE,
+        "maxDepthMm": max_depth_mm,
         "intrinsics": intrinsics.to_dict(),
         "depth": {"width": int(encoded.shape[1]), "height": int(encoded.shape[0]),
                   "data": base64.b64encode(encoded.tobytes()).decode("ascii")},

@@ -5,6 +5,7 @@ import { frontDepthToPackedPoints, PreviewClock, isPoseFresh } from "./front-vie
 import { fillPointBuffers } from "./point-buffer.js";
 import { updateMapMirror } from "./map-mirror.js";
 import { tiltAvailability } from "./motor-mode.js";
+import { mapRequestQuery, shouldApplyScanPoints } from "./map-request.js";
 import { decodePixelFrame } from "./pixel-frames.js";
 import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatLandmarkChecks, formatSpeed } from "./metrics.js";
 import { version as appVersion } from "../package.json";
@@ -134,7 +135,7 @@ document.querySelector("#app").innerHTML = `
           <div class="viewer-footer">
             <div class="stat-block"><span>ТОЧЕК</span><strong id="pointCount">—</strong></div>
             <div class="stat-block"><span>КАДРОВ</span><strong id="frameCount">0</strong></div>
-            <div class="stat-block stat-depth"><span>ДИАПАЗОН</span><strong id="depthMetric">0.5 – 4.0 м</strong></div>
+            <div class="stat-block stat-depth"><span>ФИЛЬТР ВИДА</span><strong id="depthMetric">≤ 4.0 м</strong></div>
             <div class="footer-separator"></div>
             <div class="scan-actions">
               <button class="button-primary" id="scanButton"><i data-lucide="scan-line"></i><span>Начать сканирование</span></button>
@@ -207,6 +208,7 @@ document.querySelector("#app").innerHTML = `
             <div><span>СОСТОЯНИЕ</span><strong id="stateMetric">Демо</strong></div>
             <div><span>КЛЮЧЕВЫХ КАДРОВ · ВСЕГО</span><strong id="keyframesMetric">—</strong></div>
             <div><span>ПРОФИЛЬ ПРОХОДА</span><strong id="activeProfileMetric">—</strong></div>
+            <div title="Установленный программный предел, а не подтверждённая дальность датчика"><span>ПРЕДЕЛ ПРОХОДА</span><strong id="activeDepthMetric">—</strong></div>
             <div><span>FPS · ТРЕКИНГ / TSDF</span><strong id="trackedFpsMetric">— / —</strong></div>
             <div><span>ПРИНЯТО ДЛЯ ТРЕКИНГА</span><strong id="acceptedMetric">—</strong></div>
             <div><span>СВЕРКА · ПРОШЛИ / ПРОВЕРОК</span><strong id="frameChecksMetric">— / —</strong></div>
@@ -216,15 +218,21 @@ document.querySelector("#app").innerHTML = `
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
           <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
           <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="robot">Робот · осторожная сверка</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
-          <p class="movement-hint" id="scanProfileHint">Режим «Робот» при разрыве более 120 мс от последней принятой позы требует возврата к последнему виду и может быстро потерять трекинг. «Максимум FPS» не включает эту дополнительную проверку. Повороты ≈90°/с не подтверждены: оценка ICP выше ≈57°/с отбраковывается, реальное вращение может быть оценено неверно. Это не управление роботом и не гарантия карты. Продолжение сохраняет настройки прохода. Kinect физически не проверен.</p>
+          <p class="movement-hint" id="scanProfileHint">«Робот»: после 50 мс без принятой позы нужна RGB-D-сверка, после 120 мс — возврат к последнему виду. В других профилях дополнительная сверка после 50 мс включается при быстрой оценке ICP; заниженная оценка может пропустить ошибку. Сверка может остановить трекинг и не гарантирует верную позу. Повороты ≈90°/с не подтверждены: оценка ICP выше ≈57°/с отбраковывается. Продолжение сохраняет настройки прохода. Kinect физически не проверен.</p>
           <label class="landmark-option"><input id="scanVisualLandmarks" type="checkbox" aria-describedby="landmarkHint" disabled><span>Эксперимент: сверка по RGB-опорам</span></label>
           <p class="movement-hint" id="landmarkHint">Только для нового прохода «Робот». Может замедлять обработку и ложно отклонять правильные позы: RGB и глубина не совмещены. Не подтверждает правильность позы.</p>
+          <div class="scan-depth-setting">
+            <label class="setting-title" for="scanDepthMax">Предел глубины нового прохода <span id="scanDepthMaxValue">4.0 м</span></label>
+            <input id="scanDepthMax" type="range" min="1" max="10" step="0.5" value="4" aria-describedby="scanDepthHint">
+            <div class="range-labels"><span>1 м</span><span>10 м</span></div>
+            <p class="movement-hint depth-limit-hint" id="scanDepthHint">Выше 4 м — экспериментальный программный предел, не дальность Kinect. SDK 1.8 ограничен 4 м и неизвестные значения отбрасываются; libfreenect может отдавать шумные неподтверждённые оценки. Проверки опираются на ближние данные и могут отклонить дальние кадры. При продолжении берётся сохранённое значение.</p>
+          </div>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
           <div class="section-heading compact-heading"><div><span class="section-kicker">03 / ПРОСМОТР</span><h2>Настройки сцены</h2></div><span class="heading-icon"><i data-lucide="sliders-horizontal"></i></span></div>
           <div class="setting-row"><div class="setting-title">Размер точек <span id="sizeValue">2.0</span></div><input id="pointSize" type="range" min="1" max="5" step="0.1" value="2"><div class="range-labels"><span>Меньше</span><span>Больше</span></div></div>
-          <div class="setting-row"><div class="setting-title">Макс. глубина <span id="depthValue">4.0 м</span></div><input id="depthRange" type="range" min="1" max="6" step="0.1" value="4"><div class="range-labels"><span>1 м</span><span>6 м</span></div></div>
+          <div class="setting-row"><label class="setting-title" for="depthRange">Фильтр отображения <span id="depthValue">4.0 м</span></label><input id="depthRange" type="range" min="1" max="10" step="0.1" value="4"><div class="range-labels"><span>1 м</span><span>10 м</span></div><p class="movement-hint">Только вид: в карте это расстояние от начала прохода; в переднем кадре — глубина по оси камеры. Не меняет предел записи.</p></div>
           <div class="setting-row palette-setting"><label class="setting-title" for="palette">Цветовая схема</label><div class="select-wrap"><select id="palette"><option value="depth">По глубине</option><option value="mint">Мятная</option><option value="mono">Монохром</option></select><i data-lucide="chevron-down"></i></div></div>
           <label class="grid-toggle"><span><strong>Сетка пространства</strong><small>Ориентир в 3D-сцене</small></span><input id="gridToggle" type="checkbox" checked><span class="toggle-track"></span></label>
         </section>
@@ -341,6 +349,10 @@ let pointPositions = null;
 let pointColors = null;
 
 let originalPoints = [];
+// A TSDF model changes only when it is extracted, not on every status poll.
+let mapPointsVersion = null;
+let mapPointsMode = null;
+let scanRefreshForMode = false;
 let frontPoints = new Float32Array(0);
 let viewMode = "map";
 let frontTimer = null;
@@ -527,7 +539,7 @@ async function pollFrontView() {
     const { deadline, freshFrame, fps } = update;
     if (freshFrame) {
       const hasRgb = paintRgb(data.color);
-      const hasDepth = paintDepth(data.depth);
+      const hasDepth = paintDepth(data.depth, data.maxDepthMm);
       if (!hasDepth) { clearLivePreview("Нет свежей глубины"); return; }
       if (!hasRgb) drawNoSignal(rgbCanvas);
       $("rgbDescription").textContent = hasRgb ? "RGB; с глубиной не совмещён" : "RGB-поток недоступен";
@@ -591,11 +603,13 @@ function setViewMode(mode) {
     if (viewMode === "color") {
       updateColorStatus();
       updateMotorControls();
-      if (activeSource !== "demo" && deviceConnected) {
-        if (isScanning || hasScan) void refreshScan();
-        else void pollFrame();
-        void refreshTiltStatus();
-      }
+      if (activeSource !== "demo" && deviceConnected) void refreshTiltStatus();
+    }
+    if (activeSource !== "demo") {
+      if (isScanning || hasScan) {
+        if (scanBusy) scanRefreshForMode = true;
+        else void refreshScan();
+      } else if (deviceConnected) void pollFrame();
     }
   }
 }
@@ -1045,6 +1059,7 @@ function setTracking(status, speed, warning, title = "", text = "") {
     $("sensorDroppedMetric").textContent = "—";
     $("keyframesMetric").textContent = "—";
     $("activeProfileMetric").textContent = "—";
+    $("activeDepthMetric").textContent = "—";
     $("trackedFpsMetric").textContent = "— / —";
     $("acceptedMetric").textContent = "—";
     $("frameChecksMetric").textContent = formatFrameChecks(null);
@@ -1198,7 +1213,10 @@ function paintRgb(frame) {
   return true;
 }
 
-function paintDepth(frame) {
+function paintDepth(frame, maxDepthMm = 4000) {
+  // The scale is visual only. Missing or out-of-selection pixels stay dark,
+  // not free space; measurements remain unchanged in the bridge.
+  const limit = Number.isFinite(maxDepthMm) && maxDepthMm >= 500 && maxDepthMm <= 10000 ? maxDepthMm : 4000;
   const bytes = decodePixelFrame(frame, 2);
   if (bytes === null) return false;
   depthImageCache = feedImage(depthCanvas, frame, depthImageCache);
@@ -1206,14 +1224,14 @@ function paintDepth(frame) {
   for (let pixel = 0; pixel < frame.width * frame.height; pixel++) {
     const millimetres = bytes.charCodeAt(pixel * 2) | (bytes.charCodeAt(pixel * 2 + 1) << 8);
     const i = pixel * 4;
-    if (!millimetres) {
+    if (millimetres < 450 || millimetres > limit) {
       rgba[i] = 10;
       rgba[i + 1] = 20;
       rgba[i + 2] = 18;
       rgba[i + 3] = 255;
       continue;
     }
-    const distance = Math.min(1, Math.max(0, (millimetres - 450) / 3550));
+    const distance = Math.min(1, Math.max(0, (millimetres - 450) / (limit - 450)));
     const paletteIndex = Math.round(distance * 255);
     rgba[i] = depthColorLut[paletteIndex * 3];
     rgba[i + 1] = depthColorLut[paletteIndex * 3 + 1];
@@ -1285,12 +1303,16 @@ function displaySensorFrame(data) {
   }
   if (!hasScan && !isScanning && !["finalizing", "merging"].includes(scanPhase) && Array.isArray(data.points)) {
     originalPoints = data.points.map(([x, y, z, depth, ...rgb]) => [x, y + 1.25, z, depth, ...rgb]);
+    // These are raw preview points, not the TSDF version we may have shown
+    // earlier. Never tell the server that the overwritten map is still held.
+    mapPointsVersion = null;
+    mapPointsMode = null;
     colorMapInfo = data.pointColor || null;
     renderPoints();
     updateColorStatus();
   }
   const hasRgb = paintRgb(data.color);
-  const hasDepth = paintDepth(data.depth);
+  const hasDepth = paintDepth(data.depth, Number($("depthRange").value) * 1000);
   liveFeedCleared = false;
   if (!hasRgb) drawNoSignal(rgbCanvas);
   if (!hasDepth) drawNoSignal(depthCanvas);
@@ -1579,6 +1601,7 @@ function updateExportButtons() {
   $("cancelScanButton").hidden = activeSource === "demo" || !isScanning;
   $("cancelScanButton").disabled = !actions.cancel;
   $("scanProfile").disabled = isScanning || scanActionBusy || ["starting", "stopping", "finalizing", "merging"].includes(scanPhase);
+  $("scanDepthMax").disabled = $("scanProfile").disabled;
   $("scanVisualLandmarks").disabled = $("scanProfile").disabled || $("scanProfile").value !== "robot";
   const reason = $("scanActionReason");
   reason.textContent = actions.reason;
@@ -1697,6 +1720,7 @@ async function startPhysicalScan(resumePassId = null) {
     const profile = $("scanProfile").value;
     await apiRequest("/api/scan/start", {
       method: "POST", body: { source: activeSource, profile,
+        depthMaxM: Number($("scanDepthMax").value),
         visualLandmarks: profile === "robot" && $("scanVisualLandmarks").checked,
         ...(resumePassId ? { resumePassId } : {}) },
     });
@@ -1826,8 +1850,10 @@ async function refreshScan() {
   scanBusy = true;
   const requestStartedMs = window.performance.now();
   const generation = scanGeneration;
+  const requestedMode = viewMode;
+  const pointQuery = mapRequestQuery(requestedMode, mapPointsVersion, mapPointsMode, originalPoints.length > 0);
   try {
-    const data = await apiRequest(`/api/scan?preview=0${viewMode === "color" ? "&color=1" : ""}`);
+    const data = await apiRequest(`/api/scan?preview=0${requestedMode === "color" ? "&color=1" : ""}${pointQuery}`);
     if (generation !== scanGeneration) return;
     // Include the whole request time when judging whether status could be old.
     scanStatusUpdatedMs = requestStartedMs;
@@ -1842,10 +1868,12 @@ async function refreshScan() {
       ensureLivePreview();
     }
     hasScan = scanPhase === "ready" && Boolean(data.lastResultId);
-    if (Array.isArray(data.points) && (data.points.length > 0 || scanPhase === "ready")) {
+    if (shouldApplyScanPoints(requestedMode, viewMode, data.points, scanPhase)) {
       originalPoints = data.points.map(([x, y, z, depth, ...rgb]) => [x, y + 1.25, z, depth, ...rgb]);
+      mapPointsVersion = typeof data.pointsVersion === "string" ? data.pointsVersion : null;
+      mapPointsMode = requestedMode;
       colorMapInfo = data.pointColor || null;
-      if (viewMode !== "front") renderPoints();
+      renderPoints();
       updateColorStatus();
     }
     // The status response deliberately omits its old, processing-bound image;
@@ -1859,6 +1887,8 @@ async function refreshScan() {
     $("activeProfileMetric").textContent = data.pipeline?.profile === "max_fps" ? "Максимум FPS"
       : data.pipeline?.profile === "robot" ? "Робот · осторожно"
       : data.pipeline?.profile === "standard" ? "Стандарт" : "—";
+    $("activeDepthMetric").textContent = Number.isFinite(data.pipeline?.configuredDepthMaxM)
+      ? `${data.pipeline.configuredDepthMaxM.toFixed(1)} м` : "—";
     $("trackedFpsMetric").textContent = `${formatFps(performance?.trackingFps)} / ${formatFps(performance?.integrationFps)}`;
     $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
       ? `${Math.round(data.quality.acceptedRatio * 100)}%` : "—";
@@ -1927,6 +1957,10 @@ async function refreshScan() {
     scanBusy = false;
     updateExportButtons();
     renderPasses();
+    if (scanRefreshForMode) {
+      scanRefreshForMode = false;
+      if (activeSource !== "demo" && (isScanning || hasScan)) void refreshScan();
+    }
   }
 }
 
@@ -2128,6 +2162,8 @@ $("sourceSelect").onchange = async (event) => {
   deviceConnected = false;
   hasScan = false;
   originalPoints = activeSource === "demo" ? demoPoints.slice() : [];
+  mapPointsVersion = null;
+  mapPointsMode = null;
   $("frameCount").textContent = "0";
   $("scanProgressFill").style.width = "0%";
   $("sceneModeLabel").textContent = activeSource === "demo" ? "ДЕМО-СЦЕНА" : "ИСТОЧНИК НЕ ПОДКЛЮЧЁН";
@@ -2149,6 +2185,16 @@ $("exportPly").onclick = () => exportScan("ply");
 $("exportObj").onclick = () => exportScan("obj");
 $("exportGlb").onclick = () => exportScan("glb");
 
+$("scanDepthMax").oninput = (event) => {
+  const value = Number(event.target.value);
+  $("scanDepthMaxValue").textContent = `${value.toFixed(1)} м`;
+  $("scanDepthHint").classList.toggle("experimental", value > 4);
+  // Make the newly requested range visible; the user can still adjust this
+  // view-only filter separately without changing the pass setting.
+  $("depthRange").value = String(value);
+  $("depthRange").dispatchEvent(new Event("input"));
+};
+
 $("pointSize").oninput = (event) => {
   const value = Number(event.target.value);
   pointMaterial.size = value * 0.0135;
@@ -2157,7 +2203,7 @@ $("pointSize").oninput = (event) => {
 $("depthRange").oninput = (event) => {
   const value = Number(event.target.value);
   $("depthValue").textContent = `${value.toFixed(1)} м`;
-  $("depthMetric").textContent = `0.5 – ${value.toFixed(1)} м`;
+  $("depthMetric").textContent = `≤ ${value.toFixed(1)} м`;
   renderPoints();
 };
 $("palette").onchange = renderPoints;

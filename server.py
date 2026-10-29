@@ -249,21 +249,23 @@ def _runner():
         return scan_runner
 
 
-def _scan_snapshot(include_preview=True, include_color=False):
+def _scan_snapshot(include_preview=True, include_color=False, include_points=True, known_points_version=None):
     with state_lock:
         runner = scan_runner
         pending = scan_start_pending
     # Starting can include opening a device or replaying a saved pass; expose it
     # without waiting on the runner's lock so the UI can still offer Stop/Cancel.
     if pending is None and runner is not None:
-        return runner.snapshot(include_preview=include_preview, include_color=include_color)
+        return runner.snapshot(include_preview=include_preview, include_color=include_color,
+                               include_points=include_points, known_points_version=known_points_version)
     return {
         "running": pending is not None, "phase": "starting" if pending is not None else "idle",
         "passId": None, "source": pending.get("source") if pending is not None else None,
         "frames": 0, "keyframes": 0, "pointCount": 0, "error": "", "warning": "", "hint": "",
         "tracking": "idle", "poseFresh": False, "poseAgeMs": None,
         "speedMps": None, "angularDegS": None, "lastEvent": {}, "preview": None,
-        "points": [], "pipeline": None, "quality": None, "lastResultId": None,
+        "points": [] if include_points else None, "pointsVersion": None,
+        "pipeline": None, "quality": None, "lastResultId": None,
         "resultMetrics": None, "verifiedOnHardware": False,
     }
 
@@ -555,6 +557,10 @@ def _start_scan(payload):
     # and depth are not registered/synchronized. A resumed pass keeps its own
     # saved settings instead of the current UI selection.
     settings = ScanSettings.for_profile(payload.get("profile", MAX_FPS_PROFILE))
+    # This is an application-side upper bound, not a claim that Kinect can
+    # measure that far. The SDK adapter still rejects its out-of-range codes.
+    settings.depth_max_m = payload.get("depthMaxM", 4.0)
+    settings.validate()
     landmarks = payload.get("visualLandmarks", False)
     if not isinstance(landmarks, bool):
         raise ValueError("Параметр RGB-опор должен быть логическим значением.")
@@ -615,9 +621,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE,
                                                      include_color=include_color))
             elif url.path == "/api/scan":
-                include_preview = parse_qs(url.query).get("preview", [""])[0] != "0"
-                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
-                self.respond(200, _scan_snapshot(include_preview=include_preview, include_color=include_color))
+                query = parse_qs(url.query)
+                include_preview = query.get("preview", [""])[0] != "0"
+                include_color = query.get("color", [""])[0] == "1"
+                include_points = query.get("points", [""])[0] != "0"
+                known_version = query.get("pointsVersion", [None])[0]
+                self.respond(200, _scan_snapshot(include_preview=include_preview, include_color=include_color,
+                                                 include_points=include_points, known_points_version=known_version))
             elif url.path == "/api/scan/front":
                 include_color = parse_qs(url.query).get("color", [""])[0] == "1"
                 self.respond(200, _front_snapshot(include_color=include_color))

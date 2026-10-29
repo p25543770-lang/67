@@ -58,10 +58,14 @@ RECOVERY_ROTATION_DEG = 5.0
 PREDICTION_CORRECTION_MIN_M = 0.025
 PREDICTION_CORRECTION_RATIO = 0.35
 MAX_RELIABLE_FRAME_GAP_S = 0.5
-# In robot mode, a long unobserved interval can make an apparently plausible
-# ICP result jump hundreds of millimetres even before two frames are rejected.
-# Restrict re-lock to the last trusted view; this deliberately sacrifices
-# continuity and is not a guarantee on repetitive scenes.
+# An unobserved interval can make a plausible ICP match jump far before two
+# frames are rejected. Robot mode requires confirmation after 50 ms, or the
+# last trusted view after 120 ms. Other profiles require it when the estimated
+# translation/turn is fast. An alias can look slow, so this is not a guarantee;
+# RGB/depth are not registered or guaranteed synchronous.
+GAP_CONFIRMATION_S = 0.05
+GAP_FAST_SPEED_MPS = 0.7
+GAP_FAST_ANGULAR_RPS = 0.7
 ROBOT_UNOBSERVED_GAP_S = 0.12
 SLOW_MOTION_MIN_SPEED_MPS = 0.15
 SLOW_MOTION_ERROR_MIN_M = 0.035
@@ -236,6 +240,7 @@ class FrameToModelTracker:
         self.frame_checks = 0
         self.frame_checks_passed = 0
         self.frames_rescued = 0
+        self.early_recovery_rejections = 0
         self.landmark_guard = LandmarkGuard() if settings.visual_landmark_veto else None
         self.landmark_checks = 0
         self.landmark_vetoes = 0
@@ -253,6 +258,7 @@ class FrameToModelTracker:
         self._last_view = None
         self._last_reference = None
         self.frame_checks = self.frame_checks_passed = self.frames_rescued = 0
+        self.early_recovery_rejections = 0
         self.landmark_checks = self.landmark_vetoes = 0
         if self.landmark_guard is not None:
             self.landmark_guard.reset()
@@ -295,7 +301,10 @@ class FrameToModelTracker:
         import open3d as o3d
 
         dt = dt if dt and dt > 0 else 1.0 / TARGET_FPS
-        predicted = self._predict(dt)
+        # Preserve the original velocity-consistency check even if a capture
+        # gap makes us start the ICP search from the last accepted pose.
+        motion_prediction = self._predict(dt)
+        predicted = motion_prediction
 
         if self._prepared is None or self.pose is None:
             # Первый кадр прохода: модели ещё нет, поза задаёт начало координат.
@@ -309,25 +318,44 @@ class FrameToModelTracker:
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
 
-        # A dropped interval is unobserved motion, not evidence of a steady
-        # velocity. Even the very first candidate after initialization can be a
-        # geometrically plausible but catastrophic wrong alignment. Robot mode
-        # falls back to the existing last-pose AND last-view recovery rules.
-        if (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S and
-                self._recovery_state is None):
-            self._recovery_state = "lost"
+        # Unobserved motion cannot justify seeding ICP from extrapolated
+        # velocity. Robot mode retains its stronger last-pose AND last-view
+        # recovery for long gaps; gap confirmation is applied below without
+        # bypassing any existing ICP or motion checks.
+        needs_gap_confirmation = bool(
+            dt > GAP_CONFIRMATION_S and self._recovery_state is None and
+            not (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S))
+        if dt > GAP_CONFIRMATION_S and self._recovery_state is None:
             predicted = self.pose.copy()
+            if self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S:
+                self._recovery_state = "lost"
+
+        # This is the *same mandatory recovery check* that was previously
+        # performed after both ICP scales. A different view could never be
+        # accepted in recovery, so reject it before allocating point clouds or
+        # running ICP. A matching view still goes through every existing
+        # geometric, residual, speed and independent-confirmation check below.
+        # A higher processed FPS while lost is not an increase in tracked FPS.
+        current_view = None
+        if self._recovery_state and self._last_view is not None:
+            current_view = _view_signature(*observation) if observation is not None else None
+            if not _recovery_view_matches(self._last_view, current_view):
+                self.early_recovery_rejections += 1
+                return self._reject(self._recovery_state, predicted, "return_to_last_view",
+                                    extra={"earlyRecoveryReject": True})
 
         if len(cam_points) > MAX_SOURCE_POINTS:
             step = int(np.ceil(len(cam_points) / MAX_SOURCE_POINTS))
             cam_points = cam_points[::step]
-            cam_colors = cam_colors[::step]
+            if cam_colors is not None:
+                cam_colors = cam_colors[::step]
         if len(cam_points) < MIN_SOURCE_POINTS:
             return self._reject("lost", predicted, "insufficient_points")
 
         source_world = cam_points @ predicted[:3, :3].T + predicted[:3, 3]
         source_base = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source_world))
-        source_base.colors = o3d.utility.Vector3dVector(np.clip(cam_colors, 0.0, 1.0))
+        if self.settings.use_color_icp and cam_colors is not None:
+            source_base.colors = o3d.utility.Vector3dVector(np.clip(cam_colors, 0.0, 1.0))
         # Point-to-plane ICP uses the model normals; source normals are only
         # required by the optional colored ICP. Avoid estimating them twice.
 
@@ -337,7 +365,7 @@ class FrameToModelTracker:
         finest_source = finest_target = None
         for level in self._prepared.levels:
             vp, vn, vc = crop_model_to_view(level["points"], level["normals"], level["colors"],
-                                            intrinsics, predicted)
+                                            intrinsics, predicted, far=self.settings.depth_max_m + 0.5)
             if len(vp) > MAX_TARGET_POINTS:
                 every = int(np.ceil(len(vp) / MAX_TARGET_POINTS))
                 vp, vn, vc = vp[::every], vn[::every], vc[::every]
@@ -346,7 +374,8 @@ class FrameToModelTracker:
                 return self._reject("lost", predicted, "insufficient_model_view")
             target = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(vp))
             target.normals = o3d.utility.Vector3dVector(vn)
-            target.colors = o3d.utility.Vector3dVector(vc)
+            if self.settings.use_color_icp:
+                target.colors = o3d.utility.Vector3dVector(vc)
             source = source_base.voxel_down_sample(level["radius"])
             if self.settings.use_color_icp:
                 source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=level["radius"] * 2, max_nn=30))
@@ -421,11 +450,6 @@ class FrameToModelTracker:
         if self._recovery_state and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
             return self._reject(self._recovery_state, predicted, "return_to_last_pose", fitness, rmse,
                                 step_m, step_deg, method=method)
-        if self._recovery_state and self._last_view is not None:
-            current_view = _view_signature(*observation) if observation is not None else None
-            if not _recovery_view_matches(self._last_view, current_view):
-                return self._reject(self._recovery_state, predicted, "return_to_last_view", fitness, rmse,
-                                    step_m, step_deg, method=method, extra={"eigenRatio": ratio})
         if step_m > self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M or angular > self.settings.max_angular_rps:
             self._recovery_state = "too_fast"
             return self._reject("too_fast", predicted, "speed_limit", fitness, rmse, step_m, step_deg,
@@ -445,8 +469,8 @@ class FrameToModelTracker:
                                         method=method, extra={"motionDisagreementM": mismatch[0],
                                                               "motionAllowedM": mismatch[1], "eigenRatio": ratio})
                 rescued = True
-        predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
-        correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
+        predicted_step = float(np.linalg.norm(motion_prediction[:3, 3] - self.pose[:3, 3]))
+        correction = float(np.linalg.norm(candidate[:3, 3] - motion_prediction[:3, 3]))
         if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
                                                       predicted_step * PREDICTION_CORRECTION_RATIO):
             # A sudden stop/turn or weak geometry can make ICP confidently slide
@@ -457,6 +481,18 @@ class FrameToModelTracker:
                 return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
                                     method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
             rescued = True
+
+        # For the robot profile, independently corroborate every estimate
+        # after a gap. In the other profiles do so when the *estimated* motion
+        # is fast; an incorrectly slow estimate may evade this additional gate.
+        # Missing RGB or disagreement fails closed. Confirmation cannot bypass
+        # any of the speed, residual or geometry checks above.
+        gap_high_motion = (self.settings.profile == ROBOT_PROFILE or
+                           step_m / dt >= GAP_FAST_SPEED_MPS or angular >= GAP_FAST_ANGULAR_RPS)
+        if needs_gap_confirmation and gap_high_motion and (not physically_plausible or not confirm_once()):
+            self._recovery_state = "lost"
+            return self._reject("lost", predicted, "gap_unconfirmed", fitness, rmse,
+                                step_m, step_deg, method=method, extra={"eigenRatio": ratio})
 
         # Distributed visual corners only veto a large, coherent disagreement.
         # They never provide a pose or bypass any of the checks above. RGB and
@@ -477,7 +513,8 @@ class FrameToModelTracker:
         self._recovery_state = None
         self._consecutive_rejections = 0
         self._accept(candidate)
-        self._last_view = _view_signature(*observation) if observation is not None else None
+        self._last_view = (current_view if current_view is not None else
+                           _view_signature(*observation) if observation is not None else None)
         self._last_reference = ReferenceFrame.capture(observation, candidate)
         if self.landmark_guard is not None:
             self.landmark_guard.accept(observation, intrinsics, candidate, features=features)

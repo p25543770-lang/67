@@ -162,7 +162,9 @@ class LandmarkIntegrationTests(LandmarkTests):
                     mock.patch.object(tracking, "registration_diagnostics", return_value=(0.001, 0.01)):
                 # ScanEngine samples every second pixel, so a 50-pixel shift
                 # remains a 25-pixel disagreement in the tracking image.
-                event = engine.process(self.depth, np.roll(self.color, -50, axis=1), 1.1)
+                # Stay below the separate 50 ms gap-confirmation threshold so
+                # this test specifically exercises the landmark veto.
+                event = engine.process(self.depth, np.roll(self.color, -50, axis=1), 1.04)
             self.assertEqual(event["state"], "lost", event)
             self.assertEqual(event["reason"], "landmark_disagreement")
             self.assertFalse(event["integrated"])

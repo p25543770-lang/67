@@ -47,6 +47,12 @@ def main() -> None:
                         help="include RGB in the independent camera-view polls")
     parser.add_argument("--status-without-preview", action="store_true",
                         help="omit the older processing-bound status preview")
+    parser.add_argument("--map-color", action="store_true",
+                        help="request approximate RGB on the accumulated map points")
+    parser.add_argument("--versioned-map", action="store_true",
+                        help="ask newer backends to omit unchanged map points")
+    parser.add_argument("--without-map", action="store_true",
+                        help="omit map points entirely, like the front-camera view")
     parser.add_argument("--landmarks", action="store_true",
                         help="enable experimental RGB veto (requires robot profile)")
     parser.add_argument("--trace", action="store_true",
@@ -198,14 +204,30 @@ def main() -> None:
             runner.start(sensor, source="synthetic", settings=settings, intrinsics=intr)
             active = runner.active
             poll_stop = threading.Event()
-            poll_times = []
+            poll_times, poll_sizes, unchanged_polls = [], [], []
             front_times, front_available, front_color_available, front_ids = [], [], [], []
+            snapshot_params = inspect.signature(runner.snapshot).parameters
+            supports_color = "include_color" in snapshot_params
+            supports_version = "known_points_version" in snapshot_params
+            supports_omit = "include_points" in snapshot_params
+            if args.map_color and not supports_color:
+                parser.error("this checkout does not support colored model previews")
 
             def poll_ui():
+                known_version = None
                 while not poll_stop.is_set():
                     started = time.perf_counter()
-                    snapshot = runner.snapshot(include_preview=False) if args.status_without_preview else runner.snapshot()
-                    json.dumps(snapshot)  # include JSON conversion, as the bridge does
+                    kwargs = {}
+                    if args.status_without_preview: kwargs["include_preview"] = False
+                    if args.map_color: kwargs["include_color"] = True
+                    if args.versioned_map and supports_version: kwargs["known_points_version"] = known_version
+                    if args.without_map and supports_omit: kwargs["include_points"] = False
+                    snapshot = runner.snapshot(**kwargs)
+                    payload = json.dumps(snapshot)  # include JSON conversion, as the bridge does
+                    poll_sizes.append(len(payload.encode("utf-8")))
+                    unchanged_polls.append(snapshot.get("points") is None)
+                    if snapshot.get("points") is not None:
+                        known_version = snapshot.get("pointsVersion")
                     duration = time.perf_counter() - started
                     poll_times.append(duration * 1000)
                     poll_stop.wait(max(0.0, 0.45 - duration))
@@ -289,6 +311,7 @@ def main() -> None:
                 "landmarkChecks": quality.get("landmarkChecks"),
                 "landmarkVetoes": quality.get("landmarkVetoes"),
                 "framesRescued": quality.get("framesRescued"),
+                "earlyRecoveryRejections": quality.get("earlyRecoveryRejections"),
                 "keyframesIntegrated": quality["keyframesIntegrated"],
                 "rejected": quality["rejected"],
                 "lastAcceptedFrame": last_index,
@@ -298,6 +321,15 @@ def main() -> None:
                 "worstIntegratedPoseErrorDeg": None if worst_degrees is None else round(worst_degrees, 2),
                 "worstIntegratedFrame": worst_index,
                 "uiPollMedianMs": round(statistics.median(poll_times), 2) if poll_times else None,
+                "uiPollMaxMs": round(max(poll_times), 2) if poll_times else None,
+                "uiPollBytesTotal": sum(poll_sizes),
+                "uiPollCount": len(poll_sizes),
+                "mapColorRequested": args.map_color,
+                "versionedMapRequested": args.versioned_map,
+                "versionedMapSupported": supports_version,
+                "mapOmittedPolls": sum(unchanged_polls),
+                "withoutMapRequested": args.without_map,
+                "withoutMapSupported": supports_omit,
                 "frontRequests": len(front_times),
                 "frontAvailable": sum(front_available),
                 "frontColorAvailable": sum(front_color_available),

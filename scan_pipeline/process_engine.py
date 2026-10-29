@@ -47,6 +47,7 @@ def _engine_state(engine):
         "last_pose": engine.last_pose,
         "last_accepted_capture_at": engine._last_accepted_capture_at,
         "surface_voxels": engine.fusion.surface_voxels_estimate,
+        "model_version": engine._model_version,
     }
 
 
@@ -151,6 +152,7 @@ class IsolatedScanEngine:
         self.last_angular_deg_s = None
         self.last_pose = None
         self._last_accepted_capture_at = None
+        self.model_version = 0
         self.fusion = SimpleNamespace(surface_voxels_estimate=0)
         self._lock = threading.RLock()
         self._closed = False
@@ -179,6 +181,7 @@ class IsolatedScanEngine:
         self.last_pose = state["last_pose"]
         self._last_accepted_capture_at = state["last_accepted_capture_at"]
         self.fusion.surface_voxels_estimate = state["surface_voxels"]
+        self.model_version = state["model_version"]
         self.disk_low = self.disk_low or state["disk_low"]
         self.disk_error = self.disk_error or state["disk_error"]
         self.warning = self.disk_error or state["warning"]

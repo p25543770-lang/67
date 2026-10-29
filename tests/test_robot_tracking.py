@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import synthetic_robot as robot
@@ -70,9 +72,10 @@ class RobotGuardTests(unittest.TestCase):
         frames = [room.render(pose, intr, noise=True, seed=k + 2000, scene=scene)[:2]
                   for k, pose in enumerate(trajectory.poses)]
         for sequence in ((0, 9), (0, 5, 10)):
-            for landmarks in (False, True):
-                with self.subTest(sequence=sequence, landmarks=landmarks):
-                    settings = ScanSettings.for_profile("robot")
+            for profile, landmarks in (("max_fps", False), ("standard", False),
+                                       ("robot", False), ("robot", True)):
+                with self.subTest(sequence=sequence, profile=profile, landmarks=landmarks):
+                    settings = ScanSettings.for_profile(profile)
                     settings.visual_landmark_veto = landmarks
                     engine = ScanEngine(settings, intr, clock=lambda: 0.0)
                     try:
@@ -89,6 +92,136 @@ class RobotGuardTests(unittest.TestCase):
                         self.assertEqual(recovered["state"], "tracking", recovered)
                     finally:
                         engine.release()
+
+    def test_100ms_gap_does_not_integrate_known_forward_turn_alias(self):
+        # Before mandatory gap confirmation, max_fps accepted pose 3 after
+        # pose 0 at 7 km/h and 20°/s with ~78 mm ground-truth error.
+        intr = Intrinsics.kinect_v1()
+        trajectory = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20, tilt_deg=10)
+        scene = robot.robot_scene("clutter")
+        frames = [room.render(pose, intr, noise=True, seed=k + 2000, scene=scene)[:2]
+                  for k, pose in enumerate(trajectory.poses)]
+        for profile in ("max_fps", "standard", "robot"):
+            with self.subTest(profile=profile):
+                engine = ScanEngine(ScanSettings.for_profile(profile), intr, clock=lambda: 0.0)
+                try:
+                    self.assertEqual(engine.process(*frames[0], 0.0)["state"], "tracking")
+                    trusted = engine.last_pose.copy()
+                    event = engine.process(*frames[3], trajectory.times[3])
+                    self.assertNotEqual(event["state"], "tracking", event)
+                    self.assertFalse(event["integrated"])
+                    self.assertEqual(engine.integrated, 1)
+                    np.testing.assert_array_equal(engine.last_pose, trusted)
+                finally:
+                    engine.release()
+
+    def test_one_skipped_frame_does_not_integrate_known_alias(self):
+        # At +90°/s the previously accepted 0 -> 2 frame had ~112 mm error;
+        # at 20°/s a later pose drifted to ~100 mm. These are synthetic
+        # regressions, not proof that other aliases cannot be integrated.
+        intr = Intrinsics.kinect_v1()
+        scene = robot.robot_scene("clutter")
+        for yaw in (20, 90):
+            trajectory = robot.robot_trajectory(frames=3, speed_kmh=7, yaw_deg_s=yaw, tilt_deg=10)
+            frames = [room.render(pose, intr, noise=True, seed=k + 2000, scene=scene)[:2]
+                      for k, pose in enumerate(trajectory.poses)]
+            for profile in ("max_fps", "standard", "robot"):
+                with self.subTest(yaw=yaw, profile=profile):
+                    engine = ScanEngine(ScanSettings.for_profile(profile), intr, clock=lambda: 0.0)
+                    try:
+                        self.assertEqual(engine.process(*frames[0], 0.0)["state"], "tracking")
+                        trusted = engine.last_pose.copy()
+                        event = engine.process(*frames[2], trajectory.times[2])
+                        self.assertNotEqual(event["state"], "tracking", event)
+                        self.assertFalse(event["integrated"])
+                        self.assertEqual(engine.integrated, 1)
+                        np.testing.assert_array_equal(engine.last_pose, trusted)
+                    finally:
+                        engine.release()
+
+    def test_fast_gap_requires_confirmation_in_all_profiles(self):
+        intr = Intrinsics.kinect_v1()
+        pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
+        depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
+                                      scene=robot.robot_scene("clutter"))
+        candidate = np.eye(4)
+        candidate[0, 3] = 0.1  # mocked 1 m/s over 100 ms
+        icp = SimpleNamespace(transformation=candidate, fitness=1.0)
+        for profile in ("max_fps", "standard", "robot"):
+            for confirmation in (False, True):
+                with self.subTest(profile=profile, confirmation=confirmation):
+                    engine = ScanEngine(ScanSettings.for_profile(profile), intr, clock=lambda: 0.0)
+                    try:
+                        self.assertEqual(engine.process(depth, color, 0.0)["state"], "tracking")
+                        trusted = engine.last_pose.copy()
+                        # Mock alignment and confirmation to exercise each gate;
+                        # speed and the rest of the pipeline remain active.
+                        with patch("open3d.pipelines.registration.registration_icp", return_value=icp), \
+                                patch("scan_pipeline.tracking.registration_diagnostics", return_value=(0.001, 0.01)), \
+                                patch("scan_pipeline.tracking.confirm_model_pose", return_value=confirmation) as confirm:
+                            event = engine.process(depth, color, 0.1)
+                        self.assertEqual(confirm.call_count, 1)
+                        if confirmation:
+                            self.assertEqual(event["state"], "tracking", event)
+                        else:
+                            self.assertEqual(event["reason"], "gap_unconfirmed")
+                            self.assertFalse(event["integrated"])
+                            self.assertEqual(engine.integrated, 1)
+                            np.testing.assert_array_equal(engine.last_pose, trusted)
+                    finally:
+                        engine.release()
+
+    def test_slow_estimated_gap_is_only_unconditionally_checked_in_robot_profile(self):
+        intr = Intrinsics.kinect_v1()
+        pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
+        depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
+                                      scene=robot.robot_scene("clutter"))
+        for profile in ("max_fps", "standard", "robot"):
+            with self.subTest(profile=profile):
+                engine = ScanEngine(ScanSettings.for_profile(profile), intr, clock=lambda: 0.0)
+                try:
+                    self.assertEqual(engine.process(depth, color, 0.0)["state"], "tracking")
+                    with patch("open3d.pipelines.registration.registration_icp",
+                               return_value=SimpleNamespace(transformation=np.eye(4), fitness=1.0)), \
+                            patch("scan_pipeline.tracking.registration_diagnostics", return_value=(0.001, 0.01)), \
+                            patch("scan_pipeline.tracking.confirm_model_pose", return_value=False) as confirm:
+                        event = engine.process(depth, color, 0.1)
+                    if profile == "robot":
+                        confirm.assert_called_once()
+                        self.assertEqual(event["reason"], "gap_unconfirmed")
+                        self.assertFalse(event["integrated"])
+                    else:
+                        # This deliberately documents a limitation: an alias
+                        # that looks slow may evade the new fast-profile gate.
+                        confirm.assert_not_called()
+                        self.assertEqual(event["state"], "tracking")
+                finally:
+                    engine.release()
+
+    def test_gap_seed_reset_keeps_the_existing_prediction_consistency_guard(self):
+        intr = Intrinsics.kinect_v1()
+        pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
+        depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
+                                      scene=robot.robot_scene("clutter"))
+        engine = ScanEngine(ScanSettings.for_profile("max_fps"), intr, clock=lambda: 0.0)
+        try:
+            self.assertEqual(engine.process(depth, color, 0.0)["state"], "tracking")
+            trusted = engine.last_pose.copy()
+            motion_prediction = np.eye(4)
+            motion_prediction[0, 3] = 0.1
+            icp = SimpleNamespace(transformation=np.eye(4), fitness=1.0)
+            with patch.object(engine.tracker, "_predict", return_value=motion_prediction), \
+                    patch("open3d.pipelines.registration.registration_icp", return_value=icp), \
+                    patch("scan_pipeline.tracking.registration_diagnostics", return_value=(0.001, 0.01)), \
+                    patch("scan_pipeline.tracking.confirm_model_pose", return_value=False) as confirm:
+                event = engine.process(depth, color, 0.1)
+            self.assertEqual(confirm.call_count, 1)
+            self.assertEqual(event["reason"], "motion_inconsistent")
+            self.assertFalse(event["integrated"])
+            self.assertEqual(engine.integrated, 1)
+            np.testing.assert_array_equal(engine.last_pose, trusted)
+        finally:
+            engine.release()
 
     def test_forward_turn_does_not_integrate_a_large_known_synthetic_error(self):
         intr = Intrinsics.kinect_v1()

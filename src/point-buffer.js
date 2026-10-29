@@ -35,7 +35,9 @@ export function fillPointBuffers(points, maxDepth, palette, positions, colors, d
     } else if (palette === "mint") {
       colors[offset] = 0.27; colors[offset + 1] = 0.86; colors[offset + 2] = 0.63;
     } else {
-      const idx = Math.round(Math.min(Math.max(depth / 5, 0), 1) * 255) * 3;
+      // Scale the depth palette to the view filter; color mode always uses
+      // the camera's RGB instead. This changes appearance, not geometry.
+      const idx = Math.round(Math.min(Math.max(depth / Math.max(maxDepth, 0.001), 0), 1) * 255) * 3;
       colors[offset] = depthLut[idx]; colors[offset + 1] = depthLut[idx + 1]; colors[offset + 2] = depthLut[idx + 2];
     }
     count++;

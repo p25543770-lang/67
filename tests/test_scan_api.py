@@ -317,6 +317,58 @@ class ScanApiTests(unittest.TestCase):
         self.assertTrue(completed["pointColor"]["available"])
         self.assertEqual(completed["points"][0][4:], [200, 50, 0])
 
+    def test_unchanged_model_is_not_rebuilt_or_resent_and_front_omits_it(self):
+        class VersionedEngine(FakeEngine):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._model_version = 1
+                self.model_calls = 0
+            def model_points(self, limit, include_color=False):
+                self.model_calls += 1
+                return super().model_points(limit, include_color)
+
+        self.connect()
+        with mock.patch.object(runner_module, "ScanEngine", VersionedEngine):
+            started = self.start()
+            self.wait_for(lambda state: state["keyframes"] >= 1)
+            engine = server.scan_runner.active["engine"]
+            _, first = self.request("/api/scan?preview=0&color=1")
+            token = first["pointsVersion"]
+            self.assertTrue(token.endswith(":rgb"))
+            self.assertEqual(first["points"][0][4:], [255, 0, 0])
+            calls = engine.model_calls
+            _, cached = self.request("/api/scan?preview=0&color=1&pointsVersion=" + token)
+            self.assertIsNone(cached["points"])
+            self.assertIsNone(cached["pointColor"])  # unchanged, not "unavailable"
+            self.assertEqual(engine.model_calls, calls)
+            self.assertIsNotNone(cached["performance"])
+            # Older clients still get the points, but their conversion is cached.
+            _, old_client = self.request("/api/scan?preview=0&color=1")
+            self.assertEqual(old_client["points"], first["points"])
+            self.assertEqual(engine.model_calls, calls)
+            _, front = self.request("/api/scan?preview=0&points=0")
+            self.assertIsNone(front["points"])
+            self.assertEqual(engine.model_calls, calls)
+            # A different color mode or new model revision must be sent anew.
+            _, xyz = self.request("/api/scan?preview=0&pointsVersion=" + token)
+            self.assertEqual(len(xyz["points"][0]), 4)
+            with server.scan_runner.active["engine_lock"]:
+                engine._model_version += 1
+            _, updated = self.request("/api/scan?preview=0&color=1&pointsVersion=" + token)
+            self.assertNotEqual(updated["pointsVersion"], token)
+            self.assertEqual(updated["points"][0][4:], [255, 0, 0])
+            # Resuming the same pass can recreate model version 1 with a
+            # different model; old client tokens must never hide that model.
+            self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+            self.wait_for(lambda state: state["phase"] == "ready")
+            self.connect()
+            self.start(resumePassId=started["passId"])
+            self.wait_for(lambda state: state["keyframes"] >= 1)
+            _, resumed = self.request("/api/scan?preview=0&color=1&pointsVersion=" + token)
+            self.assertNotEqual(resumed["pointsVersion"], token)
+            self.assertEqual(resumed["points"][0][4:], [255, 0, 0])
+            self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+
     def start(self, **kwargs):
         status, response = self.request("/api/scan/start", {"source": self.sensor.id, **kwargs})
         self.assertEqual(status, 200, response)
@@ -374,6 +426,39 @@ class ScanApiTests(unittest.TestCase):
         resumed = server._runner().storage.store(started["passId"]).manifest()
         self.assertEqual(resumed["settings"]["profile"], "standard")
         self.assertEqual(resumed["settings"]["keyframe_translation_m"], 0.015)
+
+    def test_depth_limit_api_is_bounded_and_resume_uses_saved_limit(self):
+        self.connect()
+        before = self.sensor.captures
+        for value in (None, True, "10", 0.49, 10.001, float("nan"), float("inf")):
+            status, response = self.request("/api/scan/start", {"source": self.sensor.id, "depthMaxM": value})
+            self.assertEqual(status, 400, (value, response))
+        self.assertEqual(self.sensor.captures, before)
+        self.assertEqual(self.request("/api/scan/passes")[1]["passes"], [])
+
+        started = self.start(depthMaxM=10.0)
+        self.wait_for(lambda status: status["keyframes"] >= 1)
+        runner = server._runner()
+        manifest = runner.storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["settings"]["depth_max_m"], 10.0)
+        self.assertEqual(runner.active["engine"].settings.depth_max_m, 10.0)
+        self.assertEqual(runner._front_context["max_depth_mm"], 10000)
+        status, front = self.request("/api/scan/front")
+        self.assertEqual(status, 200)
+        self.assertTrue(front["available"])
+        self.assertEqual(front["maxDepthMm"], 10000)
+        self.assertFalse(front["verifiedOnHardware"])
+        self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+        self.wait_for(lambda status: status["phase"] == "ready")
+
+        self.connect()
+        self.start(resumePassId=started["passId"], depthMaxM=4.0)
+        self.wait_for(lambda status: status["keyframes"] >= 1)
+        manifest = runner.storage.store(started["passId"]).manifest()
+        self.assertEqual(manifest["settings"]["depth_max_m"], 10.0)
+        self.assertEqual(runner.active["engine"].settings.depth_max_m, 10.0)
+        self.assertEqual(runner._front_context["max_depth_mm"], 10000)
+        self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
 
     def test_front_camera_view_stays_available_when_tracking_worker_is_blocked(self):
         entered, release = threading.Event(), threading.Event()
@@ -559,6 +644,8 @@ class ScanApiTests(unittest.TestCase):
         self.wait_for(lambda data: data["keyframes"] >= 1)
         manifest = server._runner().storage.store(started["passId"]).manifest()
         self.assertEqual(manifest["settings"]["profile"], "max_fps")
+        self.assertEqual(manifest["settings"]["depth_max_m"], 4.0)
+        self.assertEqual(server._runner()._front_context["max_depth_mm"], 4000)
         self.assertFalse(manifest["settings"]["visual_landmark_veto"])
         self.assertEqual(manifest["settings"]["keyframe_translation_m"], 0.075)
 

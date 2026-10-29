@@ -1066,6 +1066,8 @@ h1 {
 }
 .landmark-option input { margin: 0; accent-color: #659b70; }
 .landmark-option:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+.scan-depth-setting { margin-top: 16px; }
+.depth-limit-hint.experimental { color: #9a5f2a; font-weight: 700; }
 .setting-row {
   margin-bottom: 17px;
 }

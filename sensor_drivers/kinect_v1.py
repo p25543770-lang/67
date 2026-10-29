@@ -38,6 +38,7 @@ class KinectV1Adapter(SensorAdapter):
     limitations = (
         "Kinect v1 only (not Kinect One/v2). Depth-to-colour registration is not implemented; depth calibration is approximate; "
         "ICP can drift on plain walls, fast motion, or moving objects. Requires the powered Kinect USB adapter. "
+        "Оценки дальше 4 м экспериментальны и не подтверждены на устройстве; предел 10 м не увеличивает дальность сенсора. "
         "Смена USB-драйвера на libusbK/WinUSB ломает работу штатного драйвера Microsoft Kinect."
     )
     package_names = ("freenect", "numpy")
@@ -161,8 +162,10 @@ class KinectV1Adapter(SensorAdapter):
                 fy = 591.0 * (height / 480.0)
                 cx = (width - 1.0) / 2.0
                 cy = (height - 1.0) / 2.0
+                # Extended range is only an uncalibrated libfreenect estimate,
+                # not evidence the Kinect can reliably resolve distant objects.
                 valid = ((sampled_raw < 2047) & np.isfinite(sampled_z) &
-                         (sampled_z >= 0.45) & (sampled_z <= 4.0))
+                         (sampled_z >= 0.45) & (sampled_z <= 10.0))
                 x = (u - cx) * sampled_z / fx
                 y = -(v - cy) * sampled_z / fy
                 points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)

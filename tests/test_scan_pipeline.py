@@ -67,6 +67,18 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(result.state, "sensor_covered")
         self.assertTrue(result.hint)
 
+    def test_depth_limits_are_explicit_validated_and_inclusive(self):
+        self.assertEqual(self.settings.depth_max_m, 4.0)
+        depth = np.array([[449, 450, 4000, 4001, 9999, 10000, 10001]], dtype=np.uint16)
+        color = np.full((1, 7, 3), 200, dtype=np.uint8)
+        self.assertAlmostEqual(quality.assess_frame(depth, color, self.settings).valid_ratio, 2 / 7)
+        self.settings.depth_max_m = 10.0
+        self.settings.validate()
+        self.assertAlmostEqual(quality.assess_frame(depth, color, self.settings).valid_ratio, 5 / 7)
+        for bad in (None, True, "10", 0.49, 10.001, float("inf"), float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ScanSettings(depth_max_m=bad).validate()
+
     def test_few_valid_pixels_is_reported(self):
         depth = np.zeros((48, 64), dtype=np.uint16)
         depth[:10, :10] = 2000  # ~2 % валидных пикселей при светлом кадре
@@ -170,6 +182,25 @@ class StorageTests(unittest.TestCase):
             np.testing.assert_array_equal(loaded[0]["depth_mm"], depth)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+@NEEDS_O3D
+class ExtendedDepthFusionTests(unittest.TestCase):
+    def test_synthetic_surface_is_integrated_only_within_the_selected_limit(self):
+        # Small field of view keeps the synthetic 10 m plane cheap; this is not
+        # a measurement from Kinect and says nothing about its physical range.
+        intr = Intrinsics(64, 48, 2400, 2400, 31.5, 23.5)
+        color = np.full((48, 64, 3), 128, dtype=np.uint8)
+        for limit, depth_mm, should_exist in ((4.0, 6000, False), (10.0, 6000, True),
+                                               (10.0, 10000, True), (10.0, 10001, False)):
+            with self.subTest(limit=limit, depth=depth_mm):
+                fusion = TsdfFusion(ScanSettings(depth_max_m=limit, voxel_mm=12))
+                depth = np.full((48, 64), depth_mm, dtype=np.uint16)
+                fusion.integrate(depth, color, intr, np.eye(4))
+                points, _, _ = fusion.extract_model()
+                self.assertEqual(len(points) > 0, should_exist)
+                if should_exist:
+                    self.assertAlmostEqual(float(np.median(points[:, 2])), depth_mm / 1000, delta=0.001)
 
 
 @NEEDS_O3D

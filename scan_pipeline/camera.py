@@ -68,7 +68,9 @@ def depth_to_points_rgb(depth_m, color_rgb, intrinsics: Intrinsics, *, stride: i
 
     Select indices before constructing XYZ/RGB arrays, avoiding allocation and
     projection of tens of thousands of points that ICP would immediately drop.
-    Explicit limits keep unsupported sensor depths out of geometric matching.
+    Pass color_rgb=None for geometric ICP: XYZ and sampling are unchanged and
+    no unused per-point RGB array is allocated. Explicit limits keep unsupported
+    sensor depths out of geometric matching.
     """
     depth = np.asarray(depth_m, dtype=np.float64)[::stride, ::stride]
     _, width = depth.shape
@@ -82,8 +84,10 @@ def depth_to_points_rgb(depth_m, color_rgb, intrinsics: Intrinsics, *, stride: i
     z = flat[indices]
     points = np.column_stack((((col * stride) - intrinsics.cx) * z / intrinsics.fx,
                               ((row * stride) - intrinsics.cy) * z / intrinsics.fy, z))
-    sampled_color = np.asarray(color_rgb)[::stride, ::stride]
-    colors = sampled_color.reshape(-1, sampled_color.shape[-1])[indices].astype(np.float64) / 255.0
+    colors = None
+    if color_rgb is not None:
+        sampled_color = np.asarray(color_rgb)[::stride, ::stride]
+        colors = sampled_color.reshape(-1, sampled_color.shape[-1])[indices].astype(np.float64) / 255.0
     return points, colors
 
 

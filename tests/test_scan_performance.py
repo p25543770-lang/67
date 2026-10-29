@@ -59,6 +59,22 @@ class FrameRateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ScanSettings.for_profile("unknown")
 
+    def test_skipping_unused_icp_colors_preserves_exact_projected_points(self):
+        from scan_pipeline.camera import depth_to_points_rgb
+        rng = np.random.default_rng(482)
+        depth = rng.uniform(0.2, 4.3, size=(240, 320)).astype(np.float32)
+        depth[::19, ::7] = 0
+        color = rng.integers(0, 256, size=(240, 320, 3), dtype=np.uint8)
+        intr = Intrinsics.kinect_v1(320, 240)
+        for stride in (1, 2, 4):
+            with_rgb, colors = depth_to_points_rgb(depth, color, intr, stride=stride, max_points=6000,
+                                                   min_depth_m=0.45, max_depth_m=4.0)
+            without_rgb, absent = depth_to_points_rgb(depth, None, intr, stride=stride, max_points=6000,
+                                                       min_depth_m=0.45, max_depth_m=4.0)
+            np.testing.assert_array_equal(without_rgb, with_rgb)
+            self.assertIsNone(absent)
+            self.assertEqual(colors.shape, with_rgb.shape)
+
     def test_recovery_view_requires_matching_depth_and_available_rgb(self):
         from scan_pipeline.tracking import _recovery_view_matches, _view_signature
 
@@ -431,6 +447,61 @@ class SyntheticFastMotionTests(unittest.TestCase):
             self.engine.process(depth, color, 0.1)
         np.testing.assert_array_equal(track.call_args.args[0][:, 2], [1.5])
 
+    def test_extended_limit_filters_tracking_guards_and_integration_at_boundaries(self):
+        from scan_pipeline.fusion import TsdfFusion
+        from scan_pipeline.tracking import TrackResult
+
+        settings = ScanSettings(depth_stride=1, min_valid_ratio=0.0, depth_max_m=10.0)
+        self.engine.release()
+        self.engine = ScanEngine(settings, Intrinsics.kinect_v1(7, 1), clock=lambda: 0.0)
+        depth = np.array([[449, 450, 4000, 5000, 9999, 10000, 10001]], dtype=np.uint16)
+        original = depth.copy()
+        color = np.full((1, 7, 3), 127, dtype=np.uint8)
+        lost = TrackResult("lost", np.eye(4), np.eye(4), reason="test")
+        with mock.patch.object(self.engine.tracker, "track", return_value=lost) as track:
+            self.engine.process(depth, color, 0.0)
+        expected = (depth.astype(np.float32) / 1000.0)[0, 1:6].astype(np.float64)
+        np.testing.assert_array_equal(track.call_args.args[0][:, 2], expected)
+        np.testing.assert_array_equal(track.call_args.kwargs["observation"][0], [[0, 450, 4000, 5000, 9999, 10000, 0]])
+        np.testing.assert_array_equal(depth, original)  # sensor buffer not mutated
+        self.assertEqual(self.engine.pipeline_info()["configuredDepthMaxM"], 10.0)
+
+        class CaptureVolume:
+            def integrate(self, rgbd, intrinsics, extrinsic):
+                self.depth = np.asarray(rgbd.depth).copy()
+
+        fusion = TsdfFusion(settings)
+        volume = fusion.volume = CaptureVolume()
+        fusion.integrate(depth, color, Intrinsics.kinect_v1(7, 1), np.eye(4))
+        np.testing.assert_allclose(volume.depth, [[0, 0.45, 4.0, 5.0, 9.999, 10.0, 0]], atol=1e-6)
+        np.testing.assert_array_equal(depth, original)
+        # A smaller selection also limits the data available to all guards.
+        settings.depth_max_m = 1.0
+        with mock.patch.object(self.engine.tracker, "track", return_value=lost) as track:
+            self.engine.process(depth, color, 0.1)
+        np.testing.assert_array_equal(track.call_args.kwargs["observation"][0], [[0, 450, 0, 0, 0, 0, 0]])
+
+    def test_model_crop_follows_selected_range_without_extending_guard_evidence(self):
+        import scan_pipeline.tracking as tracking
+        from scan_pipeline.frame_validation import _cloud_from_depth
+
+        points = np.array([[0, 0, 4.4], [0, 0, 8.0], [0, 0, 10.0], [0, 0, 10.5]])
+        intr = Intrinsics.kinect_v1(320, 240)
+        near, _, _ = tracking.crop_model_to_view(points, points, points, intr, np.eye(4))
+        distant, _, _ = tracking.crop_model_to_view(points, points, points, intr, np.eye(4), far=10.5)
+        np.testing.assert_array_equal(near[:, 2], [4.4])
+        np.testing.assert_array_equal(distant[:, 2], [4.4, 8.0, 10.0])
+        # Independent confirmation remains deliberately limited to 4 m; an
+        # extended-only frame cannot certify its own candidate pose with it.
+        self.assertEqual(len(_cloud_from_depth(np.full((240, 320), 6000, np.uint16), intr).points), 0)
+        self.engine.settings.depth_max_m = 10.0
+        _, depth, color = self.frame_at(0, 20)
+        self.engine.process(depth, color, 0.0)
+        with mock.patch.object(tracking, "crop_model_to_view", wraps=tracking.crop_model_to_view) as crop:
+            self.engine.process(depth, color, 1 / 30)
+        self.assertGreater(crop.call_count, 0)
+        self.assertTrue(all(call.kwargs["far"] == 10.5 for call in crop.call_args_list))
+
     def test_real_tsdf_model_color_is_not_invented_when_rgb_is_missing(self):
         _, depth, color = self.frame_at(0, 7)
         color[:] = [230, 32, 16]
@@ -648,11 +719,13 @@ class SyntheticFastMotionTests(unittest.TestCase):
 
         with mock.patch.object(tracking, "registration_diagnostics", side_effect=weak_model), \
                 mock.patch.object(tracking, "confirm_model_pose", return_value=False) as confirm:
-            clock[0] = 0.1
+            # Exercise the pre-existing weak-geometry rule without triggering
+            # the new gap confirmation for intervals longer than 50 ms.
+            clock[0] = 0.04
             self.assertEqual(self.engine.process(depth, color, clock[0])["state"], "tracking")
             confirm.assert_not_called()
             self.engine.tracker._crosscheck_after_rescue = True
-            clock[0] = 0.2
+            clock[0] = 0.08
             self.assertEqual(self.engine.process(depth, color, clock[0])["state"], "lost")
             confirm.assert_called_once()
             self.assertEqual(self.engine.tracker.last_result.reason, "frame_disagreement")
@@ -753,6 +826,30 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertFalse(event["integrated"])
         self.assertEqual(self.engine.integrated, before)
         np.testing.assert_array_equal(previous_pose, self.engine.last_pose)
+
+    def test_recovery_mismatched_view_skips_icp_but_never_accepts_it(self):
+        _, depth, color = self.frame_at(0.0, 0)
+        self.assertEqual(self.engine.process(depth, color, 0.0)["state"], "tracking")
+        before = self.engine.integrated
+        trusted = self.engine.last_pose.copy()
+        self.engine.tracker._recovery_state = "lost"
+        different_depth = np.where(depth > 0, np.minimum(depth.astype(np.int32) + 500, 4000), 0).astype(np.uint16)
+        with mock.patch("scan_pipeline.tracking.registration_diagnostics", side_effect=AssertionError("ICP must not run")):
+            event = self.engine.process(different_depth, color, 0.1)
+        self.assertEqual(event["state"], "lost")
+        self.assertEqual(self.engine.tracker.last_result.reason, "return_to_last_view")
+        self.assertTrue(self.engine.tracker.last_result.extra["earlyRecoveryReject"])
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        self.assertEqual(self.engine.quality_summary()["earlyRecoveryRejections"], 1)
+        np.testing.assert_array_equal(self.engine.last_pose, trusted)
+        # A matching view is not automatically accepted; all normal ICP and
+        # geometry checks are still run before recovery.
+        import scan_pipeline.tracking as tracking
+        original = tracking.registration_diagnostics
+        with mock.patch.object(tracking, "registration_diagnostics", wraps=original) as diagnostics:
+            self.assertEqual(self.engine.process(depth, color, 0.2)["state"], "tracking")
+            diagnostics.assert_called()
 
     def test_repeated_bad_frames_require_a_return_to_the_trusted_view(self):
         _, depth, color = self.frame_at(0.0, 0)
