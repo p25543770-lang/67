@@ -100,7 +100,7 @@ jobs:
           }
 
   build:
-    needs: [renderer, unit-tests]
+    needs: [renderer, unit-tests, windows-tracking-regression]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
