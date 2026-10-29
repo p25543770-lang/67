@@ -3,6 +3,7 @@ import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from 
 import { apiRequest } from "./api.js";
 import { frontDepthToPackedPoints, PreviewClock, isPoseFresh } from "./front-view.js";
 import { fillPointBuffers } from "./point-buffer.js";
+import { updateMapMirror } from "./map-mirror.js";
 import { decodePixelFrame } from "./pixel-frames.js";
 import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatLandmarkChecks, formatSpeed } from "./metrics.js";
 import { version as appVersion } from "../package.json";
@@ -100,7 +101,7 @@ document.querySelector("#app").innerHTML = `
             <div class="tracking-chip" id="trackingChip" data-status="demo"><span class="tracking-pulse"></span><span id="trackingLabel">Демо-режим</span></div>
           </div>
           <div class="view-modes" role="group" aria-label="Режим просмотра 3D">
-            <button id="mapViewButton" type="button" aria-pressed="true">Общая карта</button>
+            <button id="mapViewButton" type="button" aria-pressed="true" title="Общая карта отражена по горизонтали только на экране; экспорт не меняется">Общая карта · зеркально</button>
             <button id="frontViewButton" type="button" aria-pressed="false">Перед камерой</button>
             <span id="frontViewStatus" aria-live="polite" hidden>Ожидание свежего кадра</span>
           </div>
@@ -407,6 +408,7 @@ function makeDemoRoom() {
 }
 
 function renderPoints() {
+  updateMapMirror(sceneHost, viewMode);
   const points = viewMode === "front" ? frontPoints : originalPoints;
   const needed = points instanceof Float32Array ? Math.floor(points.length / 4) : points.length;
   if (needed > pointCapacity || pointPositions === null) {

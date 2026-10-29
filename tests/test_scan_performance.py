@@ -380,6 +380,25 @@ class SyntheticFastMotionTests(unittest.TestCase):
         depth, color, _ = sr.render(pose, self.intr, noise=True, seed=seed)
         return pose, depth, color
 
+    def test_engine_filters_depth_in_millimetres_without_changing_float32_projection(self):
+        from scan_pipeline.tracking import TrackResult
+
+        self.engine.release()
+        settings = ScanSettings(depth_stride=1, min_valid_ratio=0.0)
+        self.engine = ScanEngine(settings, Intrinsics.kinect_v1(5, 1), clock=lambda: 0.0)
+        depth = np.array([[449, 450, 1500, 4000, 4001]], dtype=np.uint16)
+        color = np.full((1, 5, 3), 127, dtype=np.uint8)
+        lost = TrackResult("lost", np.eye(4), np.eye(4), reason="test")
+        with mock.patch.object(self.engine.tracker, "track", return_value=lost) as track:
+            self.engine.process(depth, color, 0.0)
+        expected = (depth.astype(np.float32) / 1000.0)[0, 1:4].astype(np.float64)
+        np.testing.assert_array_equal(track.call_args.args[0][:, 2], expected)
+        settings.depth_min_m = 0.4505
+        settings.depth_max_m = 3.9999
+        with mock.patch.object(self.engine.tracker, "track", return_value=lost) as track:
+            self.engine.process(depth, color, 0.1)
+        np.testing.assert_array_equal(track.call_args.args[0][:, 2], [1.5])
+
     def test_seven_kph_with_skipped_frames_and_correct_estimated_speed(self):
         for index in (0, 1, 2, 4, 6):  # 30 FPS source, then deliberately skip frames
             timestamp = index / 30.0

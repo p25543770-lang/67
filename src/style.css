@@ -383,6 +383,8 @@ h1 {
   height: 100%;
   outline: none;
 }
+/* Presentation only: neither stored 3D coordinates nor exports are flipped. */
+.scene-canvas.map-mirrored canvas { transform: scaleX(-1); }
 .scene-topline {
   position: absolute;
   z-index: 1;

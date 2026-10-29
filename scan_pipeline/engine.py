@@ -83,12 +83,15 @@ class ScanEngine:
         if stride > 1:
             depth = depth[::stride, ::stride]
             color = color[::stride, ::stride]
-        # Projection uses float64; convert directly so a 450 mm boundary
-        # value is not rounded just below the configured 0.45 m cutoff.
-        depth_m = depth.astype(np.float64) / 1000.0
+        # Preserve the established float32 projection: changing every point's
+        # rounding can alter the ICP trajectory across Open3D platforms.
+        # Filter in original integer millimetres so exact boundary samples
+        # (e.g. 450 mm) are not lost to float32 representation error.
+        depth_m = depth.astype(np.float32) / 1000.0
+        depth_m[(depth < self.settings.depth_min_m * 1000.0) |
+                (depth > self.settings.depth_max_m * 1000.0)] = 0.0
         cam_points, cam_colors = depth_to_points_rgb(
-            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS,
-            min_depth_m=self.settings.depth_min_m, max_depth_m=self.settings.depth_max_m)
+            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS)
 
         dt = self._dt(captured_at)
         result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt,
