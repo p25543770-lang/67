@@ -661,7 +661,7 @@ class SyntheticFastMotionTests(unittest.TestCase):
         for indices, minimum, last_min in ((scenarios[0], 38, 114), (scenarios[1], 14, 65)):
             clock = [0.0]
             self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: clock[0])
-            errors, accepted = [], []
+            errors, accepted, first_rejection = [], [], None
             for k in indices:
                 clock[0] = k / 30.0
                 depth, color = frames[k]
@@ -670,9 +670,12 @@ class SyntheticFastMotionTests(unittest.TestCase):
                     accepted.append(k)
                     truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
                     errors.append(pose_error(self.engine.last_pose, truth)[0])
+                elif first_rejection is None:
+                    first_rejection = {"frame": k, "reason": event.get("reason"),
+                                       "stepMm": event.get("stepMm"), "stepDeg": event.get("stepDeg")}
             print(f"[tracking] stride={indices.step}, accepted={len(accepted)}/{len(indices)}, "
                   f"last={accepted[-1] if accepted else None}, worst_mm={max(errors) if errors else None}, "
-                  f"rescued={self.engine.tracker.frames_rescued}")
+                  f"rescued={self.engine.tracker.frames_rescued}, first_rejection={first_rejection}")
             self.assertGreaterEqual(len(accepted), minimum)
             self.assertGreaterEqual(accepted[-1], last_min)
             self.assertLess(max(errors), 50.0)

@@ -301,10 +301,7 @@ class FrameToModelTracker:
         import open3d as o3d
 
         dt = dt if dt and dt > 0 else 1.0 / TARGET_FPS
-        # Preserve the original velocity-consistency check even if a capture
-        # gap makes us start the ICP search from the last accepted pose.
-        motion_prediction = self._predict(dt)
-        predicted = motion_prediction
+        predicted = self._predict(dt)
 
         if self._prepared is None or self.pose is None:
             # Первый кадр прохода: модели ещё нет, поза задаёт начало координат.
@@ -318,17 +315,17 @@ class FrameToModelTracker:
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
 
-        # Unobserved motion cannot justify seeding ICP from extrapolated
-        # velocity. Robot mode retains its stronger last-pose AND last-view
-        # recovery for long gaps; gap confirmation is applied below without
-        # bypassing any existing ICP or motion checks.
+        # Robot mode retains its stronger last-pose AND last-view recovery for
+        # long gaps. For other gaps the original bounded ICP initial prediction
+        # and its consistency check remain in place; gap confirmation below is
+        # an additional requirement, not a replacement for those checks.
         needs_gap_confirmation = bool(
             dt > GAP_CONFIRMATION_S and self._recovery_state is None and
             not (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S))
-        if dt > GAP_CONFIRMATION_S and self._recovery_state is None:
+        if (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S and
+                self._recovery_state is None):
+            self._recovery_state = "lost"
             predicted = self.pose.copy()
-            if self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S:
-                self._recovery_state = "lost"
 
         # This is the *same mandatory recovery check* that was previously
         # performed after both ICP scales. A different view could never be
@@ -469,8 +466,8 @@ class FrameToModelTracker:
                                         method=method, extra={"motionDisagreementM": mismatch[0],
                                                               "motionAllowedM": mismatch[1], "eigenRatio": ratio})
                 rescued = True
-        predicted_step = float(np.linalg.norm(motion_prediction[:3, 3] - self.pose[:3, 3]))
-        correction = float(np.linalg.norm(candidate[:3, 3] - motion_prediction[:3, 3]))
+        predicted_step = float(np.linalg.norm(predicted[:3, 3] - self.pose[:3, 3]))
+        correction = float(np.linalg.norm(candidate[:3, 3] - predicted[:3, 3]))
         if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
                                                       predicted_step * PREDICTION_CORRECTION_RATIO):
             # A sudden stop/turn or weak geometry can make ICP confidently slide

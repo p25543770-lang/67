@@ -198,7 +198,7 @@ class RobotGuardTests(unittest.TestCase):
                 finally:
                     engine.release()
 
-    def test_gap_seed_reset_keeps_the_existing_prediction_consistency_guard(self):
+    def test_gap_keeps_the_existing_prediction_consistency_guard(self):
         intr = Intrinsics.kinect_v1()
         pose = robot.robot_trajectory(frames=4, speed_kmh=7, yaw_deg_s=20).poses[0]
         depth, color, _ = room.render(pose, intr, noise=True, seed=2000,
@@ -209,7 +209,11 @@ class RobotGuardTests(unittest.TestCase):
             trusted = engine.last_pose.copy()
             motion_prediction = np.eye(4)
             motion_prediction[0, 3] = 0.1
-            icp = SimpleNamespace(transformation=np.eye(4), fitness=1.0)
+            # ICP correction takes the predicted 0.1 m back to the origin;
+            # this disagrees with the original velocity prediction.
+            correction = np.eye(4)
+            correction[0, 3] = -0.1
+            icp = SimpleNamespace(transformation=correction, fitness=1.0)
             with patch.object(engine.tracker, "_predict", return_value=motion_prediction), \
                     patch("open3d.pipelines.registration.registration_icp", return_value=icp), \
                     patch("scan_pipeline.tracking.registration_diagnostics", return_value=(0.001, 0.01)), \
