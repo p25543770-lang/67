@@ -65,6 +65,40 @@ jobs:
           console.log('requirements-scan.txt and python-lock.json agree.');
           "
 
+  windows-tracking-regression:
+    # Run the installed Open3D version early on Windows as well as in the
+    # clean-installer smoke test. This uses the existing pinned runtime lock.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-scan.lock.txt
+      - name: Install pinned scan runtime for tracking tests
+        shell: pwsh
+        run: |
+          python -m pip install --quiet --only-binary=:all: --require-hashes -r requirements-scan.lock.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows Open3D tracking regressions
+        shell: pwsh
+        timeout-minutes: 8
+        env:
+          OMP_NUM_THREADS: '2'
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'tracking-regression.log'
+          python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $trace = (Get-Content $log -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows Open3D tracking tests::$trace"
+            exit $code
+          }
+
   build:
     needs: [renderer, unit-tests]
     runs-on: windows-latest
@@ -360,7 +394,9 @@ jobs:
           & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v 2>&1 | Tee-Object -FilePath $trackingLog
           $trackingExitCode = $LASTEXITCODE
           if ($trackingExitCode -ne 0) {
-            $trace = (Get-Content $trackingLog -Tail 80) -join "`n"
+            # GitHub truncates long annotations; retain the actual failure,
+            # not the preceding list of successful tests.
+            $trace = (Get-Content $trackingLog -Tail 22) -join "`n"
             $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Installed synthetic tracking tests::$trace"
             exit $trackingExitCode
@@ -369,7 +405,7 @@ jobs:
           & $python -m unittest discover -s tests -p test_robot_tracking.py -v 2>&1 | Tee-Object -FilePath $robotLog
           $robotExitCode = $LASTEXITCODE
           if ($robotExitCode -ne 0) {
-            $trace = (Get-Content $robotLog -Tail 80) -join "`n"
+            $trace = (Get-Content $robotLog -Tail 22) -join "`n"
             $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Installed robot tracking tests::$trace"
             exit $robotExitCode
