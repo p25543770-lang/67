@@ -43,6 +43,7 @@ def _engine_state(engine):
         "disk_low": engine.disk_low,
         "disk_error": engine.disk_error,
         "last_speed_mps": engine.last_speed_mps,
+        "last_angular_deg_s": engine.last_angular_deg_s,
         "last_pose": engine.last_pose,
         "last_accepted_capture_at": engine._last_accepted_capture_at,
         "surface_voxels": engine.fusion.surface_voxels_estimate,
@@ -147,6 +148,7 @@ class IsolatedScanEngine:
         self.warning = self.disk_error = ""
         self.disk_low = False
         self.last_speed_mps = None
+        self.last_angular_deg_s = None
         self.last_pose = None
         self._last_accepted_capture_at = None
         self.fusion = SimpleNamespace(surface_voxels_estimate=0)
@@ -173,6 +175,7 @@ class IsolatedScanEngine:
         self.frames_seen = state["frames_seen"]
         self.integrated = state["integrated"]
         self.last_speed_mps = state["last_speed_mps"]
+        self.last_angular_deg_s = state["last_angular_deg_s"]
         self.last_pose = state["last_pose"]
         self._last_accepted_capture_at = state["last_accepted_capture_at"]
         self.fusion.surface_voxels_estimate = state["surface_voxels"]

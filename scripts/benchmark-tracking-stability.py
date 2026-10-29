@@ -26,7 +26,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frames", type=int, default=150)
     parser.add_argument("--steps", type=int, nargs="+", default=[3, 5])
-    parser.add_argument("--profile", choices=("max_fps", "standard"), default="max_fps")
+    parser.add_argument("--profile", choices=("max_fps", "standard", "robot"), default="max_fps")
     parser.add_argument("--trajectory", choices=("default", "offset", "turns", "flat"), default="default")
     parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument("--package-root", type=Path, default=ROOT)

@@ -35,8 +35,12 @@ def _slab(origin, directions, lo, hi):
     return np.where(hit & (tmin > 0), tmin, np.inf), hit
 
 
-def render(pose, intrinsics: Intrinsics, *, noise=True, seed=0, stride=1):
-    """Вернуть (depth_mm uint16, rgb uint8, depth_m_true float) для позы камеры."""
+def render(pose, intrinsics: Intrinsics, *, noise=True, seed=0, stride=1, scene=None):
+    """Вернуть (depth_mm uint16, rgb uint8, depth_m_true float) для позы камеры.
+
+    Optional scene is (room_lo, room_hi, boxes); it does not mutate the shared
+    default room, so concurrent synthetic robot scenarios remain independent.
+    """
     rng = np.random.default_rng(seed)
     u, v = np.meshgrid(np.arange(0, intrinsics.width, stride), np.arange(0, intrinsics.height, stride))
     dirs_cam = np.stack([(u - intrinsics.cx) / intrinsics.fx, (v - intrinsics.cy) / intrinsics.fy,
@@ -46,14 +50,15 @@ def render(pose, intrinsics: Intrinsics, *, noise=True, seed=0, stride=1):
     dirs = dirs_cam @ rotation.T
 
     # Комната изнутри: выход луча через ближайшую из плоскостей-границ.
+    room_lo, room_hi, boxes = scene if scene is not None else (ROOM_LO, ROOM_HI, BOXES)
     with np.errstate(divide="ignore", invalid="ignore"):
-        a = (ROOM_LO - origin) / dirs
-        b = (ROOM_HI - origin) / dirs
+        a = (room_lo - origin) / dirs
+        b = (room_hi - origin) / dirs
     far_per_axis = np.maximum(a, b)  # выход из слоя по каждой оси — дальняя граница для любого знака
     far_per_axis = np.where(np.isfinite(far_per_axis), far_per_axis, np.inf)
     t_room = np.min(far_per_axis, axis=1)
     t = t_room.copy()
-    for lo, hi in BOXES:
+    for lo, hi in boxes:
         tb, _ = _slab(origin, dirs, lo, hi)
         t = np.minimum(t, tb)
     t_depth = t  # z-координата, т.к. dirs_cam имеет z = 1

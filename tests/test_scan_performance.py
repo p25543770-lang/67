@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 from scan_pipeline.camera import Intrinsics, invert_pose, pose_error
-from scan_pipeline.config import MAX_FPS_PROFILE, STANDARD_PROFILE, ScanSettings, TARGET_FPS, VERIFIED_ON_HARDWARE
+from scan_pipeline.config import MAX_FPS_PROFILE, ROBOT_PROFILE, STANDARD_PROFILE, ScanSettings, TARGET_FPS, VERIFIED_ON_HARDWARE
 from scan_pipeline.performance import FrameMailbox
 from scan_pipeline.storage import AsyncPassStore, ScanStorage
 from sensor_drivers.kinect_sdk_v1 import DEFAULT_MAX_FPS, KinectSdkV1Adapter
@@ -40,6 +40,10 @@ class FrameRateTests(unittest.TestCase):
         fast = ScanSettings.for_profile().validate()
         self.assertEqual(fast.profile, MAX_FPS_PROFILE)
         self.assertEqual(standard.profile, STANDARD_PROFILE)
+        robot = ScanSettings.for_profile(ROBOT_PROFILE).validate()
+        self.assertEqual(robot.profile, ROBOT_PROFILE)
+        self.assertEqual(robot.max_speed_mps, fast.max_speed_mps)
+        self.assertEqual(robot.model_refresh_every, fast.model_refresh_every)
         self.assertEqual(standard.tracking_stride, fast.tracking_stride)
         self.assertGreater(fast.keyframe_translation_m, standard.keyframe_translation_m)
         self.assertGreater(fast.keyframe_rotation_deg, standard.keyframe_rotation_deg)
@@ -539,6 +543,41 @@ class SyntheticFastMotionTests(unittest.TestCase):
             self.assertEqual(self.engine.process(depth, color, clock[0])["state"], "lost")
             confirm.assert_called_once()
             self.assertEqual(self.engine.tracker.last_result.reason, "frame_disagreement")
+
+    def test_robot_profile_requires_confirmation_before_first_rescue(self):
+        import scan_pipeline.tracking as tracking
+        self.engine.release()
+        clock = [0.0]
+        self.engine = ScanEngine(ScanSettings.for_profile(ROBOT_PROFILE), self.intr, clock=lambda: clock[0])
+        depth, color, _ = sr.render(sr.orbit(frames=330).poses[0], self.intr, noise=False)
+        self.assertEqual(self.engine.process(depth, color, clock[0])["state"], "tracking")
+        previous_pose, before = self.engine.last_pose.copy(), self.engine.integrated
+        original_diagnostics = tracking.registration_diagnostics
+
+        def weak_model(source, target, transform, max_distance):
+            rmse, ratio = original_diagnostics(source, target, transform, max_distance)
+            return rmse, 0.003 if max_distance == tracking.INLIER_DISTANCE_M else ratio
+
+        clock[0] = 0.1
+        with mock.patch.object(tracking, "registration_diagnostics", side_effect=weak_model):
+            # No RGB: the robot preset must refuse the weak estimate, not
+            # silently skip the check as if it had been corroborated.
+            event = self.engine.process(depth, None, clock[0])
+        self.assertEqual(event["state"], "lost")
+        self.assertEqual(self.engine.tracker.last_result.reason, "frame_disagreement")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        np.testing.assert_array_equal(self.engine.last_pose, previous_pose)
+        # Returning to the last pose after tracking loss must not bypass the
+        # robot profile's weak-geometry check either.
+        self.engine.tracker._recovery_state = "lost"
+        clock[0] = 0.2
+        with mock.patch.object(tracking, "registration_diagnostics", side_effect=weak_model):
+            event = self.engine.process(depth, None, clock[0])
+        self.assertEqual(event["state"], "lost")
+        self.assertEqual(self.engine.tracker.last_result.reason, "frame_disagreement")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
 
     def test_regular_tracking_is_not_penalized_before_any_rescue(self):
         self.engine.release()

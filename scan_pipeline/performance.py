@@ -19,6 +19,9 @@ class FrameMailbox:
         self.window_s = window_s
         self._condition = threading.Condition()
         self._latest = None
+        # Independent bounded copy of the latest frame reference for the local
+        # camera view. Taking a frame for ICP must not consume that view.
+        self._last_published = None
         self._closed = False
         self._capture_times = deque(maxlen=2048)
         self._processed_times = deque(maxlen=2048)
@@ -60,7 +63,17 @@ class FrameMailbox:
             if self._latest is not None:
                 self._dropped += 1
             self._latest = (frame, now)
+            self._last_published = self._latest
             self._condition.notify()
+
+    def latest_published(self):
+        """Return the last captured frame without competing with the consumer.
+
+        Drivers own the frame arrays and must keep them immutable after capture.
+        There is at most one retained reference; no frame history is queued.
+        """
+        with self._condition:
+            return None if self._closed else self._last_published
 
     def take(self, stop):
         with self._condition:
@@ -96,6 +109,7 @@ class FrameMailbox:
     def close(self):
         with self._condition:
             self._closed = True
+            self._last_published = None
             if self._latest is not None:
                 self._latest = None
                 self._dropped += 1

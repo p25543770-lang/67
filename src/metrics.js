@@ -5,6 +5,12 @@ export function formatSpeed(speedMps) {
     : "— км/ч";
 }
 
+export function formatAngularSpeed(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? `${value.toFixed(1)} °/с`
+    : "— °/с";
+}
+
 export function formatFps(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value.toFixed(1)

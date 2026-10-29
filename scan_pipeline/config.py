@@ -12,6 +12,7 @@ FRAME_BUDGET_MS = 1000.0 / TARGET_FPS
 
 STANDARD_PROFILE = "standard"
 MAX_FPS_PROFILE = "max_fps"
+ROBOT_PROFILE = "robot"
 
 # Приближённые интринсики Kinect v1 при 640x480 (совпадают с адаптером SDK 1.8).
 KINECT_V1_FX = 594.2
@@ -61,12 +62,12 @@ class ScanSettings:
         poses into TSDF. This speeds up CPU scanning at the cost of denser
         fusion, noise averaging and potentially tracking stability.
         """
-        if profile == MAX_FPS_PROFILE:
+        if profile in (MAX_FPS_PROFILE, ROBOT_PROFILE):
             return cls(profile=profile, keyframe_translation_m=0.075,
                        keyframe_rotation_deg=5.0, model_refresh_every=4)
         if profile == STANDARD_PROFILE:
             return cls(profile=profile)
-        raise ValueError("Неизвестный профиль сканирования. Выберите «Максимум FPS» или «Стандарт».")
+        raise ValueError("Неизвестный профиль сканирования. Выберите «Робот», «Максимум FPS» или «Стандарт».")
 
     @property
     def voxel_m(self) -> float:
@@ -77,7 +78,7 @@ class ScanSettings:
         return self.voxel_m * self.trunc_voxels
 
     def validate(self) -> "ScanSettings":
-        if self.profile not in (STANDARD_PROFILE, MAX_FPS_PROFILE):
+        if self.profile not in (STANDARD_PROFILE, MAX_FPS_PROFILE, ROBOT_PROFILE):
             raise ValueError("Неизвестный профиль сканирования.")
         if not (4.0 <= self.voxel_mm <= 12.0):
             raise ValueError("Размер вокселя должен быть в пределах 4–12 мм (рекомендуется 5–8 мм).")

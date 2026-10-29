@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .camera import Intrinsics, invert_pose, relative_motion
-from .config import ScanSettings, TARGET_FPS
+from .config import ROBOT_PROFILE, ScanSettings, TARGET_FPS
 from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture
 
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
@@ -380,14 +380,18 @@ class FrameToModelTracker:
                 return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
                                     extra={"eigenRatio": ratio})
             rescued = True
-        elif (ratio < FRAME_CROSSCHECK_RATIO and self._crosscheck_after_rescue and
-              physically_plausible and not self._recovery_state and
-              observation is not None and self._last_reference is not None and
-              has_usable_texture(observation[1]) and has_usable_texture(self._last_reference.color)):
-            # A weakly constrained model estimate can have good ICP residuals
-            # while sliding along a wall. The extra raw-frame check also guards
-            # against accepting a false positive immediately after a rescue.
-            if not confirm_once():
+        elif (ratio < FRAME_CROSSCHECK_RATIO and physically_plausible and
+              (self.settings.profile == ROBOT_PROFILE or not self._recovery_state)):
+            # For a moving robot, weak geometry can drift *before* any rescue,
+            # especially while turning past a wall. Fail closed if RGB-D is
+            # missing or cannot confirm it; the local raw view remains separate.
+            # Other profiles keep the previous after-rescue behaviour.
+            robot_check = self.settings.profile == ROBOT_PROFILE
+            after_rescue_check = (self._crosscheck_after_rescue and observation is not None and
+                                  self._last_reference is not None and
+                                  has_usable_texture(observation[1]) and
+                                  has_usable_texture(self._last_reference.color))
+            if (robot_check or after_rescue_check) and not confirm_once():
                 return self._reject("lost", predicted, "frame_disagreement", fitness, rmse, step_m, step_deg,
                                     method=method, extra={"eigenRatio": ratio})
 

@@ -1,7 +1,9 @@
 import * as THREE from "three";
 import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from "./readiness.js";
 import { apiRequest } from "./api.js";
-import { formatCpu, formatFps, formatFrameChecks, formatSpeed } from "./metrics.js";
+import { frontDepthToPoints, frontViewDeadline, isPoseFresh } from "./front-view.js";
+import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatSpeed } from "./metrics.js";
+import { version as appVersion } from "../package.json";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import Box from "lucide/dist/esm/icons/box.js";
 import Radio from "lucide/dist/esm/icons/radio.js";
@@ -45,7 +47,7 @@ document.querySelector("#app").innerHTML = `
     <div class="topbar-right">
       <div class="connection-pill" id="headerConnection"><span class="status-dot"></span><span id="headerStatus">Демо-режим</span></div>
       <button class="top-icon" id="helpBtn" aria-label="Помощь и требования" title="Помощь и требования"><i data-lucide="circle-help"></i></button>
-      <span class="version-tag">BETA · 1.2.1</span>
+      <span class="version-tag">BETA · ${appVersion}</span>
     </div>
   </header>
 
@@ -95,6 +97,11 @@ document.querySelector("#app").innerHTML = `
             </div>
             <div class="tracking-chip" id="trackingChip" data-status="demo"><span class="tracking-pulse"></span><span id="trackingLabel">Демо-режим</span></div>
           </div>
+          <div class="view-modes" role="group" aria-label="Режим просмотра 3D">
+            <button id="mapViewButton" type="button" aria-pressed="true">Общая карта</button>
+            <button id="frontViewButton" type="button" aria-pressed="false">Перед камерой</button>
+            <span id="frontViewStatus" aria-live="polite" hidden>Ожидание свежего кадра</span>
+          </div>
           <div class="scene-wrap" id="sceneWrap">
             <div class="scene-canvas" id="sceneCanvas"></div>
             <div class="scene-topline"><span class="scene-cross">✳</span> ПРОСТРАНСТВЕННЫЙ ПРОСМОТР <span>/</span> PERSPECTIVE</div>
@@ -103,7 +110,7 @@ document.querySelector("#app").innerHTML = `
               <button id="fitView" title="Показать сцену целиком" aria-label="Показать сцену целиком"><i data-lucide="move-3d"></i></button>
               <button id="fullscreen" title="На весь экран" aria-label="На весь экран"><i data-lucide="maximize-2"></i></button>
             </div>
-            <div class="empty-scene" id="emptyScene"><span class="empty-icon">✳</span><strong>Облако точек пока пустое</strong><small>Подключите датчик или запустите демонстрационное сканирование.</small></div>
+            <div class="empty-scene" id="emptyScene"><span class="empty-icon">✳</span><strong id="emptyTitle">Облако точек пока пустое</strong><small id="emptyText">Подключите датчик или запустите демонстрационное сканирование.</small></div>
             <div class="scene-axis"><span class="axis-y">Y</span><span class="axis-x">X</span><span class="axis-z">Z</span></div>
             <div class="scene-hint"><i data-lucide="mouse-pointer-2"></i> Перетащите — вращение <span>·</span> Колесо — масштаб</div>
           </div>
@@ -123,6 +130,7 @@ document.querySelector("#app").innerHTML = `
               </div>
             </div>
           </div>
+          <p class="front-view-warning" id="frontViewWarning" hidden>Это один кадр, не накопленная карта. Время — после чтения, задержка Kinect неизвестна. Невидимые участки неизвестны. Не используйте его для управления или остановки робота.</p>
           <p class="scan-action-reason" id="scanActionReason" aria-live="polite" hidden></p>
         </section>
 
@@ -175,6 +183,7 @@ document.querySelector("#app").innerHTML = `
           <div class="warning-box" id="warningBox" hidden><span class="warning-mark">!</span><span id="warningText"></span></div>
           <div class="tracking-metrics">
             <div><span>СКОРОСТЬ · ОЦЕНКА</span><strong id="speedMetric">— км/ч</strong></div>
+            <div title="Оценка полного вращения камеры по ICP, не гироскоп и не только поворот робота"><span>ВРАЩЕНИЕ · ОЦЕНКА</span><strong id="angularMetric">— °/с</strong></div>
             <div><span>FPS · ЗАХВАТ / ОБРАБОТКА</span><strong id="fpsMetric">— / —</strong></div>
             <div><span>ПРОПУСКИ · ОЧЕРЕДЬ</span><strong id="droppedMetric">—</strong></div>
             <div><span>ПРОПУСКИ · ДО ЧТЕНИЯ SDK</span><strong id="sensorDroppedMetric">—</strong></div>
@@ -188,8 +197,8 @@ document.querySelector("#app").innerHTML = `
           </div>
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
           <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
-          <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
-          <p class="movement-hint" id="scanProfileHint">«Максимум FPS» объединяет меньше ключевых кадров: может быть больше шума и хуже детали или трекинг. Неоднозначные позы дополнительно сверяются с последним надёжным кадром, когда подходит RGB. На i5‑13400 автоматически запрашиваются до 4 потоков OpenMP; продолжение сохраняет профиль прохода. 320×240, Kinect v1 — до 30 FPS; обработка и цель 7 км/ч не гарантируются.</p>
+          <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="robot">Робот · осторожная сверка</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
+          <p class="movement-hint" id="scanProfileHint">Режим «Робот» чаще проверяет спорные позы и отбраковывает их при недостатке данных: трекинг может прерваться раньше. Это не управление роботом и не гарантия карты. Продолжение сохраняет профиль прохода. 320×240; 7 км/ч не гарантируются, физический Kinect не проверен.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
@@ -304,6 +313,13 @@ const pointObject = new THREE.Points(pointGeometry, pointMaterial);
 scene.add(pointObject);
 
 let originalPoints = [];
+let frontPoints = [];
+let viewMode = "map";
+let frontTimer = null;
+let frontExpiryTimer = null;
+let frontBusy = false;
+let frontDeadlineMs = 0;
+let frontGeneration = 0;
 let demoPoints = makeDemoRoom();
 let activeSource = "demo";
 let devices = [];
@@ -321,7 +337,11 @@ let streamBusy = false;
 let scanTimer = null;
 let demoScanTimer = null;
 let scanBusy = false;
+let scanGeneration = 0;
 let isScanning = false;
+let scanStatusUpdatedMs = 0;
+let poseExpiryTimer = null;
+let poseDeadlineMs = 0;
 let hasScan = false;
 let demoScanFrames = 0;
 let toastTimeout = null;
@@ -374,7 +394,7 @@ function renderPoints() {
   const palette = $("palette").value;
   const positions = [];
   const colors = [];
-  for (const point of originalPoints) {
+  for (const point of viewMode === "front" ? frontPoints : originalPoints) {
     const [x, y, z, depth = 2] = point;
     if (Number.isFinite(depth) && depth > maxDepth) continue;
     positions.push(x, y, z);
@@ -404,6 +424,108 @@ function renderPoints() {
   updateExportButtons();
 }
 
+function clearFrontView(message = "Нет свежего кадра") {
+  if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
+  frontExpiryTimer = null;
+  frontDeadlineMs = 0;
+  frontPoints = [];
+  $("frontViewStatus").textContent = message;
+  if (viewMode === "front") {
+    $("emptyTitle").textContent = "Нет свежего кадра глубины";
+    $("emptyText").textContent = "Подключите датчик и начните физический проход; старые кадры не показываются.";
+    renderPoints();
+  }
+}
+
+function invalidateFrontView(message) {
+  frontGeneration += 1;
+  clearFrontView(message);
+}
+
+async function pollFrontView() {
+  if (viewMode !== "front") return;
+  if (frontDeadlineMs && performance.now() >= frontDeadlineMs) clearFrontView("Кадр устарел");
+  if (document.hidden || activeSource === "demo" || !isScanning || scanActionBusy || scanPhase !== "capturing") {
+    clearFrontView("Ожидается физический проход");
+    return;
+  }
+  if (frontBusy) return;
+  frontBusy = true;
+  const generation = frontGeneration;
+  const started = performance.now();
+  try {
+    const data = await apiRequest("/api/scan/front", { timeoutMs: 1000 });
+    if (generation !== frontGeneration || viewMode !== "front") return;
+    if (document.hidden || activeSource === "demo" || !isScanning || scanActionBusy || scanPhase !== "capturing") {
+      clearFrontView("Ожидается физический проход");
+      return;
+    }
+    const received = performance.now();
+    const deadline = frontViewDeadline(data, started, received);
+    if (deadline === null) { clearFrontView("Нет свежего кадра"); return; }
+    const points = frontDepthToPoints(data);
+    if (!points.length || performance.now() >= deadline) { clearFrontView("Нет свежей глубины"); return; }
+    frontPoints = points;
+    frontDeadlineMs = deadline;
+    if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
+    // Clear at the deadline, not at the next 150 ms poll. Browser event-loop
+    // stalls can delay timers, so this is still only an informational view.
+    frontExpiryTimer = setTimeout(() => {
+      if (generation === frontGeneration && frontDeadlineMs === deadline) clearFrontView("Кадр устарел");
+    }, Math.max(0, deadline - performance.now()));
+    const age = Math.round(data.captureAgeMs + (received - started));
+    const trackingAge = data.tracking?.lastAcceptedAgeMs;
+    const trackingFresh = data.tracking?.fresh === true && Number.isFinite(trackingAge) && trackingAge >= 0 &&
+      trackingAge + received - started <= 250;
+    const tracking = trackingFresh && data.tracking?.sameFrame ? "поза этого кадра оценена"
+      : trackingFresh ? "поза другого кадра; без совмещения" : "глобальная поза не подтверждена";
+    $("frontViewStatus").textContent = `После чтения ≈${age} мс · ${tracking}`;
+    $("sceneModeLabel").textContent = "ПЕРЕД КАМЕРОЙ · ОДИН КАДР";
+    renderPoints();
+    if (performance.now() >= deadline) clearFrontView("Кадр устарел");
+  } catch {
+    if (generation === frontGeneration && viewMode === "front") clearFrontView("Нет ответа датчика");
+  } finally {
+    frontBusy = false;
+  }
+}
+
+function setViewMode(mode) {
+  viewMode = mode === "front" ? "front" : "map";
+  frontGeneration += 1;
+  if (frontTimer) clearInterval(frontTimer);
+  frontTimer = null;
+  if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
+  frontExpiryTimer = null;
+  frontPoints = [];
+  frontDeadlineMs = 0;
+  $("mapViewButton").setAttribute("aria-pressed", String(viewMode === "map"));
+  $("frontViewButton").setAttribute("aria-pressed", String(viewMode === "front"));
+  $("frontViewStatus").hidden = viewMode !== "front";
+  $("frontViewWarning").hidden = viewMode !== "front";
+  if (viewMode === "front") {
+    $("sceneModeLabel").textContent = "ПЕРЕД КАМЕРОЙ · ОДИН КАДР";
+    clearFrontView("Ожидание свежего кадра");
+    frontTimer = setInterval(pollFrontView, 150);
+    void pollFrontView();
+  } else {
+    $("emptyTitle").textContent = "Облако точек пока пустое";
+    $("emptyText").textContent = "Подключите датчик или запустите демонстрационное сканирование.";
+    $("sceneModeLabel").textContent = activeSource === "demo" ? "ДЕМО-СЦЕНА"
+      : isScanning ? "СКАНИРОВАНИЕ · TSDF" : hasScan ? "РЕЗУЛЬТАТ ПРОХОДА" : "ИСТОЧНИК НЕ ПОДКЛЮЧЁН";
+    renderPoints();
+  }
+}
+
+$("mapViewButton").onclick = () => setViewMode("map");
+$("frontViewButton").onclick = () => setViewMode("front");
+document.addEventListener("visibilitychange", () => {
+  if (poseDeadlineMs && (document.hidden || performance.now() >= poseDeadlineMs)) expirePoseStatus();
+  if (viewMode !== "front") return;
+  if (document.hidden) invalidateFrontView("Окно скрыто");
+  else void pollFrontView();
+});
+
 function resizeScene() {
   const rect = sceneHost.getBoundingClientRect();
   const width = Math.max(1, Math.floor(rect.width));
@@ -415,6 +537,8 @@ function resizeScene() {
 new ResizeObserver(resizeScene).observe(sceneHost);
 function animate() {
   requestAnimationFrame(animate);
+  if (viewMode === "front" && frontDeadlineMs && performance.now() >= frontDeadlineMs) clearFrontView("Кадр устарел");
+  if (poseDeadlineMs && performance.now() >= poseDeadlineMs) expirePoseStatus();
   controls.update();
   renderer.render(scene, camera);
 }
@@ -783,7 +907,29 @@ function updateSourcePanel() {
   renderPasses();
 }
 
+function clearPoseDeadline() {
+  if (poseExpiryTimer) clearTimeout(poseExpiryTimer);
+  poseExpiryTimer = null;
+  poseDeadlineMs = 0;
+}
+
+function expirePoseStatus() {
+  clearPoseDeadline();
+  setTracking("stale", null, "Оценка позы устарела или её время неизвестно.",
+    "Нет свежей оценки позы", "Не используйте карту для управления или остановки робота.");
+}
+
+function armPoseDeadline(deadline, generation) {
+  clearPoseDeadline();
+  poseDeadlineMs = deadline;
+  if (window.performance.now() >= deadline) { expirePoseStatus(); return; }
+  poseExpiryTimer = setTimeout(() => {
+    if (generation === scanGeneration && poseDeadlineMs === deadline && isScanning) expirePoseStatus();
+  }, Math.max(0, deadline - window.performance.now()));
+}
+
 function setTracking(status, speed, warning, title = "", text = "") {
+  if (status !== "tracking") clearPoseDeadline();
   const labels = {
     demo: "Демо-режим",
     idle: "Ожидание",
@@ -791,6 +937,7 @@ function setTracking(status, speed, warning, title = "", text = "") {
     moving: "Двигайтесь медленнее",
     too_fast: "Слишком быстро",
     lost: "Трекинг потерян",
+    stale: "Поза устарела",
     few_valid_pixels: "Мало данных глубины",
     sensor_covered: "Датчик закрыт",
     memory_budget_reached: "Лимит памяти",
@@ -807,8 +954,10 @@ function setTracking(status, speed, warning, title = "", text = "") {
   $("stateMetric").textContent = status === "demo" ? "Демо" : display;
   $("speedMetric").textContent =
     status === "demo" || status === "idle" || status === "stopped" ? formatSpeed(null) : formatSpeed(speed);
+  if (status !== "tracking") $("angularMetric").textContent = formatAngularSpeed(null);
   if (status === "demo") {
     $("fpsMetric").textContent = "— / —";
+    $("angularMetric").textContent = formatAngularSpeed(null);
     $("droppedMetric").textContent = "—";
     $("sensorDroppedMetric").textContent = "—";
     $("keyframesMetric").textContent = "—";
@@ -1067,8 +1216,8 @@ function displaySensorFrame(data) {
   $("feedState").textContent = "ПОТОК АКТИВЕН";
   if (!hasScan && !isScanning && !["finalizing", "merging"].includes(scanPhase)) {
     $("sceneModeLabel").textContent = "ПОТОК ДАТЧИКА";
-    setTracking("tracking", 0, data.warning || "", "Датчик подключён",
-      data.warning || "Поток глубины поступает в приложение.");
+    setTracking("idle", null, data.warning || "", "Датчик подключён",
+      data.warning || "Поток глубины поступает; трекинг ещё не запущен.");
     $("frameCount").textContent = "LIVE";
   }
 }
@@ -1283,6 +1432,16 @@ function startScanPolling() {
   if (!scanTimer) scanTimer = setInterval(refreshScan, 450);
 }
 
+// A blocked bridge/ICP request must not leave an old green pose or angular
+// speed on screen. This indicator is advisory and never controls the robot.
+setInterval(() => {
+  if (!isScanning || activeSource === "demo" ||
+      window.performance.now() - scanStatusUpdatedMs <= 1000) return;
+  $("angularMetric").textContent = formatAngularSpeed(null);
+  setTracking("idle", null, "Нет свежего состояния трекинга.", "Состояние сканирования неизвестно",
+    "Нет своевременного ответа; захват может продолжаться. Программа не останавливает робота.");
+}, 250);
+
 function markScanDeviceReleased(error = "") {
   stopStream();
   deviceConnected = false;
@@ -1299,6 +1458,9 @@ function markScanDeviceReleased(error = "") {
 async function startPhysicalScan(resumePassId = null) {
   if (!currentScanActions().start || isScanning) return;
   scanActionBusy = true;
+  scanGeneration += 1;
+  invalidateFrontView("Запуск прохода");
+  setTracking("idle", null, "", "Подготовка сканирования", "Ожидается первая свежая оценка позы.");
   stopStream();
   updateExportButtons();
   try {
@@ -1306,26 +1468,30 @@ async function startPhysicalScan(resumePassId = null) {
       method: "POST", body: { source: activeSource, profile: $("scanProfile").value,
         ...(resumePassId ? { resumePassId } : {}) },
     });
+    scanGeneration += 1;
     hasScan = false;
     isScanning = true;
+    scanStatusUpdatedMs = window.performance.now();
     scanPhase = "capturing";
     originalPoints = [];
     $("frameCount").textContent = "0";
     $("scanProgressFill").style.width = "0%";
     renderPoints();
     setScanButton();
-    setTracking("tracking", 0, "", "Подготовка сканирования",
-      "Медленно перемещайте датчик, сохраняя перекрытие кадров.");
+    setTracking("idle", null, "", "Подготовка сканирования",
+      "Ожидается первая свежая оценка позы; приложение не управляет роботом.");
     $("sceneModeLabel").textContent = "СКАНИРОВАНИЕ · TSDF";
     startScanPolling();
     await refreshScan();
     await loadPasses();
   } catch (error) {
+    scanGeneration += 1;
     showToast(error.message, "warning");
     if (error.code === "timeout") {
       // The bridge may still be starting. Keep Stop/Cancel available until its
       // actual state is known rather than assuming that the capture failed.
       isScanning = true;
+      scanStatusUpdatedMs = window.performance.now();
       scanPhase = "starting";
       startScanPolling();
       await refreshScan();
@@ -1355,9 +1521,13 @@ async function toggleScan() {
     return;
   }
   scanActionBusy = true;
+  scanGeneration += 1;
+  invalidateFrontView("Остановка прохода");
+  setTracking("idle", null, "", "Остановка прохода", "Ожидается подтверждение моста; робот не управляется программой.");
   updateExportButtons();
   try {
     const result = await apiRequest("/api/scan/stop", { method: "POST", body: {} });
+    scanGeneration += 1;
     isScanning = false;
     scanPhase = result.phase || "idle";
     // ScanRunner releases the handle when capture stops. Reopen the stream
@@ -1380,9 +1550,13 @@ async function toggleScan() {
 async function cancelScan() {
   if (!isScanning || activeSource === "demo" || scanActionBusy) return;
   scanActionBusy = true;
+  scanGeneration += 1;
+  invalidateFrontView("Отмена прохода");
+  setTracking("idle", null, "", "Отмена прохода", "Ожидается подтверждение моста; робот не управляется программой.");
   updateExportButtons();
   try {
     const result = await apiRequest("/api/scan/cancel", { method: "POST", body: {} });
+    scanGeneration += 1;
     if (scanTimer) clearInterval(scanTimer);
     scanTimer = null;
     isScanning = false;
@@ -1411,13 +1585,21 @@ async function cancelScan() {
 async function refreshScan() {
   if (scanBusy) return;
   scanBusy = true;
+  const requestStartedMs = window.performance.now();
+  const generation = scanGeneration;
   try {
     const data = await apiRequest("/api/scan");
+    if (generation !== scanGeneration) return;
+    // Include the whole request time when judging whether status could be old.
+    scanStatusUpdatedMs = requestStartedMs;
     const previousPhase = scanPhase;
     const wasRunning = isScanning;
     isScanning = Boolean(data.running);
     scanPhase = data.phase || (isScanning ? "capturing" : "idle");
-    if (wasRunning && !isScanning) markScanDeviceReleased(data.error || "");
+    if (wasRunning && !isScanning) {
+      invalidateFrontView("Проход остановлен");
+      markScanDeviceReleased(data.error || "");
+    }
     hasScan = scanPhase === "ready" && Boolean(data.lastResultId);
     if (Array.isArray(data.points) && (data.points.length > 0 || scanPhase === "ready")) {
       originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
@@ -1433,11 +1615,13 @@ async function refreshScan() {
       $("feedState").textContent = "ПОТОК АКТИВЕН · СКАНИРОВАНИЕ";
     }
     const performance = data.performance;
+    $("angularMetric").textContent = formatAngularSpeed(data.angularDegS);
     $("fpsMetric").textContent = `${formatFps(performance?.captureFps)} / ${formatFps(performance?.processingFps)}`;
     $("droppedMetric").textContent = Number.isFinite(performance?.droppedFrames) ? String(performance.droppedFrames) : "—";
     $("sensorDroppedMetric").textContent = Number.isFinite(performance?.sensorDroppedFrames) ? String(performance.sensorDroppedFrames) : "—";
     $("keyframesMetric").textContent = Number.isFinite(data.keyframes) ? String(data.keyframes) : "—";
     $("activeProfileMetric").textContent = data.pipeline?.profile === "max_fps" ? "Максимум FPS"
+      : data.pipeline?.profile === "robot" ? "Робот · осторожно"
       : data.pipeline?.profile === "standard" ? "Стандарт" : "—";
     $("trackedFpsMetric").textContent = `${formatFps(performance?.trackingFps)} / ${formatFps(performance?.integrationFps)}`;
     $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
@@ -1446,16 +1630,20 @@ async function refreshScan() {
     $("cpuMetric").textContent = formatCpu(data.pipeline?.cpu);
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
-    const tracking = data.tracking || (isScanning ? "tracking" : "stopped");
+    const advertisedTracking = data.tracking || (isScanning ? "idle" : "stopped");
+    const poseFresh = !document.hidden && isPoseFresh(data, requestStartedMs, window.performance.now());
+    const tracking = advertisedTracking === "tracking" && !poseFresh ? "stale" : advertisedTracking;
     const statusTitles = {
-      lost: "Отслеживание потеряно", too_fast: "Слишком быстрое движение",
+      stale: "Нет свежей оценки позы", lost: "Отслеживание потеряно", too_fast: "Слишком быстрое движение",
       few_valid_pixels: "Мало валидных пикселей", sensor_covered: "Датчик, возможно, закрыт",
       memory_budget_reached: "Достигнут лимит памяти",
     };
     const failedPasses = (data.resultMetrics?.mergedPasses || []).filter((pass) => !pass.ok);
     const mergeWarning = failedPasses.length
       ? `Не удалось совместить проходы: ${failedPasses.map((pass) => `${pass.passId}: ${pass.reason || "нет совпадения"}`).join("; ")}. Они не вошли в результат.` : "";
-    const warning = [data.error, data.warning, data.hint, mergeWarning].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i).join(" ");
+    const warning = [data.error, data.warning, data.hint, mergeWarning,
+      tracking === "stale" ? "Оценка позы устарела или её время неизвестно." : ""]
+      .filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i).join(" ");
     const title = scanPhase === "starting" ? "Подготовка сканирования" :
       scanPhase === "finalizing" ? "Обработка прохода" :
       scanPhase === "merging" ? "Объединение проходов" :
@@ -1467,6 +1655,11 @@ async function refreshScan() {
       isScanning ? "Сохраняйте перекрытие между кадрами и избегайте резких поворотов." :
       hasScan ? "Результат сохранён; экспорт содержит сетку и вершинные цвета." : "Подключите источник и начните новый проход.";
     setTracking(tracking, data.speedMps ?? null, warning, title, text);
+    if (tracking === "tracking" && isScanning) {
+      // As with the front view, include the entire request time. Since polling
+      // is slower than the expiry, stale is preferable to a frozen green pose.
+      armPoseDeadline(requestStartedMs + 250 - data.poseAgeMs, generation);
+    }
     if (hasScan) $("sceneModeLabel").textContent = data.lastResultId === "merged" ? "ОБЪЕДИНЁННЫЕ ПРОХОДЫ" : "РЕЗУЛЬТАТ ПРОХОДА";
     const processing = isScanInProgress(scanPhase, isScanning);
     if (!processing && scanTimer) { clearInterval(scanTimer); scanTimer = null; }
@@ -1476,6 +1669,8 @@ async function refreshScan() {
     }
     setScanButton();
   } catch (error) {
+    if (generation !== scanGeneration) return;
+    $("angularMetric").textContent = formatAngularSpeed(null);
     if (isScanInProgress(scanPhase, isScanning)) {
       // A failed status request is not evidence that capture stopped. Keep
       // polling and allow Stop/Cancel until the server confirms the outcome.
@@ -1506,8 +1701,11 @@ async function clearScan() {
     return;
   }
   if (!currentScanActions().clear) return;
+  scanGeneration += 1;
+  invalidateFrontView("Просмотр очищен");
   try {
     await apiRequest("/api/scan/clear", { method: "POST", body: {} });
+    scanGeneration += 1;
     scanPhase = "idle";
     hasScan = false;
     originalPoints = [];
@@ -1515,7 +1713,7 @@ async function clearScan() {
     $("scanProgressFill").style.width = "0%";
     setScanButton();
     renderPoints();
-    setTracking("tracking", 0, "", "Просмотр очищен", "Сохранённые проходы остаются на диске.");
+    setTracking("idle", null, "", "Просмотр очищен", "Сохранённые проходы остаются на диске.");
     showToast("Просмотр очищен. Сохранённые проходы не удалены.", "success");
   } catch (error) {
     showToast(error.message, "warning");
@@ -1675,6 +1873,8 @@ $("sourceSelect").onchange = async (event) => {
     return;
   }
   const nextSource = event.target.value;
+  scanGeneration += 1;
+  invalidateFrontView("Источник изменён");
   const previousSource = activeSource;
   const wasConnected = deviceConnected;
   stopStream();

@@ -11,6 +11,13 @@ test("speed uses the measured metres per second and shows unknown honestly", () 
   assert.equal(metrics.formatSpeed(NaN), "— км/ч");
 });
 
+test("angular speed is an estimated total camera rotation, not an IMU value", () => {
+  assert.equal(metrics.formatAngularSpeed(20.16), "20.2 °/с");
+  assert.equal(metrics.formatAngularSpeed(0), "0.0 °/с");
+  assert.equal(metrics.formatAngularSpeed(null), "— °/с");
+  assert.equal(metrics.formatAngularSpeed(-1), "— °/с");
+});
+
 test("FPS displays measured capture and processing values, not the target", () => {
   assert.equal(metrics.formatFps(27.63), "27.6");
   assert.equal(metrics.formatFps(0), "0.0");

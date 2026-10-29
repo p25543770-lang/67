@@ -61,7 +61,8 @@ class FakeAdapter(SensorAdapter):
         depth = np.full((24, 32), 1500, dtype=np.uint16)
         color = np.full((24, 32, 3), 100, dtype=np.uint8)
         points = np.array([[0.0, 0.0, -1.5], [0.2, 0.1, -1.5]], dtype=np.float32)
-        return SensorFrame(color, depth, points, time.time(), warning=self.warning)
+        return SensorFrame(color, depth, points, time.monotonic(), warning=self.warning,
+                           sequence_number=self.captures)
 
     def close(self):
         self.closes += 1
@@ -241,6 +242,156 @@ class ScanApiTests(unittest.TestCase):
         resumed = server._runner().storage.store(started["passId"]).manifest()
         self.assertEqual(resumed["settings"]["profile"], "standard")
         self.assertEqual(resumed["settings"]["keyframe_translation_m"], 0.015)
+
+    def test_front_camera_view_stays_available_when_tracking_worker_is_blocked(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingEngine(FakeEngine):
+            def process(self, depth, color, captured_at):
+                entered.set()
+                if not release.wait(6):
+                    raise RuntimeError("test worker timeout")
+                return super().process(depth, color, captured_at)
+
+        self.connect()
+        with mock.patch.object(runner_module, "ScanEngine", BlockingEngine):
+            self.start(profile="robot")
+            try:
+                self.assertTrue(entered.wait(3))
+                # Also hold the runner's main lock in a concurrent /api/scan
+                # request waiting on ICP; /front must not share that lock.
+                snapshot_thread = threading.Thread(target=lambda: self.request("/api/scan"), daemon=True)
+                snapshot_thread.start()
+                lock_deadline = time.monotonic() + 2
+                while time.monotonic() < lock_deadline:
+                    if not server.scan_runner.lock.acquire(blocking=False):
+                        break
+                    server.scan_runner.lock.release()
+                    time.sleep(0.01)
+                else:
+                    self.fail("ordinary snapshot did not hold the runner lock")
+                # Later captures must still replace the local view, independent
+                # of the blocked engine and blocked ordinary snapshot.
+                first_sequence = self.sensor.captures
+                deadline = time.monotonic() + 3
+                front = None
+                while time.monotonic() < deadline:
+                    status, front = self.request("/api/scan/front")
+                    if front.get("available") and front.get("sequenceNumber", 0) >= first_sequence + 2:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(status, 200)
+                self.assertTrue(front["available"], front)
+                self.assertGreaterEqual(front["sequenceNumber"], first_sequence + 2)
+                self.assertTrue(front["notForNavigation"])
+                self.assertTrue(front["oneFrameOnly"])
+                self.assertEqual(front["coordinateFrame"], "camera")
+                self.assertEqual(front["tracking"]["state"], "starting")
+                self.assertFalse(front["tracking"]["fresh"])
+                self.assertEqual(front["depth"]["width"], 8)
+                self.assertEqual(front["depth"]["height"], 6)
+            finally:
+                release.set()
+                if "snapshot_thread" in locals():
+                    snapshot_thread.join(timeout=3)
+            self.wait_for(lambda data: data["keyframes"] >= 1)
+            self.assertEqual(self.request("/api/scan/cancel", {})[0], 200)
+            _, closed = self.request("/api/scan/front")
+            self.assertFalse(closed["available"])
+            self.assertEqual(closed["reason"], "scan_not_running")
+            self.assertIsNone(closed["depth"])
+
+    def test_front_camera_view_does_not_claim_pose_when_tracking_is_lost(self):
+        FakeEngine.state = "lost"
+        self.connect()
+        self.start(profile="robot")
+        self.wait_for(lambda data: data["tracking"] == "lost")
+        status, front = self.request("/api/scan/front")
+        self.assertEqual(status, 200)
+        self.assertTrue(front["available"], front)
+        self.assertEqual(front["tracking"]["state"], "lost")
+        self.assertFalse(front["tracking"]["fresh"])
+        self.assertTrue(front["notForNavigation"])
+
+    def test_scan_status_does_not_advertise_old_velocity_as_fresh(self):
+        entered, release = threading.Event(), threading.Event()
+        self.connect()
+        original = self.sensor.capture_for_scan
+        count = [0]
+
+        def paused_after_first():
+            count[0] += 1
+            if count[0] > 1:
+                entered.set()
+                if not release.wait(6):
+                    raise RuntimeError("test capture timeout")
+            return original()
+
+        with mock.patch.object(self.sensor, "capture_for_scan", side_effect=paused_after_first):
+            self.start(profile="robot")
+            try:
+                self.assertTrue(entered.wait(3))
+                self.wait_for(lambda data: data["frames"] >= 1)
+                runner = server.scan_runner
+                with runner.lock, runner.active["engine_lock"]:
+                    engine = runner.active["engine"]
+                    engine.last_speed_mps = 1.0
+                    engine.last_angular_deg_s = 20.0
+                    # Deterministically emulate a stalled producer after its
+                    # last successful pose, without relying on a timing sleep.
+                    runner.last_event_captured_at = time.monotonic() - 1.0
+                _, status = self.request("/api/scan")
+                self.assertEqual(status["tracking"], "tracking")
+                self.assertFalse(status["poseFresh"])
+                self.assertGreaterEqual(status["poseAgeMs"], 900)
+                self.assertIsNone(status["speedMps"])
+                self.assertIsNone(status["angularDegS"])
+            finally:
+                release.set()
+
+    def test_status_waiting_on_new_engine_frame_does_not_return_an_old_green_event(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class SecondFrameBlocks(FakeEngine):
+            def process(self, depth, color, captured_at):
+                if self.frames_seen == 1:
+                    entered.set()
+                    if not release.wait(6):
+                        raise RuntimeError("test worker timeout")
+                    self.state = "lost"
+                return super().process(depth, color, captured_at)
+
+        self.connect()
+        with mock.patch.object(runner_module, "ScanEngine", SecondFrameBlocks):
+            self.start(profile="robot")
+            response = []
+            snapshot_thread = None
+            try:
+                self.assertTrue(entered.wait(3))
+                snapshot_thread = threading.Thread(target=lambda: response.append(self.request("/api/scan")), daemon=True)
+                snapshot_thread.start()
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if not server.scan_runner.lock.acquire(blocking=False):
+                        break
+                    server.scan_runner.lock.release()
+                    time.sleep(0.01)
+                else:
+                    self.fail("snapshot did not wait on the engine")
+                release.set()
+                snapshot_thread.join(timeout=3)
+                self.assertFalse(snapshot_thread.is_alive())
+                status, data = response[0]
+                self.assertEqual(status, 200)
+                self.assertEqual(data["tracking"], "stale")
+                self.assertFalse(data["poseFresh"])
+                self.assertIsNone(data["speedMps"])
+                self.assertIsNone(data["angularDegS"])
+                self.wait_for(lambda item: item["tracking"] == "lost")
+            finally:
+                release.set()
+                if snapshot_thread is not None:
+                    snapshot_thread.join(timeout=3)
 
     def test_new_pass_defaults_to_max_fps_profile(self):
         self.connect()

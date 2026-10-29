@@ -255,6 +255,41 @@ h1 {
   padding: 0 19px;
   border-bottom: 1px solid #edf1ed;
 }
+.view-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 18px;
+  border-bottom: 1px solid #edf1ed;
+  background: #fbfdfb;
+}
+.view-modes button {
+  border: 1px solid #dce8de;
+  border-radius: 6px;
+  background: #fff;
+  color: #537061;
+  font-size: 10px;
+  font-weight: 650;
+  padding: 6px 10px;
+}
+.view-modes button[aria-pressed="true"] {
+  background: #285a45;
+  border-color: #285a45;
+  color: #fff;
+}
+.view-modes > span {
+  margin-left: auto;
+  color: #8b693b;
+  font-size: 10px;
+}
+.front-view-warning {
+  padding: 0 18px 12px;
+  margin: 0;
+  color: #936632;
+  font-size: 10px;
+  line-height: 1.5;
+}
 .viewer-title-block {
   display: flex;
   align-items: center;
@@ -311,7 +346,8 @@ h1 {
   border-color: #dceede;
 }
 .tracking-chip[data-status="moving"],
-.tracking-chip[data-status="lost"] {
+.tracking-chip[data-status="lost"],
+.tracking-chip[data-status="stale"] {
   color: #95682f;
   background: #fff8e9;
   border-color: #f1dfbd;
@@ -925,12 +961,14 @@ h1 {
   margin-top: 4px;
 }
 .tracking-summary[data-status="moving"],
-.tracking-summary[data-status="lost"] {
+.tracking-summary[data-status="lost"],
+.tracking-summary[data-status="stale"] {
   border-color: #f0dfc1;
   background: #fffaf0;
 }
 .tracking-summary[data-status="moving"] .summary-icon,
-.tracking-summary[data-status="lost"] .summary-icon {
+.tracking-summary[data-status="lost"] .summary-icon,
+.tracking-summary[data-status="stale"] .summary-icon {
   background: #f6e7cc;
   color: #b58542;
 }

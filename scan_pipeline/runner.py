@@ -22,6 +22,7 @@ from . import cleanup, mesh_io, multipass
 from .camera import Intrinsics
 from .config import TARGET_FPS, ScanSettings
 from .engine import ScanEngine
+from .front_view import FRONT_MAX_AGE_S, empty_front, front_frame, monotonic_age
 from .performance import FrameMailbox
 from .storage import AsyncPassStore, ScanStorage
 
@@ -44,6 +45,8 @@ class ScanRunner:
         self.phase = "idle"          # idle | capturing | finalizing | merging | ready | error
         self.error = ""
         self.last_event = {}
+        self.last_event_captured_at = None
+        self.last_event_updated_at = None
         self.results: dict[str, dict] = {}    # pass_id -> arrays (в памяти, только для экспорта)
         self.merged: dict | None = None       # {"arrays", "metrics", "transforms", "passes"}
         self.last_result_id = None
@@ -55,6 +58,10 @@ class ScanRunner:
         self.last_frames = 0
         self.last_keyframes = 0
         self.last_performance = None
+        # This lock never protects ICP, TSDF, disk or the main runner snapshot.
+        # A slow model update must not block access to the latest depth frame.
+        self._front_lock = threading.Lock()
+        self._front_context = None
 
     # ----- запуск -----------------------------------------------------------
     def start(self, adapter, *, source: str, settings: ScanSettings, intrinsics: Intrinsics,
@@ -138,10 +145,18 @@ class ScanRunner:
             self.last_performance = None
             self.last_preview = None
             self.last_event = {}
+            self.last_event_captured_at = None
+            self.last_event_updated_at = None
+            with self._front_lock:
+                self._front_context = {"mailbox": mailbox, "stop": stop, "intrinsics": intrinsics,
+                                       "pass_id": pass_id, "tracking": "starting", "last_tracked_at": None,
+                                       "last_processed_at": None, "updated_at": None}
             try:
                 thread.start()
             except Exception as exc:
                 self.active = None
+                with self._front_lock:
+                    self._front_context = None
                 self.phase = "error"
                 self.error = f"Не удалось запустить поток сканирования: {exc}"
                 try:
@@ -228,8 +243,18 @@ class ScanRunner:
                     frames_seen = engine.frames_seen
                 mailbox.processed(received_at, tracked=event.get("state") in ("tracking", "memory_budget_reached"),
                                   integrated=bool(event.get("integrated")))
+                with self._front_lock:
+                    context = self._front_context
+                    if context is not None and context["mailbox"] is mailbox:
+                        context["tracking"] = event.get("state", "unknown")
+                        context["last_processed_at"] = frame.captured_at
+                        context["updated_at"] = time.monotonic()
+                        if event.get("state") == "tracking":
+                            context["last_tracked_at"] = frame.captured_at
                 with self.lock:
                     self.last_event = event
+                    self.last_event_captured_at = frame.captured_at
+                    self.last_event_updated_at = time.monotonic()
                     self.last_preview = {"color": frame.color_rgb, "depth": frame.depth_mm}
                     warnings = [text for text in (getattr(frame, "warning", ""), warning) if text]
                     if warnings:
@@ -606,6 +631,50 @@ class ScanRunner:
         return mesh_io.write_glb(*args), f"{stem}.glb", "model/gltf-binary"
 
     # ----- состояние для интерфейса -----------------------------------------
+    def front_snapshot(self) -> dict:
+        """Latest raw camera view without waiting for the model/engine lock.
+
+        A fresh depth frame is not evidence of a correct global pose. In
+        particular the raw view can continue while the TSDF tracker is lost.
+        The payload is informational and explicitly not a navigation system.
+        """
+        with self._front_lock:
+            context = self._front_context
+            if context is None:
+                return empty_front("scan_not_running")
+            status = dict(context)
+        if status["stop"].is_set():
+            return empty_front("scan_not_running")
+        published = status["mailbox"].latest_published()
+        frame = None
+        if published is None:
+            result = empty_front("no_frame")
+        else:
+            frame, received_at = published
+            result = front_frame(frame, received_at, status["intrinsics"])
+        now = time.monotonic()
+        tracked_age = monotonic_age(now, status["last_tracked_at"])
+        processed_age = monotonic_age(now, status["last_processed_at"])
+        updated_age = monotonic_age(now, status["updated_at"])
+        tracking_fresh = bool(status["tracking"] == "tracking" and tracked_age is not None and
+                              updated_age is not None and tracked_age <= FRONT_MAX_AGE_S and
+                              updated_age <= FRONT_MAX_AGE_S)
+        result["tracking"] = {
+            "state": status["tracking"],
+            "lastAcceptedAgeMs": None if tracked_age is None else round(tracked_age * 1000, 1),
+            "lastProcessedAgeMs": None if processed_age is None else round(processed_age * 1000, 1),
+            "fresh": tracking_fresh,
+            # The latest captured image normally isn't the one ICP just used.
+            # A fresh *different* pose must never be presented as its pose.
+            "sameFrame": bool(tracking_fresh and result["available"] and frame is not None and
+                              getattr(frame, "captured_at", None) == status["last_tracked_at"]),
+        }
+        # A stop/new scan can race the encoding. Do not serve an old pass.
+        with self._front_lock:
+            if self._front_context is not context or status["stop"].is_set():
+                return empty_front("scan_not_running")
+        return result
+
     def snapshot(self, preview_points=PREVIEW_POINTS) -> dict:
         with self.lock:
             active = self.active
@@ -627,8 +696,9 @@ class ScanRunner:
                     frames = engine.frames_seen
                     keyframes = engine.integrated
                     speed = getattr(engine, "last_speed_mps", None)
+                    angular = getattr(engine, "last_angular_deg_s", None)
             else:
-                frames, keyframes, speed = self.last_frames, self.last_keyframes, None
+                frames, keyframes, speed, angular = self.last_frames, self.last_keyframes, None, None
             if engine is None and self.merged is not None:
                 count = self.merged["metrics"]["points"]
                 points = _preview_mesh(self.merged["arrays"]["vertices"], preview_points)
@@ -641,6 +711,21 @@ class ScanRunner:
             if running and self.last_preview is not None:
                 preview = _encode_preview(self.last_preview)
             tracking = event.get("state", "idle") if running else ("stopped" if phase == "ready" else "idle")
+            # A snapshot may have waited on the engine lock while the next
+            # frame completed; self.last_event is published under self.lock
+            # afterwards. Do not pair the new engine values with an older
+            # "tracking" event while that publication is blocked.
+            if running and frames and event.get("frames") != frames:
+                tracking = "stale"
+            now = time.monotonic()
+            pose_age = monotonic_age(now, self.last_event_captured_at) if running else None
+            event_age = monotonic_age(now, self.last_event_updated_at) if running else None
+            pose_fresh = bool(tracking == "tracking" and pose_age is not None and event_age is not None and
+                              pose_age <= FRONT_MAX_AGE_S and event_age <= FRONT_MAX_AGE_S)
+            # Never keep displaying old velocity estimates as current after a
+            # stopped producer or a stalled tracker.
+            if not pose_fresh:
+                speed, angular = None, None
             performance = active["mailbox"].snapshot() if running else self.last_performance
             capture_warning = active.get("capture_warning", "") if running else ""
             slow_warning = ""
@@ -668,7 +753,10 @@ class ScanRunner:
                 "warning": warning,
                 "hint": event.get("hint", "") if running else "",
                 "tracking": tracking,
+                "poseFresh": pose_fresh,
+                "poseAgeMs": None if pose_age is None else round(pose_age * 1000, 1),
                 "speedMps": None if speed is None else round(float(speed), 3),
+                "angularDegS": None if angular is None else round(float(angular), 1),
                 "performance": performance,
                 "lastEvent": {k: v for k, v in event.items() if k not in ("warning", "hint")},
                 "preview": preview,

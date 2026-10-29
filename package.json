@@ -1,6 +1,6 @@
 {
   "name": "depth-studio",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "private": true,
   "description": "Experimental depth-camera room scanning and point-cloud viewer.",
   "author": "Depth Studio contributors",
@@ -66,8 +66,16 @@
         "to": "scripts/benchmark-tracking-stability.py"
       },
       {
+        "from": "scripts/benchmark-robot-turn.py",
+        "to": "scripts/benchmark-robot-turn.py"
+      },
+      {
         "from": "tests/synthetic_room.py",
         "to": "tests/synthetic_room.py"
+      },
+      {
+        "from": "tests/synthetic_robot.py",
+        "to": "tests/synthetic_robot.py"
       },
       {
         "from": "requirements-scan.txt",

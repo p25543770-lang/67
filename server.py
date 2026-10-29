@@ -222,10 +222,23 @@ def _scan_snapshot():
         "running": pending is not None, "phase": "starting" if pending is not None else "idle",
         "passId": None, "source": pending.get("source") if pending is not None else None,
         "frames": 0, "keyframes": 0, "pointCount": 0, "error": "", "warning": "", "hint": "",
-        "tracking": "idle", "speedMps": 0.0, "lastEvent": {}, "preview": None,
+        "tracking": "idle", "poseFresh": False, "poseAgeMs": None,
+        "speedMps": None, "angularDegS": None, "lastEvent": {}, "preview": None,
         "points": [], "pipeline": None, "quality": None, "lastResultId": None,
         "resultMetrics": None, "verifiedOnHardware": False,
     }
+
+
+def _front_snapshot():
+    # Do not create an engine merely to ask for the local camera view. This
+    # route remains responsive even while the Open3D worker or /api/scan waits.
+    with state_lock:
+        runner = scan_runner
+    if runner is None:
+        return {"available": False, "reason": "scan_not_running", "depth": None,
+                "coordinateFrame": "camera", "oneFrameOnly": True,
+                "notForNavigation": True, "verifiedOnHardware": False}
+    return runner.front_snapshot()
 
 
 def _adapter_for(source_id):
@@ -497,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE))
             elif url.path == "/api/scan":
                 self.respond(200, _scan_snapshot())
+            elif url.path == "/api/scan/front":
+                self.respond(200, _front_snapshot())
             elif url.path == "/api/scan/passes":
                 self.respond(200, {"passes": _runner().list_passes(), "verifiedOnHardware": False})
             elif url.path == "/api/export":
@@ -590,6 +605,10 @@ class Handler(BaseHTTPRequestHandler):
             pass  # client timed out or closed the window
 
     def log_message(self, fmt, *args):
+        # The single-frame view can be polled several times per second. Avoid
+        # filling the disk with successful preview requests; errors still log.
+        if getattr(self, "path", "").split("?", 1)[0] == "/api/scan/front" and len(args) > 1 and str(args[1]) == "200":
+            return
         print("[Depth Studio] %s - %s" % (self.address_string(), fmt % args), flush=True)
 
 

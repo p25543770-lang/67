@@ -82,6 +82,8 @@ test("конвейер попадает в состав Windows-сборки, б
   assert.ok(pkg.build.extraResources.some((entry) => entry.from === "scan_pipeline" && entry.to === "scan_pipeline"));
   assert.ok(pkg.build.extraResources.some((entry) => entry.to === "scripts/benchmark-synthetic-fps.py"));
   assert.ok(pkg.build.extraResources.some((entry) => entry.to === "scripts/benchmark-tracking-stability.py"));
+  assert.ok(pkg.build.extraResources.some((entry) => entry.to === "scripts/benchmark-robot-turn.py"));
+  assert.ok(pkg.build.extraResources.some((entry) => entry.to === "tests/synthetic_robot.py"));
   assert.ok(pkg.build.extraResources.some((entry) => entry.to === "tests/synthetic_room.py"));
   assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["lucide", "three"]);
 });

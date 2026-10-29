@@ -51,6 +51,7 @@ class ScanEngine:
         self.last_quality = None
         self.last_step = (0.0, 0.0)
         self.last_speed_mps: float | None = None
+        self.last_angular_deg_s: float | None = None
         self._recent_integrate: deque[float] = deque(maxlen=TIMING_WINDOW)
         self._memory_keyframes: list[dict] | None = [] if keep_keyframes_in_memory else None
         self._last_accepted_capture_at = None
@@ -70,6 +71,7 @@ class ScanEngine:
         self.last_quality = quality
         if not quality.usable:
             self.last_speed_mps = None
+            self.last_angular_deg_s = None
             self.tracker.note_input_rejection()
             self.rejected[quality.state] = self.rejected.get(quality.state, 0) + 1
             self._set_state(quality.state, quality.state)
@@ -91,6 +93,9 @@ class ScanEngine:
         self.last_step = (result.step_m, result.step_deg)
         self.last_speed_mps = (result.step_m / dt if dt and result.state in ("ok", "too_fast")
                                and result.reason not in ("first_frame", "return_to_last_pose") else None)
+        # Estimated total 3D rotation, not specifically yaw or IMU output.
+        self.last_angular_deg_s = (result.step_deg / dt if dt and result.state == "ok" and
+                                   result.reason != "first_frame" else None)
         if result.state == "lost":
             self.rejected["lost"] += 1
             self._set_state("lost", "lost")
