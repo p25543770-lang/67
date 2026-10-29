@@ -72,27 +72,43 @@ test("Vite proxy preserves origin, host and explicit motor header", {
   }
 });
 
-test("packaged Electron proxy preserves the same headers", { timeout: 15000 }, async () => {
-  const bridge = echoBridge();
-  const bridgePort = await listen(bridge);
-  // Exercise the production function, with Electron's unrelated lifecycle
-  // excluded. This makes the actual request forwarding testable in Node CI.
-  const source = fs.readFileSync(path.resolve(__dirname, "../main.cjs"), "utf8");
+function proxySource(text) {
+  // Git may check out text using CRLF on Windows. Normalise before locating
+  // the production function, otherwise a failed assertion leaked the server.
+  const source = text.replace(/\r\n/g, "\n");
   const start = source.indexOf("function proxyApi(req, res) {");
   const end = source.indexOf("\n\nfunction startWebServer()", start);
   assert.ok(start >= 0 && end > start, "production proxy function was found");
-  const proxyApi = vm.runInNewContext(`(${source.slice(start, end)})`, {
-    http, URL, bridgePort, bridgeStatus: { running: true },
-    sendJson: (res, status, value) => { res.writeHead(status); res.end(JSON.stringify(value)); },
-  });
-  const proxy = http.createServer(proxyApi);
+  return source.slice(start, end);
+}
+
+test("production proxy extraction handles Windows and Unix line endings", () => {
+  const text = fs.readFileSync(path.resolve(__dirname, "../main.cjs"), "utf8").replace(/\r\n/g, "\n");
+  assert.equal(proxySource(text), proxySource(text.replace(/\n/g, "\r\n")));
+});
+
+test("packaged Electron proxy preserves the same headers", { timeout: 15000 }, async () => {
+  const bridge = echoBridge();
+  let proxy;
   try {
+    const bridgePort = await listen(bridge);
+    // Exercise the production function with Electron's unrelated lifecycle
+    // excluded, including the exact headers consumed by the Python bridge.
+    const source = fs.readFileSync(path.resolve(__dirname, "../main.cjs"), "utf8");
+    const proxyApi = vm.runInNewContext(`(${proxySource(source)})`, {
+      http, URL, bridgePort, bridgeStatus: { running: true },
+      sendJson: (res, status, value) => { res.writeHead(status); res.end(JSON.stringify(value)); },
+    });
+    proxy = http.createServer(proxyApi);
     const port = await listen(proxy);
     assertPreserved(await send(port));
   } finally {
-    proxy.closeAllConnections();
+    // The bridge must close even if extraction or the assertion fails.
+    if (proxy) {
+      proxy.closeAllConnections();
+      if (proxy.listening) await close(proxy);
+    }
     bridge.closeAllConnections();
-    await close(proxy);
-    await close(bridge);
+    if (bridge.listening) await close(bridge);
   }
 });
