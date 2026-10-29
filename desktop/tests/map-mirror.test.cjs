@@ -11,6 +11,8 @@ test("only the map canvas is horizontally mirrored; point data stay unchanged", 
   updateMapMirror(host, "map");
   assert.equal(classes.has("map-mirrored"), true);
   assert.deepEqual(points, [[2, 3, -4, 1]]);
+  updateMapMirror(host, "color");
+  assert.equal(classes.has("map-mirrored"), true, "the RGB mode is the same mirrored map");
   updateMapMirror(host, "front");
   assert.equal(classes.has("map-mirrored"), false);
   updateMapMirror(host, "map");

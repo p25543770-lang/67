@@ -37,6 +37,12 @@ class ScanEngine:
         self.frames_seen = 0
         self.frames_tracked = 0
         self.integrated = 0
+        # A missing RGB frame is currently fused as black; keep its provenance
+        # so the viewer never labels that placeholder as measured color.
+        self.rgb_integrated = 0
+        self.rgb_missing_integrated = 0
+        self.rgb_unknown_integrated = 0  # older saved passes have no RGB-presence flag
+        self._model_color_counts = {"rgb": 0, "missing": 0, "unknown": 0}
         self.rejected = {"lost": 0, "too_fast": 0, "sensor_covered": 0, "few_valid_pixels": 0}
         self.fitness_values: list[float] = []
         self.rmse_values: list[float] = []
@@ -128,7 +134,8 @@ class ScanEngine:
 
         integrated = False
         if self.policy.should_integrate(result.pose, now):
-            integrated = self._integrate(depth, color, result.pose, captured_at)
+            integrated = self._integrate(depth, color, result.pose, captured_at,
+                                         color_present=color_rgb is not None)
         self._set_state("tracking", "")
         return self._event(integrated, "tracking", result)
 
@@ -150,7 +157,7 @@ class ScanEngine:
         dt = captured_at - self._last_accepted_capture_at
         return dt if dt > 0.001 else None
 
-    def _integrate(self, depth, color, pose, captured_at) -> bool:
+    def _integrate(self, depth, color, pose, captured_at, *, color_present: bool) -> bool:
         elapsed = self.fusion.integrate(depth, color, self.intrinsics, pose)
         self._recent_integrate.append(elapsed)
         index = self.integrated + 1
@@ -168,6 +175,10 @@ class ScanEngine:
                                            "color": color.copy(), "pose": np.array(pose),
                                            "intrinsics": self.intrinsics})
         self.integrated = index
+        if color_present:
+            self.rgb_integrated += 1
+        else:
+            self.rgb_missing_integrated += 1
         if self.integrated == 1 or self.integrated % self.settings.model_refresh_every == 0:
             self._refresh_model()
         if self.integrated >= self.settings.max_keyframes:
@@ -182,6 +193,7 @@ class ScanEngine:
     def _refresh_model(self) -> None:
         model = self.fusion.extract_model()
         self._model_version += 1
+        self._model_color_counts = self._color_counts()
         self.tracker.set_model(model, self._model_version)
 
     def _maybe_degrade(self) -> None:
@@ -234,6 +246,9 @@ class ScanEngine:
             pose = np.asarray(kf["pose"], dtype=np.float64)
             self.fusion.integrate(kf["depth_mm"], kf["color"], kf["intrinsics"], pose)
             self.integrated = kf["index"]
+            # Saved keyframes from existing releases store a black substitute
+            # for missing RGB without recording whether color was available.
+            self.rgb_unknown_integrated += 1
             count += 1
             last = pose
             if count % self.settings.model_refresh_every == 0:
@@ -253,13 +268,25 @@ class ScanEngine:
             self.intrinsics = self.base_intrinsics.downscaled(self.settings.depth_stride)
         return count
 
-    def model_points(self, max_points: int = 14000):
+    def _color_counts(self):
+        return {"rgb": self.rgb_integrated, "missing": self.rgb_missing_integrated,
+                "unknown": self.rgb_unknown_integrated}
+
+    def model_points(self, max_points: int = 14000, include_color: bool = False):
         model = self.fusion.last_model
         if model is None:
             return np.empty((0, 3))
         points = model[0]
-        if len(points) > max_points:
-            points = points[:: int(np.ceil(len(points) / max_points))]
+        stride = int(np.ceil(len(points) / max_points)) if len(points) > max_points else 1
+        points = points[::stride]
+        counts = self._model_color_counts
+        # RGB8 in Open3D is [0,1]. If the only fused frames lacked RGB, do not
+        # present the black substitute as sensor color. Unknown legacy frames
+        # are shown with an explicit provenance warning.
+        if include_color and (counts["rgb"] or counts["unknown"]):
+            colors = np.asarray(model[2], dtype=np.float64)[::stride]
+            if colors.shape == points.shape and np.isfinite(colors).all():
+                return np.column_stack((points, np.clip(colors, 0.0, 1.0)))
         return points
 
     def quality_summary(self) -> dict:
@@ -295,6 +322,8 @@ class ScanEngine:
             "baseResolution": [self.base_intrinsics.width, self.base_intrinsics.height],
             "trackingStride": self.settings.tracking_stride,
             "visualLandmarkVeto": self.settings.visual_landmark_veto,
+            "colorFrames": self._color_counts(),
+            "modelColorFrames": dict(self._model_color_counts),
             "targetFps": TARGET_FPS,
             "degraded": bool(self.degradations),
             "degradations": [note.__dict__ for note in self.degradations],

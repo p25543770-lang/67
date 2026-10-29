@@ -675,7 +675,7 @@ class ScanRunner:
                 return empty_front("scan_not_running")
         return result
 
-    def snapshot(self, preview_points=PREVIEW_POINTS, *, include_preview=True) -> dict:
+    def snapshot(self, preview_points=PREVIEW_POINTS, *, include_preview=True, include_color=False) -> dict:
         with self.lock:
             active = self.active
             event = dict(self.last_event)
@@ -687,12 +687,16 @@ class ScanRunner:
             count = 0
             pipeline = None
             quality = None
+            color_counts = None
             if engine is not None:
                 with active["engine_lock"]:
                     count = engine.fusion.surface_voxels_estimate
                     pipeline = engine.pipeline_info()
                     quality = engine.quality_summary()
-                    points = _preview(engine.model_points(preview_points))
+                    model = (engine.model_points(preview_points, True) if include_color
+                             else engine.model_points(preview_points))
+                    points = _preview(model)
+                    color_counts = (pipeline or {}).get("modelColorFrames")
                     frames = engine.frames_seen
                     keyframes = engine.integrated
                     speed = getattr(engine, "last_speed_mps", None)
@@ -701,11 +705,18 @@ class ScanRunner:
                 frames, keyframes, speed, angular = self.last_frames, self.last_keyframes, None, None
             if engine is None and self.merged is not None:
                 count = self.merged["metrics"]["points"]
-                points = _preview_mesh(self.merged["arrays"]["vertices"], preview_points)
+                arrays = self.merged["arrays"]
+                # A merged/legacy result may lack RGB-presence metadata.
+                color_counts = (self.merged.get("metrics", {}).get("pipeline") or {}).get("colorFrames")
+                colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
+                points = _preview_mesh(arrays["vertices"], preview_points, colors)
             elif engine is None and self.last_result_id and self.last_result_id in self.results:
-                arrays = self.results[self.last_result_id]["arrays"]
+                entry = self.results[self.last_result_id]
+                arrays = entry["arrays"]
                 count = len(arrays["vertices"])
-                points = _preview_mesh(arrays["vertices"], preview_points)
+                color_counts = (entry.get("metrics", {}).get("pipeline") or {}).get("colorFrames")
+                colors = arrays.get("colors") if include_color and _may_have_rgb(color_counts) else None
+                points = _preview_mesh(arrays["vertices"], preview_points, colors)
             running = active is not None
             preview = None
             if include_preview and running and self.last_preview is not None:
@@ -761,6 +772,7 @@ class ScanRunner:
                 "lastEvent": {k: v for k, v in event.items() if k not in ("warning", "hint")},
                 "preview": preview,
                 "points": points,
+                "pointColor": _point_color_info(points, color_counts) if include_color else None,
                 "pipeline": pipeline,
                 "quality": quality,
                 "lastResultId": self.last_result_id,
@@ -797,21 +809,49 @@ def _summary(metrics):
                                          "voxelMm", "textureKeyframes")}
 
 
+def _may_have_rgb(counts):
+    # No metadata means a legacy/merged result, not proof of missing RGB.
+    return not isinstance(counts, dict) or bool(counts.get("rgb") or counts.get("unknown"))
+
+
+def _point_color_info(points, counts):
+    has_rgb = bool(points and len(points[0]) >= 7)
+    if not has_rgb:
+        status = "unavailable"
+    elif not isinstance(counts, dict) or counts.get("unknown"):
+        status = "unknown"
+    elif counts.get("missing"):
+        status = "partial"
+    else:
+        status = "approximate"
+    return {"available": has_rgb, "status": status, "registered": False,
+            "synchronized": False, "verifiedOnHardware": False}
+
+
 def _preview(points_world):
     if points_world is None or len(points_world) == 0:
         return []
-    # snapshot() holds the engine lock here. Vectorize distance and rounding so
-    # UI polling doesn't stall capture/ICP for tens of milliseconds per poll.
-    points = np.asarray(points_world, dtype=np.float64)
+    # XYZ in Open3D world coordinates; optional trailing RGB is normalized.
+    # Perform coordinate/color conversion before JSON, without a Python loop.
+    values = np.asarray(points_world, dtype=np.float64)
+    points = values[:, :3]
     vertices, _ = mesh_io.to_export_frame(points, np.zeros_like(points))
-    return np.column_stack((np.round(vertices, 4), np.round(np.linalg.norm(points, axis=1), 3))).tolist()
+    columns = [np.round(vertices, 4), np.round(np.linalg.norm(points, axis=1), 3)]
+    if values.shape[1] >= 6 and np.isfinite(values[:, 3:6]).all():
+        columns.append(np.rint(np.clip(values[:, 3:6], 0.0, 1.0) * 255.0))
+    return np.column_stack(columns).tolist()
 
 
-def _preview_mesh(vertices, limit):
+def _preview_mesh(vertices, limit, colors=None):
     if len(vertices) == 0:
         return []
     step = int(np.ceil(len(vertices) / limit))
-    return _preview(np.asarray(vertices)[::step])
+    vertices = np.asarray(vertices)[::step]
+    if colors is not None:
+        colors = np.asarray(colors, dtype=np.float64)[::step]
+        if colors.shape == vertices.shape and np.isfinite(colors).all():
+            return _preview(np.column_stack((vertices, np.clip(colors / 255.0, 0.0, 1.0))))
+    return _preview(vertices)
 
 
 def _encode_preview(frame, max_side=320):

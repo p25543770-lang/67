@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from .base import SensorAdapter, SensorFrame, requirement
@@ -54,6 +55,16 @@ MIN_DEPTH_M = 0.45
 MAX_DEPTH_M = 4.0
 # Три младших бита пикселя DepthImageFrame содержат индекс игрока, глубина — в старших.
 PLAYER_INDEX_BITS = 3
+
+# The SDK exposes -27..27 degrees. The mechanism is not rated for continual
+# movement: enforce conservative, process-local limits even for API callers.
+TILT_MIN_DEG = -27
+TILT_MAX_DEG = 27
+TILT_MIN_INTERVAL_S = 3.0
+TILT_WINDOW_S = 120.0
+TILT_MAX_PER_WINDOW = 10
+TILT_SERIES_REST_S = 20.0
+TILT_SETTLE_S = 8.0
 
 
 class KinectSdkUnavailable(RuntimeError):
@@ -410,6 +421,12 @@ class KinectSdkV1Adapter(SensorAdapter):
         self._session: _SdkSession | None = None
         self._last_capture: float | None = None
         self._last_color_warning = ""
+        # Keep this history across disconnect/reconnect so the UI cannot bypass
+        # the limiter. It cannot account for other programs or app restarts.
+        self._tilt_attempts = deque()
+        self._tilt_last_attempt = None
+        self._tilt_settle_until = 0.0
+        self._tilt_series_count = 0
 
     # ------------------------------------------------------------------ status
     def _env_map(self) -> dict[str, str]:
@@ -585,6 +602,95 @@ class KinectSdkV1Adapter(SensorAdapter):
         if remaining > 0:
             self._sleep(remaining)
         self._last_capture = self._clock()
+
+    def _tilt_session_locked(self):
+        # A command must never open or reconnect a sensor implicitly.
+        session = self._session
+        if session is None or session.closed or not getattr(session.sensor, "IsRunning", False):
+            raise KinectSdkUnavailable(
+                "tilt_not_connected", "Наклон доступен только после подключения Kinect через SDK 1.8.",
+                "Подключите датчик и убедитесь, что он запущен.")
+        return session
+
+    def _tilt_timing_locked(self, now):
+        while self._tilt_attempts and now - self._tilt_attempts[0] >= TILT_WINDOW_S:
+            self._tilt_attempts.popleft()
+        elapsed = None if self._tilt_last_attempt is None else max(0.0, now - self._tilt_last_attempt)
+        if elapsed is not None and elapsed >= TILT_SERIES_REST_S:
+            self._tilt_series_count = 0
+        interval = max(0.0, TILT_MIN_INTERVAL_S - elapsed) if elapsed is not None else 0.0
+        rest = max(0.0, TILT_SERIES_REST_S - elapsed) if elapsed is not None and self._tilt_series_count >= TILT_MAX_PER_WINDOW else 0.0
+        window = max(0.0, TILT_WINDOW_S - (now - self._tilt_attempts[0])) if len(self._tilt_attempts) >= TILT_MAX_PER_WINDOW else 0.0
+        settle = max(0.0, self._tilt_settle_until - now)
+        return max(interval, rest, window), settle
+
+    def tilt_scan_wait(self):
+        """Minimum pause after a command; not proof that the motor has stopped."""
+        with self._lock:
+            return self._tilt_timing_locked(self._clock())[1]
+
+    def _tilt_status_locked(self, sensor, *, allow_read_error=False):
+        try:
+            low = max(TILT_MIN_DEG, int(getattr(sensor, "MinElevationAngle", TILT_MIN_DEG)))
+            high = min(TILT_MAX_DEG, int(getattr(sensor, "MaxElevationAngle", TILT_MAX_DEG)))
+            if low > high:
+                raise ValueError("некорректные ограничения SDK")
+            angle = int(sensor.ElevationAngle)
+            if not low <= angle <= high:
+                raise ValueError("SDK вернул угол вне диапазона")
+        except Exception as exc:
+            if not allow_read_error:
+                raise KinectSdkUnavailable("tilt_read_failed", f"Не удалось прочитать угол Kinect: {exc}",
+                                           "Проверьте питание мотора и SDK; Kinect физически не проверен.") from exc
+            low, high, angle = TILT_MIN_DEG, TILT_MAX_DEG, None
+        cooldown, settle = self._tilt_timing_locked(self._clock())
+        return {"angle": angle, "minAngle": low, "maxAngle": high,
+                "cooldownMs": int(max(0.0, cooldown) * 1000 + 0.999),
+                "scanWaitMs": int(max(0.0, settle) * 1000 + 0.999),
+                "verifiedOnHardware": False}
+
+    def tilt_status(self):
+        with self._lock:
+            return self._tilt_status_locked(self._tilt_session_locked().sensor)
+
+    def set_tilt(self, angle, *, deadline=None):
+        if isinstance(angle, bool) or not isinstance(angle, int) or not TILT_MIN_DEG <= angle <= TILT_MAX_DEG:
+            raise ValueError("Угол должен быть целым числом от −27° до +27°.")
+        with self._lock:
+            sensor = self._tilt_session_locked().sensor
+            status = self._tilt_status_locked(sensor)
+            if not status["minAngle"] <= angle <= status["maxAngle"]:
+                raise ValueError("Угол находится за пределами диапазона этого Kinect.")
+            if status["cooldownMs"]:
+                seconds = (status["cooldownMs"] + 999) // 1000
+                raise KinectSdkUnavailable("tilt_cooldown", f"Мотору нужен отдых: повторите через {seconds} с.",
+                                           "Мотор Kinect не рассчитан на частые движения.")
+            if status["angle"] == angle:
+                return {**status, "commandSent": False, "targetAngle": angle}
+            now = self._clock()
+            if deadline is not None and now >= deadline:
+                raise KinectSdkUnavailable("tilt_timeout", "Запрос наклона устарел; команда мотору не отправлена.",
+                                           "Повторите после проверки подключения.")
+            self._tilt_attempts.append(now)
+            self._tilt_last_attempt = now
+            self._tilt_series_count += 1
+            try:
+                # Microsoft.Kinect.KinectSensor.ElevationAngle: SDK 1.8 uses
+                # the running sensor's hardware tilt motor, not the robot drive.
+                sensor.ElevationAngle = angle
+            except Exception as exc:
+                # It may have moved even if the SDK call failed or timed out.
+                raise KinectSdkUnavailable("tilt_failed", f"Команда наклона не подтверждена: {exc}",
+                                           "Проверьте мотор и подождите: он мог начать движение.") from exc
+            finally:
+                # Native calls can block. Begin both cooldowns *after* the call
+                # returns, not before an unknown-duration hardware operation.
+                finished = self._clock()
+                self._tilt_attempts[-1] = finished
+                self._tilt_last_attempt = finished
+                self._tilt_settle_until = max(self._tilt_settle_until, finished + TILT_SETTLE_S)
+            return {**self._tilt_status_locked(sensor, allow_read_error=True),
+                    "commandSent": True, "targetAngle": angle}
 
     def close(self) -> None:
         with self._lock:

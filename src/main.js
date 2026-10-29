@@ -4,6 +4,7 @@ import { apiRequest } from "./api.js";
 import { frontDepthToPackedPoints, PreviewClock, isPoseFresh } from "./front-view.js";
 import { fillPointBuffers } from "./point-buffer.js";
 import { updateMapMirror } from "./map-mirror.js";
+import { tiltAvailability } from "./motor-mode.js";
 import { decodePixelFrame } from "./pixel-frames.js";
 import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatLandmarkChecks, formatSpeed } from "./metrics.js";
 import { version as appVersion } from "../package.json";
@@ -103,8 +104,21 @@ document.querySelector("#app").innerHTML = `
           <div class="view-modes" role="group" aria-label="Режим просмотра 3D">
             <button id="mapViewButton" type="button" aria-pressed="true" title="Общая карта отражена по горизонтали только на экране; экспорт не меняется">Общая карта · зеркально</button>
             <button id="frontViewButton" type="button" aria-pressed="false">Перед камерой</button>
+            <button id="colorViewButton" type="button" aria-pressed="false">RGB-карта + наклон Kinect</button>
             <span id="frontViewStatus" aria-live="polite" hidden>Ожидание свежего кадра</span>
           </div>
+          <section class="tilt-panel" id="tiltPanel" aria-label="Цветная карта и наклон Kinect" hidden>
+            <div class="tilt-header"><div><strong>Цветная карта + наклон Kinect</strong><small>Только мотор камеры, не управление движением робота</small></div><span class="tilt-badge">ЭКСПЕРИМЕНТ</span></div>
+            <p id="colorMapStatus" class="tilt-note" aria-live="polite">RGB и глубина не откалиброваны и могут быть не синхронны; цвет на карте приблизительный.</p>
+            <div class="tilt-controls">
+              <label for="tiltAngle">Угол камеры <strong id="tiltDesired">0°</strong><small> −27° вниз / +27° вверх</small></label>
+              <input id="tiltAngle" type="range" min="-27" max="27" step="1" value="0" disabled aria-describedby="tiltStatus">
+              <button class="button-secondary" id="tiltApply" type="button" disabled>Применить наклон</button>
+              <button class="button-secondary" id="tiltRefresh" type="button" disabled>Прочитать угол</button>
+            </div>
+            <p id="tiltStatus" class="tilt-note" aria-live="polite">Подключите Kinect через Microsoft Kinect SDK 1.8.</p>
+            <p class="tilt-note">Мотор не предназначен для частого движения. Наклон заблокирован при сканировании; после команды дождитесь остановки камеры. Угол SDK не подтверждает остановку.</p>
+          </section>
           <div class="scene-wrap" id="sceneWrap">
             <div class="scene-canvas" id="sceneCanvas"></div>
             <div class="scene-topline"><span class="scene-cross">✳</span> ПРОСТРАНСТВЕННЫЙ ПРОСМОТР <span>/</span> PERSPECTIVE</div>
@@ -344,6 +358,14 @@ let devices = [];
 let deviceConnected = false;
 let deviceActionBusy = false;
 let scanActionBusy = false;
+let tiltBusy = false;
+let tiltGeneration = 0;
+let tiltQueryBusy = false;
+let tiltStatus = null;
+let tiltMessage = "";
+let tiltCooldownUntil = 0;
+let tiltScanWaitUntil = 0;
+let colorMapInfo = null;
 let bridgeHealth = null;
 let devicesAvailable = false;
 let scanPhase = "idle";
@@ -372,32 +394,32 @@ function makeDemoRoom() {
   };
   for (let x = -3.05; x <= 3.05; x += 0.085) {
     for (let z = -3.2; z <= 3.2; z += 0.085) {
-      if (rand(x, z) > 0.22) points.push([x, 0.02, z, Math.hypot(x, z) + 1]);
+      if (rand(x, z) > 0.22) points.push([x, 0.02, z, Math.hypot(x, z) + 1, 167, 145, 114]);
     }
   }
   for (let x = -3.05; x <= 3.05; x += 0.085) {
     for (let y = 0.03; y <= 2.75; y += 0.085) {
-      if (rand(x, y, 1) > 0.29) points.push([x, y, -3.2, 3.2]);
+      if (rand(x, y, 1) > 0.29) points.push([x, y, -3.2, 3.2, 202, 219, 207]);
     }
   }
   for (let z = -3.2; z <= 3.2; z += 0.085) {
     for (let y = 0.03; y <= 2.75; y += 0.085) {
-      if (rand(z, y, 2) > 0.31) points.push([-3.05, y, z, 3.2]);
+      if (rand(z, y, 2) > 0.31) points.push([-3.05, y, z, 3.2, 151, 186, 174]);
     }
   }
   const surfaceBox = (cx, cy, cz, w, h, d, salt = 0) => {
     for (let x = -w / 2; x <= w / 2; x += 0.075) {
       for (let z = -d / 2; z <= d / 2; z += 0.075) {
-        points.push([cx + x, cy + h / 2, cz + z, 2.3]);
+        points.push([cx + x, cy + h / 2, cz + z, 2.3, 188, 142, 102]);
       }
       for (let y = -h / 2; y <= h / 2; y += 0.075) {
         if (rand(x + salt, y, 3) > 0.11)
-          points.push([cx + x, cy + y, cz + d / 2, 2.3]);
+          points.push([cx + x, cy + y, cz + d / 2, 2.3, 170, 119, 84]);
       }
     }
     for (let z = -d / 2; z <= d / 2; z += 0.075) {
       for (let y = -h / 2; y <= h / 2; y += 0.075)
-        points.push([cx + w / 2, cy + y, cz + z, 2.3]);
+        points.push([cx + w / 2, cy + y, cz + z, 2.3, 151, 107, 76]);
     }
   };
   surfaceBox(0.35, 0.72, -0.72, 2.25, 1.42, 0.8, 1);
@@ -421,7 +443,7 @@ function renderPoints() {
     pointGeometry.setAttribute("position", new THREE.BufferAttribute(pointPositions, 3).setUsage(THREE.DynamicDrawUsage));
     pointGeometry.setAttribute("color", new THREE.BufferAttribute(pointColors, 3).setUsage(THREE.DynamicDrawUsage));
   }
-  const count = fillPointBuffers(points, Number($("depthRange").value), $("palette").value,
+  const count = fillPointBuffers(points, Number($("depthRange").value), viewMode === "color" ? "rgb" : $("palette").value,
     pointPositions, pointColors, pointColorLut);
   pointGeometry.setDrawRange(0, count);
   pointGeometry.getAttribute("position").needsUpdate = true;
@@ -546,10 +568,12 @@ async function pollFrontView() {
 }
 
 function setViewMode(mode) {
-  viewMode = mode === "front" ? "front" : "map";
+  viewMode = ["front", "color"].includes(mode) ? mode : "map";
   frontPoints = new Float32Array(0);
   $("mapViewButton").setAttribute("aria-pressed", String(viewMode === "map"));
   $("frontViewButton").setAttribute("aria-pressed", String(viewMode === "front"));
+  $("colorViewButton").setAttribute("aria-pressed", String(viewMode === "color"));
+  $("tiltPanel").hidden = viewMode !== "color";
   $("frontViewStatus").hidden = viewMode !== "front";
   $("frontViewWarning").hidden = viewMode !== "front";
   if (viewMode === "front") {
@@ -564,11 +588,21 @@ function setViewMode(mode) {
     $("sceneModeLabel").textContent = activeSource === "demo" ? "ДЕМО-СЦЕНА"
       : isScanning ? "СКАНИРОВАНИЕ · TSDF" : hasScan ? "РЕЗУЛЬТАТ ПРОХОДА" : "ИСТОЧНИК НЕ ПОДКЛЮЧЁН";
     renderPoints();
+    if (viewMode === "color") {
+      updateColorStatus();
+      updateMotorControls();
+      if (activeSource !== "demo" && deviceConnected) {
+        if (isScanning || hasScan) void refreshScan();
+        else void pollFrame();
+        void refreshTiltStatus();
+      }
+    }
   }
 }
 
 $("mapViewButton").onclick = () => setViewMode("map");
 $("frontViewButton").onclick = () => setViewMode("front");
+$("colorViewButton").onclick = () => setViewMode("color");
 document.addEventListener("visibilitychange", () => {
   if (poseDeadlineMs && (document.hidden || performance.now() >= poseDeadlineMs)) expirePoseStatus();
   if (document.hidden) invalidateFrontView("Окно скрыто");
@@ -882,7 +916,7 @@ function updateSourcePanel() {
       : profile.connected
         ? '<i data-lucide="radio"></i><span>Подключить поток</span>'
         : '<i data-lucide="radio"></i><span>Подключить выбранный источник</span>';
-    $("connectButton").disabled = deviceActionBusy || isScanning || bridgeHealth?.ok !== true;
+    $("connectButton").disabled = deviceActionBusy || tiltBusy || isScanning || bridgeHealth?.ok !== true;
     $("headerStatus").textContent = deviceConnected
       ? "Поток датчика активен"
       : profile.connected
@@ -1250,8 +1284,10 @@ function displaySensorFrame(data) {
     $("sourceDescription").textContent = profile.warning || profile.limitations || "Выбран экспериментальный источник глубины.";
   }
   if (!hasScan && !isScanning && !["finalizing", "merging"].includes(scanPhase) && Array.isArray(data.points)) {
-    originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
+    originalPoints = data.points.map(([x, y, z, depth, ...rgb]) => [x, y + 1.25, z, depth, ...rgb]);
+    colorMapInfo = data.pointColor || null;
     renderPoints();
+    updateColorStatus();
   }
   const hasRgb = paintRgb(data.color);
   const hasDepth = paintDepth(data.depth);
@@ -1277,7 +1313,7 @@ async function pollFrame() {
   const source = activeSource;
   streamBusy = true;
   try {
-    const data = await apiRequest(`/api/frame?source=${encodeURIComponent(source)}`);
+    const data = await apiRequest(`/api/frame?source=${encodeURIComponent(source)}${viewMode === "color" ? "&color=1" : ""}`);
     if (generation !== streamGeneration || source !== activeSource) return;
     displaySensorFrame(data);
   } catch (error) {
@@ -1314,6 +1350,7 @@ async function connectSelectedSource({ reconnect = false } = {}) {
   updateSourcePanel();
   try {
     if (deviceConnected && !reconnect) {
+      invalidateTilt();
       stopStream();
       await apiRequest("/api/devices/disconnect", { method: "POST", body: { source } });
       deviceConnected = false;
@@ -1329,6 +1366,7 @@ async function connectSelectedSource({ reconnect = false } = {}) {
       await apiRequest("/api/devices/disconnect", { method: "POST", body: { source } });
       return false;
     }
+    invalidateTilt();
     deviceConnected = true;
     const profile = devices.find((device) => device.id === source);
     if (profile) { profile.connected = true; profile.state = "connected"; profile.error = ""; profile.hint = ""; }
@@ -1353,6 +1391,7 @@ async function connectSelectedSource({ reconnect = false } = {}) {
   } finally {
     deviceActionBusy = false;
     updateSourcePanel();
+    if (viewMode === "color" && deviceConnected) void refreshTiltStatus();
   }
 }
 
@@ -1386,14 +1425,152 @@ function setScanButton() {
   updateExportButtons();
 }
 
+function sourceIsSdk() { return activeSource === "kinect_v1_sdk"; }
+function invalidateTilt() { tiltGeneration += 1; tiltStatus = null; tiltMessage = ""; }
+
+function updateColorStatus() {
+  if (viewMode !== "color") return;
+  let message;
+  if (activeSource === "demo") {
+    message = "Демо-цвета синтетической сцены; Kinect не подключён.";
+  } else if (!originalPoints.length) {
+    message = "Карта пока пуста; подключите датчик или начните проход.";
+  } else if (!colorMapInfo?.available) {
+    message = "RGB для этих точек недоступен; они показаны серыми, а не искусственными цветами.";
+  } else if (colorMapInfo.status === "partial") {
+    message = "Не все точки/кадры имеют RGB; часть показана серой или может быть темнее.";
+  } else if (colorMapInfo.status === "unknown") {
+    message = "Для сохранённого прохода наличие RGB в каждом кадре неизвестно; цвет может быть неверным.";
+  } else {
+    message = "Показаны цвета из RGB-кадров; это приблизительное совмещение.";
+  }
+  $("colorMapStatus").textContent = `${message} RGB и глубина Kinect не откалиброваны и не гарантированно синхронны.`;
+}
+
+function updateMotorControls() {
+  const environment = environmentStatus(setupState, bridgeHealth);
+  const inPass = isScanInProgress(scanPhase, isScanning);
+  const cooldown = Math.max(0, Math.ceil((tiltCooldownUntil - performance.now()) / 1000));
+  const settle = Math.max(0, Math.ceil((tiltScanWaitUntil - performance.now()) / 1000));
+  const available = tiltAvailability({ visible: viewMode === "color", environmentReady: environment.ready,
+    sdkSource: sourceIsSdk(), connected: deviceConnected, scanInProgress: inPass,
+    deviceBusy: deviceActionBusy, scanBusy: scanActionBusy, motorBusy: tiltBusy,
+    queryBusy: tiltQueryBusy, angleKnown: Number.isInteger(tiltStatus?.angle), cooldownMs: cooldown });
+  $("tiltAngle").disabled = !available.select;
+  $("tiltApply").disabled = !available.apply;
+  $("tiltRefresh").disabled = !available.read;
+  let message;
+  if (!environment.ready) message = environment.reason;
+  else if (activeSource === "demo") message = "В демо мотор не двигается. Подключите Kinect через SDK 1.8.";
+  else if (!sourceIsSdk()) message = "Управление наклоном доступно только через Microsoft Kinect SDK 1.8.";
+  else if (!deviceConnected) message = "Подключите Kinect через Microsoft Kinect SDK 1.8.";
+  else if (inPass) message = "Наклон заблокирован во время прохода. Остановите сканирование и подключите датчик снова.";
+  else if (tiltBusy) message = "Отправка команды. Камера может двигаться; не запускайте проход.";
+  else if (tiltQueryBusy) message = "Читаем угол Kinect…";
+  else if (tiltMessage) message = tiltMessage;
+  else if (!tiltStatus) message = "Нажмите «Прочитать угол». Наклон не проверен на физическом Kinect.";
+  else {
+    const angle = Number.isInteger(tiltStatus.angle) ? `${tiltStatus.angle}°` : "неизвестен";
+    message = `Угол, сообщённый SDK: ${angle}. Это не подтверждение остановки мотора.`;
+    if (cooldown) message += ` Следующая команда через ${cooldown} с.`;
+    if (settle) message += ` Сканирование доступно не раньше чем через ${settle} с.`;
+  }
+  $("tiltStatus").textContent = message;
+}
+
+function rememberTiltStatus(result, updateSlider = false) {
+  if (!result || !Number.isFinite(result.cooldownMs) || !Number.isFinite(result.scanWaitMs) ||
+      result.cooldownMs < 0 || result.scanWaitMs < 0 ||
+      !Number.isInteger(result.minAngle) || !Number.isInteger(result.maxAngle) ||
+      result.minAngle < -27 || result.maxAngle > 27 || result.minAngle > result.maxAngle ||
+      (result.angle !== null && (!Number.isInteger(result.angle) || result.angle < result.minAngle || result.angle > result.maxAngle))) {
+    throw new Error("Мост вернул некорректное состояние наклона.");
+  }
+  tiltStatus = result;
+  const now = performance.now();
+  tiltCooldownUntil = now + result.cooldownMs;
+  tiltScanWaitUntil = Math.max(tiltScanWaitUntil, now + result.scanWaitMs);
+  $("tiltAngle").min = result.minAngle;
+  $("tiltAngle").max = result.maxAngle;
+  if (updateSlider && Number.isInteger(result.angle)) $("tiltAngle").value = result.angle;
+  $("tiltDesired").textContent = `${$("tiltAngle").value}°`;
+}
+
+async function refreshTiltStatus() {
+  if (viewMode !== "color" || !sourceIsSdk() || !deviceConnected || tiltBusy || tiltQueryBusy ||
+      deviceActionBusy || scanActionBusy || isScanInProgress(scanPhase, isScanning) ||
+      !environmentStatus(setupState, bridgeHealth).ready) return;
+  tiltQueryBusy = true;
+  const source = activeSource;
+  const generation = tiltGeneration;
+  updateMotorControls();
+  try {
+    const data = await apiRequest(`/api/devices/tilt?source=${encodeURIComponent(source)}`, { timeoutMs: 6000 });
+    if (generation !== tiltGeneration || source !== activeSource || !deviceConnected || isScanInProgress(scanPhase, isScanning)) return;
+    rememberTiltStatus(data, !tiltStatus);
+    tiltMessage = "";
+  } catch (error) {
+    if (generation === tiltGeneration && source === activeSource) { tiltStatus = null; tiltMessage = error.message; }
+  } finally {
+    tiltQueryBusy = false;
+    updateExportButtons();
+  }
+}
+
+async function applyTilt() {
+  if ($("tiltApply").disabled) return;
+  const angle = Number($("tiltAngle").value);
+  if (!Number.isInteger(angle) || angle < -27 || angle > 27) return;
+  tiltBusy = true;
+  tiltMessage = "";
+  const source = activeSource;
+  const generation = tiltGeneration;
+  updateSourcePanel();
+  updateExportButtons();
+  try {
+    const data = await apiRequest("/api/devices/tilt", { method: "POST", timeoutMs: 8000,
+      headers: { "X-Depth-Studio-Tilt": "1" }, body: { source, angle } });
+    if (generation !== tiltGeneration || source !== activeSource || !deviceConnected) return;
+    rememberTiltStatus(data);
+    tiltMessage = data.commandSent ? "Команда отправлена. Убедитесь, что камера остановилась перед проходом." : "Этот угол уже сообщён SDK; команда мотору не отправлялась.";
+    if (data.commandSent) setTimeout(() => { tiltMessage = ""; void refreshTiltStatus(); }, 8500);
+  } catch (error) {
+    // A timed-out or failed SDK call may have moved the motor anyway. Never
+    // display it as stopped or immediately start a scan on that assumption.
+    tiltScanWaitUntil = Math.max(tiltScanWaitUntil, performance.now() + 8000);
+    tiltStatus = null;
+    tiltMessage = `${error.message} Камера могла начать движение; проверьте её и прочитайте угол.`;
+  } finally {
+    tiltBusy = false;
+    updateSourcePanel();
+    updateExportButtons();
+  }
+}
+
+$("tiltAngle").oninput = () => { $("tiltDesired").textContent = `${$("tiltAngle").value}°`; };
+$("tiltApply").onclick = applyTilt;
+$("tiltRefresh").onclick = () => { tiltMessage = ""; void refreshTiltStatus(); };
+setInterval(() => {
+  if (viewMode === "color" || tiltScanWaitUntil > 0) {
+    if (performance.now() >= tiltScanWaitUntil) tiltScanWaitUntil = 0;
+    updateExportButtons();
+  }
+}, 1000);
+
 function currentScanActions() {
   return scanActions({ source: activeSource, connected: deviceConnected, setup: setupState,
     health: bridgeHealth, phase: scanPhase, running: isScanning, hasResult: hasScan,
-    hasVisibleData: originalPoints.length > 0, busy: scanActionBusy });
+    hasVisibleData: originalPoints.length > 0, busy: scanActionBusy || tiltBusy ||
+      (sourceIsSdk() && !isScanning && performance.now() < tiltScanWaitUntil) });
 }
 
 function updateExportButtons() {
   const actions = currentScanActions();
+  if (sourceIsSdk() && !isScanning && performance.now() < tiltScanWaitUntil) {
+    actions.reason = "Выдержите защитную паузу после команды мотора и проверьте остановку камеры.";
+  } else if (tiltBusy && !isScanning) {
+    actions.reason = "Дождитесь завершения запроса наклона Kinect.";
+  }
   $("scanButton").disabled = !actions.start;
   $("clearButton").disabled = !actions.clear;
   $("exportPly").disabled = !actions.export;
@@ -1408,6 +1585,7 @@ function updateExportButtons() {
   reason.hidden = !actions.reason;
   $("scanButton").title = !actions.start ? actions.reason : "";
   $("clearButton").title = !actions.clear && actions.reason ? actions.reason : "Очистить просмотр";
+  updateMotorControls();
   for (const id of ["exportPly", "exportObj", "exportGlb"]) {
     const button = $(id);
     const format = id.slice("export".length).toUpperCase();
@@ -1493,6 +1671,7 @@ setInterval(() => {
 }, 250);
 
 function markScanDeviceReleased(error = "") {
+  invalidateTilt();
   stopStream();
   deviceConnected = false;
   const profile = selectedProfile();
@@ -1508,6 +1687,7 @@ function markScanDeviceReleased(error = "") {
 async function startPhysicalScan(resumePassId = null) {
   if (!currentScanActions().start || isScanning) return;
   scanActionBusy = true;
+  invalidateTilt();
   scanGeneration += 1;
   invalidateFrontView("Запуск прохода", true);
   setTracking("idle", null, "", "Подготовка сканирования", "Ожидается первая свежая оценка позы.");
@@ -1647,7 +1827,7 @@ async function refreshScan() {
   const requestStartedMs = window.performance.now();
   const generation = scanGeneration;
   try {
-    const data = await apiRequest("/api/scan?preview=0");
+    const data = await apiRequest(`/api/scan?preview=0${viewMode === "color" ? "&color=1" : ""}`);
     if (generation !== scanGeneration) return;
     // Include the whole request time when judging whether status could be old.
     scanStatusUpdatedMs = requestStartedMs;
@@ -1663,8 +1843,10 @@ async function refreshScan() {
     }
     hasScan = scanPhase === "ready" && Boolean(data.lastResultId);
     if (Array.isArray(data.points) && (data.points.length > 0 || scanPhase === "ready")) {
-      originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
-      if (viewMode === "map") renderPoints();
+      originalPoints = data.points.map(([x, y, z, depth, ...rgb]) => [x, y + 1.25, z, depth, ...rgb]);
+      colorMapInfo = data.pointColor || null;
+      if (viewMode !== "front") renderPoints();
+      updateColorStatus();
     }
     // The status response deliberately omits its old, processing-bound image;
     // the independent latest-frame request above drives both feed canvases.
@@ -1925,8 +2107,8 @@ async function exportScan(format) {
 
 $("scanProfile").onchange = updateExportButtons;
 $("sourceSelect").onchange = async (event) => {
-  if (isScanning || scanActionBusy || deviceActionBusy || ["finalizing", "merging"].includes(scanPhase)) {
-    showToast("Дождитесь окончания текущего прохода перед сменой источника.", "warning");
+  if (isScanning || scanActionBusy || deviceActionBusy || tiltBusy || ["finalizing", "merging"].includes(scanPhase)) {
+    showToast("Дождитесь окончания прохода или запроса наклона перед сменой источника.", "warning");
     event.target.value = activeSource;
     return;
   }
@@ -1941,6 +2123,8 @@ $("sourceSelect").onchange = async (event) => {
     catch (error) { showToast(error.message, "warning"); }
   }
   activeSource = nextSource;
+  invalidateTilt();
+  colorMapInfo = null;
   deviceConnected = false;
   hasScan = false;
   originalPoints = activeSource === "demo" ? demoPoints.slice() : [];
@@ -2150,6 +2334,7 @@ function scheduleSetupPoll(delay = 3000) {
       if (activeSource !== "demo") await loadPasses();
     } else if (!bridgeHealth && wasOnline) {
       devicesAvailable = false;
+      invalidateTilt();
       stopStream();
       deviceConnected = false;
       $("serverNote").innerHTML = '<span class="server-note-dot"></span><span>Локальный мост не отвечает · демо доступно</span>';

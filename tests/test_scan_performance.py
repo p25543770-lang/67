@@ -162,6 +162,38 @@ class FrameRateTests(unittest.TestCase):
         self.assertEqual(_preview(np.empty((0, 3))), [])
         self.assertEqual(_preview(None), [])
 
+    def test_preview_rgb_keeps_channels_and_reports_unknown_or_missing(self):
+        from scan_pipeline.runner import _preview, _preview_mesh, _point_color_info
+        points = np.array([[1, 2, 3, 1, 0.5, 0], [4, 5, 6, 0, 1, 0.25]], dtype=float)
+        result = _preview(points)
+        self.assertEqual(result[0][:3], [1.0, -2.0, -3.0])
+        self.assertEqual(result[0][4:], [255, 128, 0])
+        self.assertEqual(_point_color_info(result, {"rgb": 1, "missing": 0, "unknown": 0})["status"], "approximate")
+        self.assertEqual(_point_color_info(result, {"rgb": 1, "missing": 1, "unknown": 0})["status"], "partial")
+        self.assertEqual(_point_color_info(result, None)["status"], "unknown")
+        self.assertEqual(_point_color_info(_preview(points[:, :3]), None)["status"], "unavailable")
+        mesh = _preview_mesh(points[:, :3], 2, np.array([[255, 128, 0], [0, 255, 64]]))
+        self.assertEqual(mesh[0][4:], [255, 128, 0])
+        self.assertEqual(mesh[1][4:], [0, 255, 64])
+
+    def test_direct_preview_rgb_uses_actual_samples_and_does_not_fabricate_missing_rgb(self):
+        import server
+        from sensor_drivers.base import SensorFrame
+        depth = np.full((4, 4), 1000, dtype=np.uint16)
+        rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+        rgb[1, 2] = [32, 149, 250]
+        fx, fy, cx, cy = 594.2 * 4 / 640, 591.0 * 4 / 480, 1.5, 1.5
+        point = np.array([[(2-cx)/fx, -(1-cy)/fy, -1]], dtype=np.float32)
+        frame = SensorFrame(rgb, depth, point, 0.0)
+        color = server._frame_response(frame, "kinect_v1_sdk", include_color=True)
+        self.assertEqual(color["points"][0][4:], [32, 149, 250])
+        self.assertTrue(color["pointColor"]["available"])
+        self.assertFalse(color["pointColor"]["registered"])
+        frame.color_rgb = None
+        missing = server._frame_response(frame, "kinect_v1_sdk", include_color=True)
+        self.assertEqual(len(missing["points"][0]), 4)
+        self.assertEqual(missing["pointColor"]["status"], "unavailable")
+
     def test_sensor_sequence_gaps_are_separate_from_mailbox_drops(self):
         from types import SimpleNamespace
 
@@ -398,6 +430,21 @@ class SyntheticFastMotionTests(unittest.TestCase):
         with mock.patch.object(self.engine.tracker, "track", return_value=lost) as track:
             self.engine.process(depth, color, 0.1)
         np.testing.assert_array_equal(track.call_args.args[0][:, 2], [1.5])
+
+    def test_real_tsdf_model_color_is_not_invented_when_rgb_is_missing(self):
+        _, depth, color = self.frame_at(0, 7)
+        color[:] = [230, 32, 16]
+        self.engine.process(depth, color, 0.0)
+        color_model = self.engine.model_points(2000, True)
+        self.assertEqual(color_model.shape[1], 6)
+        self.assertGreater(len(color_model), 100)
+        self.assertGreater(float(color_model[:, 3].mean()), 0.6)
+        self.assertEqual(self.engine.pipeline_info()["modelColorFrames"], {"rgb": 1, "missing": 0, "unknown": 0})
+        self.engine.release()
+        self.engine = ScanEngine(ScanSettings(), self.intr, clock=lambda: 0.0)
+        self.engine.process(depth, None, 0.0)
+        self.assertEqual(self.engine.model_points(2000, True).shape[1], 3)
+        self.assertEqual(self.engine.pipeline_info()["modelColorFrames"], {"rgb": 0, "missing": 1, "unknown": 0})
 
     def test_seven_kph_with_skipped_frames_and_correct_estimated_speed(self):
         for index in (0, 1, 2, 4, 6):  # 30 FPS source, then deliberately skip frames

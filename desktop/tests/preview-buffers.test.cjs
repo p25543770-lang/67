@@ -32,3 +32,16 @@ test("2D preview rejects malformed and oversized image payloads", () => {
   assert.equal(pixels.decodePixelFrame({ ...good, data: "AA==" }, 3), null);
   assert.equal(pixels.decodePixelFrame(null, 3), null);
 });
+
+
+test("RGB mode renders actual channels with sRGB conversion, missing RGB is neutral", () => {
+  const positions = new Float32Array(9), colors = new Float32Array(9), lut = new Float32Array(768);
+  const points = [[1, 2, 3, 1, 255, 128, 0], [4, 5, 6, 1], [7, 8, 9, 1, -1, -1, -1]];
+  const count = buffers.fillPointBuffers(points, 4, "rgb", positions, colors, lut);
+  assert.equal(count, 3);
+  assert.equal(colors[0], 1);
+  assert.ok(Math.abs(colors[1] - 0.21586) < 0.0001);
+  assert.equal(colors[2], 0);
+  for (let i = 3; i < 9; i++) assert.ok(Math.abs(colors[i] - 0.22) < 1e-6);
+  assert.deepEqual(points[0], [1, 2, 3, 1, 255, 128, 0]);
+});

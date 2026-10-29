@@ -49,6 +49,26 @@ class FakeAdapter(SensorAdapter):
         self.error = None
         self.warning = ""
         self.fail_after = None
+        self.tilt_angle = 0
+        self.tilt_commands = []
+        self.tilt_wait = 0.0
+
+    def tilt_scan_wait(self):
+        return self.tilt_wait
+
+    def tilt_status(self):
+        return {"angle": self.tilt_angle, "minAngle": -27, "maxAngle": 27,
+                "cooldownMs": 0, "scanWaitMs": int(self.tilt_wait * 1000),
+                "verifiedOnHardware": False}
+
+    def set_tilt(self, angle, *, deadline=None):
+        if isinstance(angle, bool) or not isinstance(angle, int) or not -27 <= angle <= 27:
+            raise ValueError("Invalid angle")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RuntimeError("Expired")
+        self.tilt_commands.append(angle)
+        self.tilt_angle = angle
+        return {**self.tilt_status(), "commandSent": True, "targetAngle": angle}
 
     def dependencies_available(self):
         return True
@@ -101,8 +121,9 @@ class FakeEngine:
         self.integrated = count
         return count
 
-    def model_points(self, limit):
-        return np.array([[0.0, 0.0, 1.5], [0.1, 0.0, 1.5]])
+    def model_points(self, limit, include_color=False):
+        points = np.array([[0.0, 0.0, 1.5], [0.1, 0.0, 1.5]])
+        return np.column_stack((points, np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))) if include_color else points
 
     def pipeline_info(self):
         return {"method": "TSDF тест", "verifiedOnHardware": False}
@@ -164,9 +185,9 @@ class ScanApiTests(unittest.TestCase):
         self.registry_patch.stop()
         self.tmp.cleanup()
 
-    def request(self, path, payload=None):
+    def request(self, path, payload=None, headers=None):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
-        req = Request(self.base + path, data=body, headers={"Content-Type": "application/json"})
+        req = Request(self.base + path, data=body, headers={"Content-Type": "application/json", **(headers or {})})
         try:
             with urlopen(req, timeout=8) as response:
                 raw = response.read()
@@ -188,6 +209,113 @@ class ScanApiTests(unittest.TestCase):
         status, response = self.request("/api/devices/connect", {"source": self.sensor.id})
         self.assertEqual(status, 200, response)
         self.assertTrue(response["frame"]["depth"])
+
+    def test_tilt_endpoint_requires_connected_sdk_and_explicit_same_origin_json(self):
+        path = "/api/devices/tilt"
+        headers = {"X-Depth-Studio-Tilt": "1"}
+        status, _ = self.request(path, {"source": self.sensor.id, "angle": 5}, headers)
+        self.assertEqual(status, 503)
+        self.assertEqual(self.sensor.tilt_commands, [])
+        self.connect()
+        status, _ = self.request(path, {"source": self.sensor.id, "angle": 5})
+        self.assertEqual(status, 400)  # no explicit motor-action header
+        status, _ = self.request(path, {"source": self.sensor.id, "angle": 5},
+                                 {**headers, "Origin": "https://attacker.invalid"})
+        self.assertEqual(status, 400)
+        status, _ = self.request(path, {"source": self.sensor.id, "angle": 5},
+                                 {**headers, "Content-Type": "text/plain"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.sensor.tilt_commands, [])
+        status, response = self.request(f"{path}?source={self.sensor.id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(response["angle"], 0)
+        status, response = self.request(path, {"source": self.sensor.id, "angle": 5}, headers)
+        self.assertEqual(status, 200, response)
+        self.assertTrue(response["commandSent"])
+        self.assertFalse(response["verifiedOnHardware"])
+        self.assertEqual(self.sensor.tilt_commands, [5])
+        status, _ = self.request(path, {"source": self.sensor.id, "angle": 28}, headers)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.sensor.tilt_commands, [5])
+        status, response = self.request(path, {"source": self.sensor.id, "angle": 6}, {**headers, "Origin": self.base})
+        self.assertEqual(status, 200, response)  # same-origin browser request
+        self.assertEqual(self.sensor.tilt_commands, [5, 6])
+
+    def test_tilt_is_blocked_during_scan_and_scan_waits_after_a_tilt(self):
+        self.connect()
+        self.sensor.tilt_wait = 4.0
+        before = self.sensor.captures
+        status, response = self.request("/api/scan/start", {"source": self.sensor.id})
+        self.assertEqual(status, 503, response)
+        self.assertIn("наклон", response["error"].lower())
+        self.assertEqual(self.sensor.captures, before)
+        self.sensor.tilt_wait = 0
+        self.start()
+        self.wait_for(lambda status: status["running"])
+        status, response = self.request("/api/devices/tilt", {"source": self.sensor.id, "angle": 5},
+                                        {"X-Depth-Studio-Tilt": "1"})
+        self.assertEqual(status, 503, response)
+        self.assertEqual(self.sensor.tilt_commands, [])
+        self.request("/api/scan/cancel", {})
+
+    def test_tilt_waiting_for_operation_lock_expires_and_never_moves(self):
+        self.connect()
+        result = []
+        parsed = threading.Event()
+        original_read = server.Handler.read_json
+
+        def notify_read(handler):
+            payload = original_read(handler)
+            parsed.set()
+            return payload
+
+        with mock.patch.object(server, "DEVICE_TILT_DEADLINE", 0.0), \
+                mock.patch.object(server.Handler, "read_json", notify_read):
+            with server.operation_lock:
+                worker = threading.Thread(target=lambda: result.append(self.request(
+                    "/api/devices/tilt", {"source": self.sensor.id, "angle": 5}, {"X-Depth-Studio-Tilt": "1"})))
+                worker.start()
+                self.assertTrue(parsed.wait(3))
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result[0][0], 503)
+        self.assertIn("устарел", result[0][1]["error"])
+        self.assertEqual(self.sensor.tilt_commands, [])
+
+    def test_scan_pending_rejects_tilt_before_sending_any_command(self):
+        self.connect()
+        with server.state_lock:
+            server.scan_start_pending = {"source": self.sensor.id}
+        try:
+            status, body = self.request("/api/devices/tilt", {"source": self.sensor.id, "angle": 5},
+                                        {"X-Depth-Studio-Tilt": "1"})
+            self.assertEqual(status, 503)
+            self.assertIn("запускается", body["error"])
+            self.assertEqual(self.sensor.tilt_commands, [])
+        finally:
+            with server.state_lock:
+                server.scan_start_pending = None
+
+    def test_color_mode_returns_rgb_from_model_and_completed_mesh(self):
+        self.connect()
+        status, direct = self.request(f"/api/frame?source={self.sensor.id}&color=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(direct["pointColor"]["available"])
+        self.assertFalse(direct["pointColor"]["registered"])
+        self.assertEqual(direct["points"][0][4:], [100, 100, 100])
+        self.start()
+        self.wait_for(lambda status: status["keyframes"] >= 1)
+        status, live = self.request("/api/scan?preview=0&color=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(live["pointColor"]["available"])
+        self.assertEqual(live["points"][0][4:], [255, 0, 0])
+        self.assertEqual(live["pointColor"]["status"], "unknown")
+        self.request("/api/scan/stop", {})
+        self.wait_for(lambda state: state["phase"] == "ready")
+        status, completed = self.request("/api/scan?preview=0&color=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(completed["pointColor"]["available"])
+        self.assertEqual(completed["points"][0][4:], [200, 50, 0])
 
     def start(self, **kwargs):
         status, response = self.request("/api/scan/start", {"source": self.sensor.id, **kwargs})
@@ -699,12 +827,22 @@ class ScanApiTests(unittest.TestCase):
         self.assertLessEqual(live["quality"]["frameChecksPassed"], live["quality"]["frameChecks"])
         self.assertNotEqual(server.scan_runner.active["engine"]._process.pid, os.getpid())
         self.assertFalse(live["verifiedOnHardware"])
+        status, colored = self.request("/api/scan?preview=0&color=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(colored["pointColor"]["available"])
+        self.assertEqual(colored["pointColor"]["status"], "approximate")
+        self.assertFalse(colored["pointColor"]["registered"])
+        self.assertEqual(len(colored["points"][0]), 7)
         self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
         final = self.wait_for(lambda s: s["phase"] in ("ready", "error"), timeout=30)
         self.assertEqual(final["phase"], "ready", final["error"])
         self.assertEqual(final["lastResultId"], started["passId"])
         self.assertGreater(final["resultMetrics"]["vertices"], 0)
         self.assertGreater(final["resultMetrics"]["triangles"], 0)
+        status, colored_final = self.request("/api/scan?preview=0&color=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(colored_final["pointColor"]["available"])
+        self.assertEqual(len(colored_final["points"][0]), 7)
         status, ply = self.request("/api/export?format=ply")
         self.assertEqual(status, 200)
         self.assertIn(b"element face ", ply)

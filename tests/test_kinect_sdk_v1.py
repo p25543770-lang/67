@@ -561,5 +561,134 @@ class ConversionTests(unittest.TestCase):
             sdk.depth_and_color_to_frame(np.zeros(10, dtype=np.uint16), 640, 480, None, None, None)
 
 
+
+
+class TiltMotorTests(unittest.TestCase):
+    """SDK tilt tests use fake .NET objects; no physical-device claims."""
+
+    class Motor(FakeSensor):
+        MinElevationAngle = -27
+        MaxElevationAngle = 27
+
+        def __init__(self):
+            super().__init__()
+            self._angle = 0
+            self.attempted = []
+            self.fail = False
+            self.fail_read = False
+            self.Start()
+
+        @property
+        def ElevationAngle(self):
+            if not self.IsRunning or self.fail_read:
+                raise RuntimeError("angle read failed")
+            return self._angle
+
+        @ElevationAngle.setter
+        def ElevationAngle(self, value):
+            self.attempted.append(value)
+            if self.fail:
+                raise RuntimeError("motor error")
+            self._angle = value
+
+    def setUp(self):
+        self.now = [100.0]
+        self.adapter = sdk.KinectSdkV1Adapter(clock=lambda: self.now[0])
+        self.sensor = self.Motor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+
+    def tearDown(self):
+        self.adapter.close()
+
+    def test_read_and_set_uses_running_sdk_sensor_and_never_claims_hardware(self):
+        status = self.adapter.tilt_status()
+        self.assertEqual((status["angle"], status["minAngle"], status["maxAngle"]), (0, -27, 27))
+        self.assertFalse(status["verifiedOnHardware"])
+        result = self.adapter.set_tilt(12)
+        self.assertTrue(result["commandSent"])
+        self.assertEqual(self.sensor.attempted, [12])
+        self.assertEqual(result["targetAngle"], 12)
+        self.assertGreaterEqual(result["scanWaitMs"], 8000)
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(13)
+        self.assertEqual(caught.exception.code, "tilt_cooldown")
+        self.assertEqual(self.sensor.attempted, [12])
+        self.now[0] += 8.0
+        self.assertEqual(self.adapter.tilt_scan_wait(), 0.0)
+        # Equal target is a no-op, not another motor write.
+        self.assertFalse(self.adapter.set_tilt(12)["commandSent"])
+        self.assertEqual(self.sensor.attempted, [12])
+
+    def test_input_and_device_limits_are_enforced_before_writing(self):
+        for bad in (-28, 28, 1.5, "3", True, None, float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.adapter.set_tilt(bad)
+        self.sensor.MinElevationAngle = -10
+        self.sensor.MaxElevationAngle = 10
+        with self.assertRaises(ValueError):
+            self.adapter.set_tilt(11)
+        self.assertEqual(self.sensor.attempted, [])
+
+    def test_failed_write_still_enters_cooldown_and_does_not_claim_success(self):
+        self.sensor.fail = True
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(-10)
+        self.assertEqual(caught.exception.code, "tilt_failed")
+        self.assertEqual(self.sensor.attempted, [-10])
+        self.assertGreater(self.adapter.tilt_scan_wait(), 0)
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(10)
+        self.assertEqual(self.sensor.attempted, [-10])
+
+    def test_limit_survives_reconnect_and_cannot_be_bypassed_by_rapid_api_calls(self):
+        for i in range(10):
+            self.adapter.set_tilt(1 if i % 2 == 0 else 0)
+            self.now[0] += 3.0
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(1)
+        self.adapter.close()
+        self.sensor = self.Motor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(1)
+        self.now[0] += 90.0
+        self.assertTrue(self.adapter.set_tilt(1)["commandSent"])
+
+    def test_expired_command_is_never_sent_and_blocking_setter_gets_full_settle_pause(self):
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(10, deadline=self.now[0] - 1)
+        self.assertEqual(caught.exception.code, "tilt_timeout")
+        self.assertEqual(self.sensor.attempted, [])
+        now = self.now
+
+        class SlowMotor(self.Motor):
+            @self.Motor.ElevationAngle.setter
+            def ElevationAngle(sensor, value):
+                now[0] += 30.0  # Native setter may block before the motor starts.
+                sensor._angle = value
+                sensor.attempted.append(value)
+
+        self.sensor = SlowMotor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        result = self.adapter.set_tilt(10, deadline=now[0] + 5)
+        self.assertTrue(result["commandSent"])
+        self.assertEqual(result["scanWaitMs"], 8000)
+        self.assertEqual(result["cooldownMs"], 3000)
+
+    def test_tilt_never_opens_a_device_and_read_errors_are_reported(self):
+        self.adapter.close()
+        with mock.patch.object(self.adapter, "_open_session") as opened:
+            with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+                self.adapter.tilt_status()
+            self.assertEqual(caught.exception.code, "tilt_not_connected")
+            opened.assert_not_called()
+        self.sensor = self.Motor()
+        self.sensor.fail_read = True
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.tilt_status()
+        self.assertEqual(caught.exception.code, "tilt_read_failed")
+
+
 if __name__ == "__main__":
     unittest.main()

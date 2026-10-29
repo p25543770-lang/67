@@ -231,8 +231,8 @@ class IsolatedScanEngine:
     def pipeline_info(self):
         return self._call("pipeline")
 
-    def model_points(self, max_points=14000):
-        return self._call("model_points", max_points)
+    def model_points(self, max_points=14000, include_color=False):
+        return self._call("model_points", max_points, include_color)
 
     def finish(self, up_world=None):
         import numpy as np

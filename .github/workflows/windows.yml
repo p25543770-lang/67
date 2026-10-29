@@ -336,6 +336,10 @@ jobs:
           if (-not (Test-Path $python)) { Write-Output '::error::Встроенный Python не найден.'; exit 1 }
           & $python -c "import os,server,scan_pipeline; root=os.path.normcase(os.path.abspath(os.environ['DEPTH_STUDIO_EXPECT_RESOURCES'])); paths=[os.path.normcase(os.path.abspath(server.__file__)),os.path.normcase(os.path.abspath(scan_pipeline.__file__))]; print('Installed modules:', paths); assert all(os.path.commonpath([root,p]) == root for p in paths), paths"
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_kinect_sdk_v1.py -k TiltMotorTests -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Fake SDK motor tests failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k tilt -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Motor API interlock tests failed.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка установленного Open3D-конвейера на синтетическом кадре.'; exit 1 }
           & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_process_replays_saved_keyframes -v

@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 # Set the OpenMP/BLAS defaults before NumPy/Open3D are imported. An explicit
 # user setting is preserved; larger CPUs no longer inherit a fixed two-thread cap.
@@ -33,6 +33,7 @@ MAX_PREVIEW_POINTS = 9000
 # leave a sensor connected behind the user's back.
 DEVICE_CONNECT_DEADLINE = 14.0
 DEVICE_FRAME_DEADLINE = 6.0
+DEVICE_TILT_DEADLINE = 6.0
 ENV_ROOT = os.environ.get("DEPTH_STUDIO_ENV_ROOT", "")
 STATE_FILE = os.environ.get("DEPTH_STUDIO_STATE", "")
 REQUIRE_APP_ENV = os.environ.get("DEPTH_STUDIO_REQUIRE_APP_ENV") == "1"
@@ -150,7 +151,35 @@ def _encode_array(array, max_side=320, dtype=None):
     }
 
 
-def _frame_response(frame, source_id="kinect_v1"):
+def _approximate_preview_rgb(points, depth_mm, color_rgb, source_id):
+    """Same-pixel RGB for a depth preview; explicitly NOT calibrated/registered."""
+    import numpy as np
+
+    if source_id not in ("kinect_v1_sdk", "kinect_v1") or color_rgb is None or depth_mm is None:
+        return None, None
+    depth, color = np.asarray(depth_mm), np.asarray(color_rgb)
+    if depth.ndim != 2 or color.ndim != 3 or color.shape[2] < 3 or not depth.size or not color.size:
+        return None, None
+    h, w = depth.shape
+    ch, cw = color.shape[:2]
+    if min(h, w, ch, cw) < 2 or max(h, w, ch, cw) > 4096:
+        return None, None
+    xyz = np.asarray(points, dtype=np.float64)
+    z = -xyz[:, 2]
+    valid = np.isfinite(xyz).all(axis=1) & (z > 0)
+    safe_z = np.where(valid, z, 1.0)
+    u = np.rint(xyz[:, 0] / safe_z * (594.2 * w / 640.0) + (w - 1) / 2.0)
+    v = np.rint(-xyz[:, 1] / safe_z * (591.0 * h / 480.0) + (h - 1) / 2.0)
+    valid &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    rgb = np.full((len(xyz), 3), -1, dtype=np.int16)
+    if valid.any():
+        cols = np.clip(np.rint(u[valid] * (cw - 1) / (w - 1)), 0, cw - 1).astype(np.int64)
+        rows = np.clip(np.rint(v[valid] * (ch - 1) / (h - 1)), 0, ch - 1).astype(np.int64)
+        rgb[valid] = np.asarray(color[rows, cols, :3], dtype=np.uint8)
+    return rgb, valid
+
+
+def _frame_response(frame, source_id="kinect_v1", *, include_color=False):
     import numpy as np
 
     xyz = np.asarray(frame.points, dtype=np.float32).reshape((-1, 3))
@@ -159,13 +188,23 @@ def _frame_response(frame, source_id="kinect_v1"):
         xyz = xyz[::stride]
     # Use float64 for rounded JSON numbers, and avoid a Python loop per point.
     xyz64 = xyz.astype(np.float64, copy=False)
-    points = np.column_stack((np.round(xyz64, 4), np.round(np.linalg.norm(xyz64, axis=1), 3))).tolist()
+    columns = [np.round(xyz64, 4), np.round(np.linalg.norm(xyz64, axis=1), 3)]
+    point_color = None
+    if include_color:
+        rgb, valid = _approximate_preview_rgb(xyz64, frame.depth_mm, frame.color_rgb, source_id)
+        if rgb is not None:
+            columns.append(rgb)
+        point_color = {"available": bool(valid is not None and valid.any()),
+                       "status": "unavailable" if valid is None or not valid.any() else "approximate" if valid.all() else "partial",
+                       "registered": False, "synchronized": False, "verifiedOnHardware": False}
+    points = np.column_stack(columns).tolist()
     return {
         "source": source_id,
         "capturedAt": frame.captured_at,
         "color": _encode_array(frame.color_rgb, dtype=np.uint8),
         "depth": _encode_array(frame.depth_mm, dtype="<u2"),
         "points": points,
+        "pointColor": point_color,
         "calibration": frame.calibration,
         "warning": getattr(frame, "warning", ""),
     }
@@ -210,14 +249,14 @@ def _runner():
         return scan_runner
 
 
-def _scan_snapshot(include_preview=True):
+def _scan_snapshot(include_preview=True, include_color=False):
     with state_lock:
         runner = scan_runner
         pending = scan_start_pending
     # Starting can include opening a device or replaying a saved pass; expose it
     # without waiting on the runner's lock so the UI can still offer Stop/Cancel.
     if pending is None and runner is not None:
-        return runner.snapshot(include_preview=include_preview)
+        return runner.snapshot(include_preview=include_preview, include_color=include_color)
     return {
         "running": pending is not None, "phase": "starting" if pending is not None else "idle",
         "passId": None, "source": pending.get("source") if pending is not None else None,
@@ -412,7 +451,7 @@ def _disconnect_device(source_id):
     return {"ok": True}
 
 
-def _capture_connected(source_id, deadline=None):
+def _capture_connected(source_id, deadline=None, *, include_color=False):
     adapter = _adapter_for(source_id)
     with capture_lock:
         _ensure_no_capture()
@@ -425,7 +464,7 @@ def _capture_connected(source_id, deadline=None):
                 raise DeviceFrameTimeout()
             frame = adapter.capture()
             _validate_frame(frame)
-            response = _frame_response(frame, source_id)
+            response = _frame_response(frame, source_id, include_color=include_color)
             if _deadline_expired(deadline):
                 raise DeviceFrameTimeout()
         except Exception as exc:
@@ -433,6 +472,54 @@ def _capture_connected(source_id, deadline=None):
             _close_adapter(adapter)
             raise
     return response
+
+
+def _tilt_adapter(source_id):
+    if source_id != "kinect_v1_sdk":
+        raise RuntimeError("Наклон доступен только для Kinect 360 через Microsoft Kinect SDK 1.8.")
+    adapter = _adapter_for(source_id)
+    with state_lock:
+        current = connected_source
+    if current != source_id:
+        raise RuntimeError("Подключите Kinect через Microsoft Kinect SDK 1.8.")
+    if not callable(getattr(adapter, "tilt_status", None)) or not callable(getattr(adapter, "set_tilt", None)):
+        raise RuntimeError("Этот адаптер не поддерживает управление наклоном.")
+    return adapter
+
+
+def _tilt_status(source_id):
+    with capture_lock:
+        _ensure_no_capture()
+        return {"source": source_id, **_tilt_adapter(source_id).tilt_status()}
+
+
+def _set_tilt(payload, deadline=None):
+    source_id = str(payload.get("source", ""))
+    with capture_lock:
+        # Moving the camera during a pass can corrupt the map. Keep this check
+        # on the server, not merely in the UI, and serialize with capture/start.
+        _ensure_no_capture()
+        with state_lock:
+            pending = scan_start_pending
+        if pending is not None:
+            raise RuntimeError("Сканирование запускается: команда наклона отменена.")
+        if _deadline_expired(deadline):
+            raise RuntimeError("Запрос наклона устарел; команда мотору не отправлена.")
+        adapter = _tilt_adapter(source_id)
+        return {"ok": True, "source": source_id, **adapter.set_tilt(payload.get("angle"), deadline=deadline)}
+
+
+def _validate_tilt_request(headers):
+    # Motor actions must not be triggerable by a cross-origin HTML form or a
+    # browser's no-cors text/plain POST. No OPTIONS/CORS handler is exposed.
+    content_type = (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json" or headers.get("X-Depth-Studio-Tilt") != "1":
+        raise ValueError("Для управления наклоном нужен запрос приложения Depth Studio.")
+    origin = headers.get("Origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != (headers.get("Host") or "").lower() or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("Запрос наклона пришёл с другого источника.")
 
 
 def _require_scan_modules():
@@ -454,6 +541,11 @@ def _start_scan(payload):
         current = connected_source
     if current != source_id:
         raise RuntimeError("Источник не подключён. Сначала подключите выбранный датчик.")
+    # A successful SDK setter is not proof the motor is stationary. Enforce a
+    # minimum pause and still ask the operator to check it physically.
+    scan_wait = getattr(adapter, "tilt_scan_wait", lambda: 0.0)()
+    if scan_wait > 0:
+        raise RuntimeError(f"После наклона подождите не менее {math.ceil(scan_wait)} с и убедитесь, что мотор остановился.")
     _require_scan_modules()
     from scan_pipeline.camera import Intrinsics
     from scan_pipeline.config import MAX_FPS_PROFILE, ROBOT_PROFILE, ScanSettings
@@ -514,12 +606,18 @@ class Handler(BaseHTTPRequestHandler):
                                    "environment": _environment_info()})
             elif url.path == "/api/devices":
                 self.respond(200, _devices_response())
+            elif url.path == "/api/devices/tilt":
+                source_id = parse_qs(url.query).get("source", [""])[0]
+                self.respond(200, _tilt_status(source_id))
             elif url.path == "/api/frame":
                 source_id = parse_qs(url.query).get("source", [""])[0]
-                self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE))
+                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
+                self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE,
+                                                     include_color=include_color))
             elif url.path == "/api/scan":
                 include_preview = parse_qs(url.query).get("preview", [""])[0] != "0"
-                self.respond(200, _scan_snapshot(include_preview=include_preview))
+                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
+                self.respond(200, _scan_snapshot(include_preview=include_preview, include_color=include_color))
             elif url.path == "/api/scan/front":
                 include_color = parse_qs(url.query).get("color", [""])[0] == "1"
                 self.respond(200, _front_snapshot(include_color=include_color))
@@ -547,13 +645,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
+            if url.path == "/api/devices/tilt":
+                _validate_tilt_request(self.headers)
             payload = self.read_json()
             connect_deadline = time.monotonic() + DEVICE_CONNECT_DEADLINE if url.path == "/api/devices/connect" else None
+            tilt_deadline = time.monotonic() + DEVICE_TILT_DEADLINE if url.path == "/api/devices/tilt" else None
             if url.path == "/api/scan/start":
                 response = _start_scan_with_pending(payload)
             else:
                 with operation_lock:
-                    response = self._device_or_scan_command(url.path, payload, connect_deadline)
+                    response = self._device_or_scan_command(url.path, payload, connect_deadline, tilt_deadline)
             if response is None:
                 self.send_error(404)
             else:
@@ -563,13 +664,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self.respond(503, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
 
-    def _device_or_scan_command(self, path, payload, connect_deadline=None):
+    def _device_or_scan_command(self, path, payload, connect_deadline=None, tilt_deadline=None):
         if path == "/api/devices/probe":
             response = _probe_devices()
         elif path == "/api/devices/connect":
             response = _connect_device(str(payload.get("source", "")), connect_deadline)
         elif path == "/api/devices/disconnect":
             response = _disconnect_device(str(payload.get("source", "")))
+        elif path == "/api/devices/tilt":
+            response = _set_tilt(payload, tilt_deadline)
         elif path == "/api/scan/stop":
             response = _runner().stop()
             if not response.get("ok"):

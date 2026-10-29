@@ -2016,3 +2016,16 @@ input[type="range"] {
   .scan-actions { width: 100%; margin: 0; }
   .pass-row { align-items: flex-start; flex-direction: column; }
 }
+
+/* Separate RGB/tilt mode. Movement is an explicit click, never a live slider. */
+.tilt-panel { padding: 13px 18px 14px; border-bottom: 1px solid #dce8de; background: #f5faf6; }
+.tilt-panel[hidden] { display: none; }
+.tilt-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tilt-header strong { display: block; color: #274b3a; font-size: 12px; }
+.tilt-header small { display: block; margin-top: 3px; color: #718779; font-size: 10px; }
+.tilt-badge { flex: none; font-size: 9px; font-weight: 700; letter-spacing: .05em; color: #8c6b35; }
+.tilt-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 8px; }
+.tilt-controls label { color: #3f5b4b; font-size: 11px; white-space: nowrap; }
+.tilt-controls input[type="range"] { flex: 1 1 120px; accent-color: #317353; min-width: 110px; }
+.tilt-controls button { font-size: 10px; padding: 7px 10px; }
+.tilt-note { color: #6c786b; font-size: 10px; line-height: 1.45; margin: 6px 0 0; }

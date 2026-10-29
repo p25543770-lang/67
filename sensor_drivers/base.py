@@ -7,8 +7,9 @@ from typing import Any
 
 @dataclass
 class SensorFrame:
-    """One synchronized sensor frame in camera coordinates.
+    """One sensor capture container in camera coordinates.
 
+    RGB and depth are not guaranteed to be registered or synchronized.
     ``color_rgb`` is an optional HxWx3 uint8 array. ``depth_mm`` is an optional
     HxW uint16 depth image in millimetres. ``points`` is an Nx3 float array in
     metres, with +Y up and the camera looking down -Z. Scan-only captures may
