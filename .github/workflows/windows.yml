@@ -95,7 +95,9 @@ jobs:
             Write-Output "::error::Python bridge tests failed: $escaped"
             exit $testExitCode
           }
-      - run: npm run test:desktop
+      - name: Desktop tests on Windows
+        timeout-minutes: 3
+        run: npm run test:desktop
       - uses: actions/download-artifact@v4
         with:
           name: depth-studio-renderer
