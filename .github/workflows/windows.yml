@@ -403,6 +403,19 @@ jobs:
             Write-Output '::error::Robot realtime report is incomplete or claims hardware verification.'; exit 1
           }
           Write-Output "::notice title=Windows robot simulated realtime::$json"
+          # The requested robot can rotate about 90°/s, with a slightly
+          # down-tilted front camera. 10° is just a synthetic assumption.
+          foreach ($profile in @('max_fps', 'robot')) {
+            $results = & $python $robotBench --frames 30 --steps 1 --scene clutter --speed-kmh 7 --yaw-deg-s 90 --tilt-deg 10 --profile $profile
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Fast-turn robot benchmark failed: $profile"; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Fast-turn benchmark returned no result.'; exit 1 }
+            $data = $json | ConvertFrom-Json
+            if ($data.yawDegS -ne 90 -or $data.cameraTiltDeg -ne 10 -or $data.hardwareVerified -ne $false) {
+              Write-Output '::error::Fast-turn report has incorrect parameters.'; exit 1
+            }
+            Write-Output "::notice title=Windows fast robot turn $($profile)::$json"
+          }
           try {
             $ciCpu = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()
             $ciRam = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)

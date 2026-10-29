@@ -38,6 +38,8 @@ def main() -> None:
     parser.add_argument("--scene", choices=("clutter", "plain", "bench"), default="clutter")
     parser.add_argument("--speed-kmh", type=float, default=5.0)
     parser.add_argument("--yaw-deg-s", type=float, default=20.0)
+    parser.add_argument("--tilt-deg", type=float, default=None,
+                        help="robot camera tilt downward from horizontal (0–45 degrees)")
     parser.add_argument("--front-poll-ms", type=int, default=0,
                         help="also poll raw camera view at this interval (0 disables)")
     args = parser.parse_args()
@@ -46,6 +48,8 @@ def main() -> None:
     if (not math.isfinite(args.speed_kmh) or not 0 <= args.speed_kmh <= 12 or
             not math.isfinite(args.yaw_deg_s) or abs(args.yaw_deg_s) > 120):
         parser.error("speed must be 0–12 km/h and yaw -120–120 deg/s")
+    if args.tilt_deg is not None and (not math.isfinite(args.tilt_deg) or not 0 <= args.tilt_deg <= 45):
+        parser.error("--tilt-deg must be between 0 and 45 degrees downward")
     if args.front_poll_ms < 0 or 0 < args.front_poll_ms < 50:
         parser.error("--front-poll-ms must be 0 or at least 50")
 
@@ -80,9 +84,12 @@ def main() -> None:
     intr = Intrinsics.kinect_v1()
     scene = None
     seed_offset = 0
+    effective_tilt = None
     if args.trajectory == "robot":
         import synthetic_robot as robot
-        trajectory = robot.robot_trajectory(args.frames, args.speed_kmh, args.yaw_deg_s, scene=args.scene)
+        trajectory = robot.robot_trajectory(args.frames, args.speed_kmh, args.yaw_deg_s,
+                                            scene=args.scene, tilt_deg=args.tilt_deg)
+        effective_tilt = round(math.degrees(math.asin(-trajectory.poses[0][1, 2])), 2)
         scene, seed_offset = robot.robot_scene(args.scene), 2000
     else:
         trajectory = room.orbit(frames=330, look="inward")
@@ -212,6 +219,7 @@ def main() -> None:
                 "scene": args.scene if args.trajectory == "robot" else None,
                 "speedKmh": args.speed_kmh if args.trajectory == "robot" else None,
                 "yawDegS": args.yaw_deg_s if args.trajectory == "robot" else None,
+                "cameraTiltDeg": effective_tilt,
                 "processingIsolation": "process" if use_process else "inprocess",
                 "scheduledFrames": args.frames,
                 "sensorScheduleMisses": sensor.scheduled_misses,

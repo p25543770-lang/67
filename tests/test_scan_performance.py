@@ -383,6 +383,33 @@ class SyntheticFastMotionTests(unittest.TestCase):
         self.assertEqual(self.engine.process(depth, color, 0.3)["state"], "tracking")
         self.assertLess(self.engine.last_speed_mps, 0.1)
 
+    def test_robot_rejects_an_estimated_ninety_degrees_per_second(self):
+        # With strong fake ICP diagnostics, isolate the existing angular speed
+        # guard from geometry/registration variability across Open3D builds.
+        import open3d as o3d
+        import scan_pipeline.tracking as tracking
+        from types import SimpleNamespace
+
+        self.engine.release()
+        self.engine = ScanEngine(ScanSettings.for_profile(ROBOT_PROFILE), self.intr, clock=lambda: 0.0)
+        _, depth, color = self.frame_at(0.0, 0)
+        self.assertEqual(self.engine.process(depth, color, 0.0)["state"], "tracking")
+        before = self.engine.integrated
+        previous = self.engine.last_pose.copy()
+        theta = np.radians(3.0)  # 90°/s at a 30 Hz source
+        rotation = np.eye(4)
+        rotation[:3, :3] = [[np.cos(theta), 0, np.sin(theta)], [0, 1, 0],
+                            [-np.sin(theta), 0, np.cos(theta)]]
+        fake = SimpleNamespace(transformation=rotation, fitness=1.0)
+        with mock.patch.object(o3d.pipelines.registration, "registration_icp", return_value=fake), \
+                mock.patch.object(tracking, "registration_diagnostics", return_value=(0.001, 0.01)):
+            event = self.engine.process(depth, color, 1.0 / 30.0)
+        self.assertEqual(event["state"], "too_fast")
+        self.assertEqual(self.engine.tracker.last_result.reason, "speed_limit")
+        self.assertFalse(event["integrated"])
+        self.assertEqual(self.engine.integrated, before)
+        np.testing.assert_array_equal(self.engine.last_pose, previous)
+
     def test_inconsistent_fast_motion_is_not_integrated_as_a_good_pose(self):
         rejected = None
         for index in (0, 1, 2, 4, 6, 8, 10):

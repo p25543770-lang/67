@@ -23,6 +23,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--speed-kmh", type=float, default=5.0)
     parser.add_argument("--yaw-deg-s", type=float, default=20.0)
+    parser.add_argument("--tilt-deg", type=float, default=None,
+                        help="camera tilt downward from horizontal (0–45 degrees)")
     parser.add_argument("--frames", type=int, default=45)
     parser.add_argument("--steps", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--profile", choices=("robot", "max_fps", "standard"), default="robot")
@@ -33,6 +35,8 @@ def main():
     if (not math.isfinite(args.speed_kmh) or not 0 <= args.speed_kmh <= 12 or
             not math.isfinite(args.yaw_deg_s) or abs(args.yaw_deg_s) > 120):
         parser.error("speed must be 0–12 km/h and yaw -120–120 deg/s")
+    if args.tilt_deg is not None and (not math.isfinite(args.tilt_deg) or not 0 <= args.tilt_deg <= 45):
+        parser.error("--tilt-deg must be between 0 and 45 degrees downward")
     if not 2 <= args.frames <= 150 or any(step < 1 or step > args.frames for step in args.steps):
         parser.error("frames must be 2–150; each step must be between 1 and frames")
     if abs(args.color_shift_px) > 100:
@@ -55,7 +59,9 @@ def main():
     from scan_pipeline.engine import ScanEngine
 
     intr = Intrinsics.kinect_v1()
-    trajectory = robot.robot_trajectory(args.frames, args.speed_kmh, args.yaw_deg_s, scene=args.scene)
+    trajectory = robot.robot_trajectory(args.frames, args.speed_kmh, args.yaw_deg_s,
+                                        scene=args.scene, tilt_deg=args.tilt_deg)
+    effective_tilt = math.degrees(math.asin(-trajectory.poses[0][1, 2]))
     scene = robot.robot_scene(args.scene)
     needed = sorted({index for step in args.steps for index in range(0, args.frames, step)})
     frames = {}
@@ -91,6 +97,7 @@ def main():
                 "profile": args.profile,
                 "speedKmh": args.speed_kmh,
                 "yawDegS": args.yaw_deg_s,
+                "cameraTiltDeg": round(effective_tilt, 2),
                 "scheduledFrames": args.frames,
                 "inputEveryNthFrame": step,
                 "framesProcessed": processed,

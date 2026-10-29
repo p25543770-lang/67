@@ -30,6 +30,22 @@ class RobotTrajectoryTests(unittest.TestCase):
         expected_chord = 2 * (7 / 3.6) / math.radians(20) * math.sin(math.radians(10))
         self.assertAlmostEqual(distance, expected_chord, places=6)
         self.assertAlmostEqual(turn.times[-1], 1.0)
+        right = robot.robot_trajectory(frames=31, speed_kmh=7, yaw_deg_s=90, tilt_deg=10)
+        left = robot.robot_trajectory(frames=31, speed_kmh=7, yaw_deg_s=-90, tilt_deg=10)
+        self.assertAlmostEqual(relative_motion(right.poses[0], right.poses[-1])[1], 90, places=5)
+        self.assertAlmostEqual(relative_motion(left.poses[0], left.poses[-1])[1], 90, places=5)
+        self.assertAlmostEqual(right.poses[-1][0, 3], -left.poses[-1][0, 3], places=6)
+
+    def test_camera_downward_tilt_can_be_varied_without_changing_the_arc(self):
+        base = robot.robot_trajectory(frames=31, speed_kmh=7, yaw_deg_s=90, tilt_deg=0)
+        tilted = robot.robot_trajectory(frames=31, speed_kmh=7, yaw_deg_s=90, tilt_deg=10)
+        for level, down in zip(base.poses, tilted.poses):
+            np.testing.assert_allclose(level[:3, 3], down[:3, 3])
+            self.assertAlmostEqual(down[1, 2], -math.sin(math.radians(10)), places=7)
+        with self.assertRaises(ValueError):
+            robot.robot_trajectory(tilt_deg=91)
+        with self.assertRaises(ValueError):
+            robot.robot_trajectory(tilt_deg=float("nan"))
 
     def test_scene_geometry_is_explicit_and_no_global_room_is_mutated(self):
         old = room.ROOM_LO.copy(), room.ROOM_HI.copy(), len(room.BOXES)

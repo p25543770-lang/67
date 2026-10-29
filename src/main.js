@@ -198,7 +198,7 @@ document.querySelector("#app").innerHTML = `
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
           <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
           <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="robot">Робот · осторожная сверка</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
-          <p class="movement-hint" id="scanProfileHint">Режим «Робот» чаще проверяет спорные позы и отбраковывает их при недостатке данных: трекинг может прерваться раньше. Это не управление роботом и не гарантия карты. Продолжение сохраняет профиль прохода. 320×240; 7 км/ч не гарантируются, физический Kinect не проверен.</p>
+          <p class="movement-hint" id="scanProfileHint">Режим «Робот» отбраковывает спорные позы и может быстро потерять трекинг. При стандартном пределе оценка ICP выше ≈57°/с не принимается; реальное вращение может быть оценено неверно. Это не управление роботом и не гарантия карты. Продолжение сохраняет профиль прохода. 320×240; Kinect физически не проверен.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">

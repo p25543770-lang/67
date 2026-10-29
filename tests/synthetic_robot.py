@@ -16,16 +16,21 @@ from synthetic_room import BOXES, ROOM_HI, ROOM_LO, Trajectory
 FPS = 30.0
 
 
-def robot_trajectory(frames=45, speed_kmh=5.0, yaw_deg_s=20.0, *, scene="clutter") -> Trajectory:
-    """Known camera poses on a horizontal constant-speed, constant-yaw arc."""
+def robot_trajectory(frames=45, speed_kmh=5.0, yaw_deg_s=20.0, *, scene="clutter",
+                     tilt_deg=None) -> Trajectory:
+    """Known planar arc; optional camera tilt is downward from horizontal."""
     if frames < 2 or speed_kmh < 0:
         raise ValueError("Need at least two frames and a non-negative speed")
+    if tilt_deg is not None and (not math.isfinite(tilt_deg) or not 0 <= tilt_deg <= 45):
+        raise ValueError("Camera tilt must be between 0 and 45 degrees downward")
     if scene == "bench":
         start_x, start_z, height, heading, tilt = 0.9, 0.0, 1.3, -math.pi / 2, 0.55
     elif scene in ("clutter", "plain"):
         start_x, start_z, height, heading, tilt = 0.0, -6.0, 1.1, 0.0, 0.12
     else:
         raise ValueError("Unknown synthetic scene")
+    if tilt_deg is not None:
+        tilt = math.tan(math.radians(tilt_deg))
     speed = speed_kmh / 3.6
     yaw_rate = math.radians(yaw_deg_s)
     poses, times = [], []
