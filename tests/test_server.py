@@ -46,14 +46,6 @@ class RegistryTests(unittest.TestCase):
             self.assertIsNone(preferred_source({"kinect_v1_sdk": {"state": "no_device"}}))
         self.assertEqual(device_family("kinect_v1_sdk"), device_family("kinect_v1"))
 
-    def test_ply_and_obj_export_are_point_clouds(self):
-        points = [[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]]
-        ply = server._cloud_text("ply", points).decode("ascii")
-        obj = server._cloud_text("obj", points).decode("ascii")
-        self.assertIn("element vertex 2", ply)
-        self.assertIn("1.000000 2.000000 3.000000", ply)
-        self.assertIn("v 1.000000 2.000000 3.000000", obj)
-        self.assertNotIn("f ", obj)
 
 
 class ApiTests(unittest.TestCase):

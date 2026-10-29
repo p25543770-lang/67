@@ -25,12 +25,14 @@ Python and avoids leaking event handlers.
 from __future__ import annotations
 
 import array
+import ctypes
 import importlib
 import importlib.util
 import os
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from .base import SensorAdapter, SensorFrame, requirement
@@ -41,9 +43,9 @@ SDK_RELATIVE_PATH = os.path.join("Microsoft SDKs", "Kinect", "v1.8", "Assemblies
 SDK_DOWNLOAD_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=40278"
 SDK_ASSEMBLY_ENV = "DEPTH_STUDIO_KINECT_SDK_DLL"
 
-DEFAULT_MAX_FPS = 15.0
+DEFAULT_MAX_FPS = 30.0
 DEFAULT_FRAME_TIMEOUT = 1.5
-POLL_INTERVAL = 0.01
+POLL_INTERVAL = 0.002
 # Kinect v1 даёт 640x480 при 30 к/с; внутренние параметры — приближённые.
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
@@ -53,6 +55,16 @@ MIN_DEPTH_M = 0.45
 MAX_DEPTH_M = 4.0
 # Три младших бита пикселя DepthImageFrame содержат индекс игрока, глубина — в старших.
 PLAYER_INDEX_BITS = 3
+
+# The SDK exposes -27..27 degrees. The mechanism is not rated for continual
+# movement: enforce conservative, process-local limits even for API callers.
+TILT_MIN_DEG = -27
+TILT_MAX_DEG = 27
+TILT_MIN_INTERVAL_S = 3.0
+TILT_WINDOW_S = 120.0
+TILT_MAX_PER_WINDOW = 10
+TILT_SERIES_REST_S = 20.0
+TILT_SETTLE_S = 8.0
 
 
 class KinectSdkUnavailable(RuntimeError):
@@ -110,9 +122,9 @@ def find_sdk_assembly(env: dict[str, str] | None = None) -> str | None:
 def _pixels_to_bytes(pixels: Any, item_size: int = 2) -> bytes:
     """Read a .NET ``byte[]``/``short[]`` buffer as raw bytes.
 
-    ``short[]`` is what ``DepthImageFrame.GetPixels`` returns; depth values above
-    8 m (``> 32767`` after the ``<< 3`` shift) arrive as negative ``Int16``, so the
-    conversion must accept both ranges — the two's-complement bytes are identical.
+    ``short[]`` is what ``DepthImageFrame.CopyPixelDataTo`` fills; packed values
+    above ``32767`` can arrive as negative ``Int16``, including unknown-depth
+    codes. Preserve the two's-complement bytes before normalising the codes.
     ``bytes(bytearray(...))`` is *not* usable for depth: it rejects values > 255.
     """
     if pixels is None:
@@ -168,12 +180,13 @@ def _dispose(frame: Any) -> None:
 def depth_pixels_to_metres(raw: Any) -> Any:
     """Convert DepthImageFrame pixels to metres.
 
-    Values are millimetres shifted left by :data:`PLAYER_INDEX_BITS`; zero means
-    "no measurement" and stays zero.
+    Values are millimetres shifted left by :data:`PLAYER_INDEX_BITS`.
+    Missing, overflow and undocumented SDK values beyond 4 m become zero.
     """
     import numpy as np
 
     millimetres = (np.asarray(raw, dtype=np.uint16) >> PLAYER_INDEX_BITS).astype(np.float32)
+    millimetres = np.where(millimetres <= int(MAX_DEPTH_M * 1000), millimetres, 0.0)
     return millimetres / 1000.0
 
 
@@ -186,8 +199,9 @@ def depth_and_color_to_frame(
     color_height: int | None,
     *,
     captured_at: float | None = None,
+    include_points: bool = True,
 ) -> SensorFrame:
-    """Pure conversion step, kept separate so it can be tested without a sensor."""
+    """Convert SDK images; scan capture can omit the unused preview cloud."""
     import numpy as np
 
     if isinstance(depth_raw, (bytes, bytearray, memoryview)):
@@ -200,7 +214,14 @@ def depth_and_color_to_frame(
             f"Кадр глубины короче ожидаемого: {pixels.size} пикселей вместо {expected}."
         )
     depth_u16 = pixels[:expected].reshape(height, width)
-    depth_m = depth_pixels_to_metres(depth_u16)
+    # Packed SDK depth is already integer millimetres in the upper bits.
+    # Avoid a full-frame float conversion and a lossy round trip through metres.
+    depth_mm = np.right_shift(depth_u16, PLAYER_INDEX_BITS)
+    # SDK 1.8's default Kinect v1 stream reports MaxDepth=4000 mm. Values
+    # 4095 (TooFarDepth) and -1 (unsigned 8191 after shifting) are sentinel
+    # codes, not distant surfaces. Do not let a 10 m application limit turn
+    # these or other undocumented >4 m SDK values into fabricated points.
+    depth_mm[depth_mm > int(MAX_DEPTH_M * 1000)] = 0
 
     color_rgb = None
     if color_bytes:
@@ -211,28 +232,26 @@ def depth_and_color_to_frame(
             # ColorImageFrame даёт BGRA; приложению нужен RGB.
             color_rgb = np.ascontiguousarray(bgra[:, :, 2::-1])
 
-    sampled_mm = depth_u16[::4, ::4]
-    sampled_z = depth_m[::4, ::4]
-    v, u = np.indices(sampled_z.shape, dtype=np.float32)
-    u = u * 4
-    v = v * 4
-    fx = FX_640 * (width / float(DEFAULT_WIDTH))
-    fy = FY_640 * (height / float(DEFAULT_HEIGHT))
-    cx = (width - 1.0) / 2.0
-    cy = (height - 1.0) / 2.0
-    valid = (
-        (sampled_mm > 0)
-        & np.isfinite(sampled_z)
-        & (sampled_z >= MIN_DEPTH_M)
-        & (sampled_z <= MAX_DEPTH_M)
-    )
-    x = (u - cx) * sampled_z / fx
-    y = -(v - cy) * sampled_z / fy
-    points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
-
-    depth_mm = np.zeros((height, width), dtype=np.uint16)
-    valid_full = (depth_u16 > 0) & np.isfinite(depth_m) & (depth_m > 0)
-    depth_mm[valid_full] = np.clip(depth_m[valid_full] * 1000.0, 1, 65535).astype(np.uint16)
+    points = None
+    if include_points:
+        sampled_mm = depth_mm[::4, ::4]
+        sampled_z = sampled_mm.astype(np.float32) / 1000.0
+        v, u = np.indices(sampled_z.shape, dtype=np.float32)
+        u = u * 4
+        v = v * 4
+        fx = FX_640 * (width / float(DEFAULT_WIDTH))
+        fy = FY_640 * (height / float(DEFAULT_HEIGHT))
+        cx = (width - 1.0) / 2.0
+        cy = (height - 1.0) / 2.0
+        valid = (
+            (sampled_mm > 0)
+            & np.isfinite(sampled_z)
+            & (sampled_z >= MIN_DEPTH_M)
+            & (sampled_z <= MAX_DEPTH_M)
+        )
+        x = (u - cx) * sampled_z / fx
+        y = -(v - cy) * sampled_z / fy
+        points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
 
     return SensorFrame(
         color_rgb,
@@ -287,13 +306,44 @@ class _SdkSession:
         height = int(getattr(frame, "Height", default_height) or default_height)
         return width, height
 
-    def grab_depth(self, timeout: float) -> tuple[int, int, bytes] | None:
+    @staticmethod
+    def _copy_pixels(frame: Any, item_size: int, expected_length: int) -> bytes:
+        """Copy pixels before Dispose using the actual Kinect SDK 1.8 API.
+
+        SDK 1.8 offers a native-buffer overload as well as managed arrays.
+        Passing an IntPtr avoids iterating hundreds of thousands of CLR values
+        in Python. The length is *elements*, not bytes (including for Int16).
+        The ctypes buffer stays alive until after the SDK copy and bytes copy.
+        """
+        count = int(getattr(frame, "PixelDataLength", expected_length))
+        if count != expected_length:
+            raise RuntimeError(f"Некорректная длина кадра SDK: {count}, ожидалось {expected_length}.")
+        system = importlib.import_module("System")
+        if count > 0 and hasattr(system, "IntPtr") and hasattr(system, "Int64"):
+            buffer = ctypes.create_string_buffer(count * item_size)
+            address = system.IntPtr(system.Int64(ctypes.addressof(buffer)))
+            try:
+                frame.CopyPixelDataTo(address, count)
+            except TypeError:
+                # Some test doubles/SDK variants only implement the managed
+                # overload. Real copy errors are not silently swallowed.
+                pass
+            else:
+                return bytes(buffer)
+        element_type = system.Int16 if item_size == 2 else system.Byte
+        pixels = system.Array.CreateInstance(element_type, count)
+        frame.CopyPixelDataTo(pixels)
+        return _pixels_to_bytes(pixels, item_size)
+
+    def grab_depth(self, timeout: float) -> tuple[int, int, bytes, int | None] | None:
         frame = self._read_frame(self.sensor.DepthStream, timeout)
         if frame is None:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, _pixels_to_bytes(frame.GetPixels(), 2)
+            number = getattr(frame, "FrameNumber", None)
+            number = int(number) if number is not None else None
+            return width, height, self._copy_pixels(frame, 2, width * height), number
         finally:
             _dispose(frame)
 
@@ -303,7 +353,7 @@ class _SdkSession:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, _pixels_to_bytes(frame.GetPixels(), 1)
+            return width, height, self._copy_pixels(frame, 1, width * height * 4)
         finally:
             _dispose(frame)
 
@@ -352,6 +402,7 @@ class KinectSdkV1Adapter(SensorAdapter):
     limitations = (
         "Kinect v1, не Kinect One. Модуль не проверен на физическом датчике. Цвет и глубина не совмещены в общей системе координат, "
         "калибровка приближённая, ICP может дрейфовать на однотонных стенах и при быстром движении. "
+        "SDK ограничен 4 м: программная настройка 10 м не увеличивает дальность датчика. "
         "Нужен штатный блок питания/USB-адаптер Kinect."
     )
     package_names = ("pythonnet", "numpy")
@@ -362,20 +413,27 @@ class KinectSdkV1Adapter(SensorAdapter):
         *,
         max_fps: float = DEFAULT_MAX_FPS,
         frame_timeout: float = DEFAULT_FRAME_TIMEOUT,
-        color_timeout: float = 0.4,
+        color_timeout: float = 0.015,
         env: dict[str, str] | None = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
         self.max_fps = max(1.0, float(max_fps))
         self.frame_timeout = max(0.05, float(frame_timeout))
-        self.color_timeout = max(0.05, float(color_timeout))
+        self.color_timeout = max(0.0, float(color_timeout))
         self._env = env
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.RLock()
         self._session: _SdkSession | None = None
         self._last_capture: float | None = None
+        self._last_color_warning = ""
+        # Keep this history across disconnect/reconnect so the UI cannot bypass
+        # the limiter. It cannot account for other programs or app restarts.
+        self._tilt_attempts = deque()
+        self._tilt_last_attempt = None
+        self._tilt_settle_until = 0.0
+        self._tilt_series_count = 0
 
     # ------------------------------------------------------------------ status
     def _env_map(self) -> dict[str, str]:
@@ -538,6 +596,11 @@ class KinectSdkV1Adapter(SensorAdapter):
             return self._session
 
     def _throttle(self) -> None:
+        # The 30-FPS SDK stream already blocks until a new depth frame exists.
+        # An extra 33-ms sleep at that cap can make a slightly late reader miss
+        # a frame. Preserve the software limiter for explicitly lower limits.
+        if self.max_fps >= DEFAULT_MAX_FPS:
+            return
         interval = 1.0 / self.max_fps
         if self._last_capture is None:
             self._last_capture = self._clock()
@@ -547,11 +610,101 @@ class KinectSdkV1Adapter(SensorAdapter):
             self._sleep(remaining)
         self._last_capture = self._clock()
 
+    def _tilt_session_locked(self):
+        # A command must never open or reconnect a sensor implicitly.
+        session = self._session
+        if session is None or session.closed or not getattr(session.sensor, "IsRunning", False):
+            raise KinectSdkUnavailable(
+                "tilt_not_connected", "Наклон доступен только после подключения Kinect через SDK 1.8.",
+                "Подключите датчик и убедитесь, что он запущен.")
+        return session
+
+    def _tilt_timing_locked(self, now):
+        while self._tilt_attempts and now - self._tilt_attempts[0] >= TILT_WINDOW_S:
+            self._tilt_attempts.popleft()
+        elapsed = None if self._tilt_last_attempt is None else max(0.0, now - self._tilt_last_attempt)
+        if elapsed is not None and elapsed >= TILT_SERIES_REST_S:
+            self._tilt_series_count = 0
+        interval = max(0.0, TILT_MIN_INTERVAL_S - elapsed) if elapsed is not None else 0.0
+        rest = max(0.0, TILT_SERIES_REST_S - elapsed) if elapsed is not None and self._tilt_series_count >= TILT_MAX_PER_WINDOW else 0.0
+        window = max(0.0, TILT_WINDOW_S - (now - self._tilt_attempts[0])) if len(self._tilt_attempts) >= TILT_MAX_PER_WINDOW else 0.0
+        settle = max(0.0, self._tilt_settle_until - now)
+        return max(interval, rest, window), settle
+
+    def tilt_scan_wait(self):
+        """Minimum pause after a command; not proof that the motor has stopped."""
+        with self._lock:
+            return self._tilt_timing_locked(self._clock())[1]
+
+    def _tilt_status_locked(self, sensor, *, allow_read_error=False):
+        try:
+            low = max(TILT_MIN_DEG, int(getattr(sensor, "MinElevationAngle", TILT_MIN_DEG)))
+            high = min(TILT_MAX_DEG, int(getattr(sensor, "MaxElevationAngle", TILT_MAX_DEG)))
+            if low > high:
+                raise ValueError("некорректные ограничения SDK")
+            angle = int(sensor.ElevationAngle)
+            if not low <= angle <= high:
+                raise ValueError("SDK вернул угол вне диапазона")
+        except Exception as exc:
+            if not allow_read_error:
+                raise KinectSdkUnavailable("tilt_read_failed", f"Не удалось прочитать угол Kinect: {exc}",
+                                           "Проверьте питание мотора и SDK; Kinect физически не проверен.") from exc
+            low, high, angle = TILT_MIN_DEG, TILT_MAX_DEG, None
+        cooldown, settle = self._tilt_timing_locked(self._clock())
+        return {"angle": angle, "minAngle": low, "maxAngle": high,
+                "cooldownMs": int(max(0.0, cooldown) * 1000 + 0.999),
+                "scanWaitMs": int(max(0.0, settle) * 1000 + 0.999),
+                "verifiedOnHardware": False}
+
+    def tilt_status(self):
+        with self._lock:
+            return self._tilt_status_locked(self._tilt_session_locked().sensor)
+
+    def set_tilt(self, angle, *, deadline=None):
+        if isinstance(angle, bool) or not isinstance(angle, int) or not TILT_MIN_DEG <= angle <= TILT_MAX_DEG:
+            raise ValueError("Угол должен быть целым числом от −27° до +27°.")
+        with self._lock:
+            sensor = self._tilt_session_locked().sensor
+            status = self._tilt_status_locked(sensor)
+            if not status["minAngle"] <= angle <= status["maxAngle"]:
+                raise ValueError("Угол находится за пределами диапазона этого Kinect.")
+            if status["cooldownMs"]:
+                seconds = (status["cooldownMs"] + 999) // 1000
+                raise KinectSdkUnavailable("tilt_cooldown", f"Мотору нужен отдых: повторите через {seconds} с.",
+                                           "Мотор Kinect не рассчитан на частые движения.")
+            if status["angle"] == angle:
+                return {**status, "commandSent": False, "targetAngle": angle}
+            now = self._clock()
+            if deadline is not None and now >= deadline:
+                raise KinectSdkUnavailable("tilt_timeout", "Запрос наклона устарел; команда мотору не отправлена.",
+                                           "Повторите после проверки подключения.")
+            self._tilt_attempts.append(now)
+            self._tilt_last_attempt = now
+            self._tilt_series_count += 1
+            try:
+                # Microsoft.Kinect.KinectSensor.ElevationAngle: SDK 1.8 uses
+                # the running sensor's hardware tilt motor, not the robot drive.
+                sensor.ElevationAngle = angle
+            except Exception as exc:
+                # It may have moved even if the SDK call failed or timed out.
+                raise KinectSdkUnavailable("tilt_failed", f"Команда наклона не подтверждена: {exc}",
+                                           "Проверьте мотор и подождите: он мог начать движение.") from exc
+            finally:
+                # Native calls can block. Begin both cooldowns *after* the call
+                # returns, not before an unknown-duration hardware operation.
+                finished = self._clock()
+                self._tilt_attempts[-1] = finished
+                self._tilt_last_attempt = finished
+                self._tilt_settle_until = max(self._tilt_settle_until, finished + TILT_SETTLE_S)
+            return {**self._tilt_status_locked(sensor, allow_read_error=True),
+                    "commandSent": True, "targetAngle": angle}
+
     def close(self) -> None:
         with self._lock:
             session, self._session = self._session, None
         if session is not None:
             session.close()
+        self._last_color_warning = ""
 
     def __enter__(self) -> "KinectSdkV1Adapter":
         return self
@@ -566,6 +719,15 @@ class KinectSdkV1Adapter(SensorAdapter):
             pass
 
     def capture(self) -> SensorFrame:
+        return self._capture(include_points=True)
+
+    def capture_for_scan(self) -> SensorFrame:
+        # ScanEngine builds its own point cloud from depth. Computing a second
+        # preview cloud for every captured frame wastes time, especially when a
+        # later frame replaces it in the mailbox.
+        return self._capture(include_points=False)
+
+    def _capture(self, *, include_points: bool) -> SensorFrame:
         try:
             session = self._session_for_capture()
             self._throttle()
@@ -576,20 +738,36 @@ class KinectSdkV1Adapter(SensorAdapter):
                     "Kinect не вернул кадр глубины за отведённое время.",
                     "Проверьте питание и USB, закройте другие Kinect-приложения и повторите.",
                 )
-            width, height, depth_bytes = depth
+            width, height, depth_bytes, frame_number = depth
+            # Measure the depth instant, not the later RGB wait/conversion time.
+            captured_at = self._clock()
             color = None
+            color_warning = ""
             try:
                 color = session.grab_color(self.color_timeout)
-            except Exception:  # noqa: BLE001 - глубина остаётся полезной без RGB
-                color = None
-            return depth_and_color_to_frame(
+                if color is None:
+                    color_warning = "Kinect не вернул RGB-кадр. Проверьте USB и закройте другие приложения Kinect; глубина доступна, но цвет может отсутствовать."
+            except Exception as exc:  # noqa: BLE001 - глубина остаётся полезной без RGB
+                color_warning = f"Не удалось прочитать RGB-кадр Kinect: {exc}. Проверьте USB и SDK; глубина доступна, но цвет может отсутствовать."
+            if color_warning != self._last_color_warning:
+                if color_warning:
+                    print(f"[Depth Studio] {color_warning}", flush=True)
+                elif self._last_color_warning:
+                    print("[Depth Studio] RGB-поток Kinect восстановлен.", flush=True)
+                self._last_color_warning = color_warning
+            frame = depth_and_color_to_frame(
                 depth_bytes,
                 width,
                 height,
                 color[2] if color else None,
                 color[0] if color else None,
                 color[1] if color else None,
+                captured_at=captured_at,
+                include_points=include_points,
             )
+            frame.warning = color_warning
+            frame.sequence_number = frame_number
+            return frame
         except KinectSdkUnavailable as exc:
             # Таймаут кадра не повод переоткрывать сенсор: следующая попытка может удаться.
             if exc.code != "frame_timeout":

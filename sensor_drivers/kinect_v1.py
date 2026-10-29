@@ -38,6 +38,7 @@ class KinectV1Adapter(SensorAdapter):
     limitations = (
         "Kinect v1 only (not Kinect One/v2). Depth-to-colour registration is not implemented; depth calibration is approximate; "
         "ICP can drift on plain walls, fast motion, or moving objects. Requires the powered Kinect USB adapter. "
+        "Оценки дальше 4 м экспериментальны и не подтверждены на устройстве; предел 10 м не увеличивает дальность сенсора. "
         "Смена USB-драйвера на libusbK/WinUSB ломает работу штатного драйвера Microsoft Kinect."
     )
     package_names = ("freenect", "numpy")
@@ -107,6 +108,12 @@ class KinectV1Adapter(SensorAdapter):
         return result
 
     def capture(self) -> SensorFrame:
+        return self._capture(include_points=True)
+
+    def capture_for_scan(self) -> SensorFrame:
+        return self._capture(include_points=False)
+
+    def _capture(self, *, include_points: bool) -> SensorFrame:
         try:
             import freenect
             import numpy as np
@@ -116,6 +123,7 @@ class KinectV1Adapter(SensorAdapter):
         try:
             raw_result = freenect.sync_get_depth()
             raw_depth = self._unwrap(raw_result)
+            captured_at = time.monotonic()
             if raw_depth is None:
                 raise RuntimeError("Kinect не вернул кадр глубины.")
             raw_depth = np.asarray(raw_depth)
@@ -133,37 +141,41 @@ class KinectV1Adapter(SensorAdapter):
                     if video.ndim != 3 or video.shape[2] < 3:
                         video = None
                     else:
-                        video = np.ascontiguousarray(video[:, :, :3])
+                        video = np.array(video[:, :, :3], dtype=np.uint8, order="C", copy=True)
             except Exception:
                 # A depth frame is still useful if the optional RGB stream fails.
                 video = None
 
             depth_raw = raw_depth.astype(np.float32, copy=False)
             depth_m = 0.1236 * np.tan(depth_raw / 2842.5 + 1.1863)
-            height, width = depth_raw.shape
-            # Subsample before constructing the point cloud to keep preview and ICP bounded.
-            step = 4 if max(height, width) >= 480 else 2
-            sampled_raw = depth_raw[::step, ::step]
-            sampled_z = depth_m[::step, ::step]
-            v, u = np.indices(sampled_z.shape, dtype=np.float32)
-            u = u * step
-            v = v * step
-            fx = 594.2 * (width / 640.0)
-            fy = 591.0 * (height / 480.0)
-            cx = (width - 1.0) / 2.0
-            cy = (height - 1.0) / 2.0
-            valid = ((sampled_raw < 2047) & np.isfinite(sampled_z) &
-                     (sampled_z >= 0.45) & (sampled_z <= 4.0))
-            x = (u - cx) * sampled_z / fx
-            y = -(v - cy) * sampled_z / fy
-            points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
+            points = None
+            if include_points:
+                height, width = depth_raw.shape
+                # Subsample before constructing the independent preview cloud.
+                step = 4 if max(height, width) >= 480 else 2
+                sampled_raw = depth_raw[::step, ::step]
+                sampled_z = depth_m[::step, ::step]
+                v, u = np.indices(sampled_z.shape, dtype=np.float32)
+                u = u * step
+                v = v * step
+                fx = 594.2 * (width / 640.0)
+                fy = 591.0 * (height / 480.0)
+                cx = (width - 1.0) / 2.0
+                cy = (height - 1.0) / 2.0
+                # Extended range is only an uncalibrated libfreenect estimate,
+                # not evidence the Kinect can reliably resolve distant objects.
+                valid = ((sampled_raw < 2047) & np.isfinite(sampled_z) &
+                         (sampled_z >= 0.45) & (sampled_z <= 10.0))
+                x = (u - cx) * sampled_z / fx
+                y = -(v - cy) * sampled_z / fy
+                points = np.column_stack((x[valid], y[valid], -sampled_z[valid])).astype(np.float32)
 
             # The stream image is downsampled in the HTTP layer. Keep the native
             # depth values in millimetres for a meaningful depth preview.
             depth_mm = np.zeros(raw_depth.shape, dtype=np.uint16)
             valid_full = (raw_depth < 2047) & np.isfinite(depth_m) & (depth_m > 0)
             depth_mm[valid_full] = np.clip(depth_m[valid_full] * 1000.0, 1, 65535).astype(np.uint16)
-            return SensorFrame(video, depth_mm, points, time.time(),
+            return SensorFrame(video, depth_mm, points, captured_at,
                                "Kinect v1 approximate depth formula; RGB/depth are not registered")
         except RuntimeError:
             raise

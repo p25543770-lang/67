@@ -7,11 +7,16 @@ from typing import Any
 
 @dataclass
 class SensorFrame:
-    """One synchronized sensor frame in camera coordinates.
+    """One sensor capture container in camera coordinates.
 
+    RGB and depth are not guaranteed to be registered or synchronized.
     ``color_rgb`` is an optional HxWx3 uint8 array. ``depth_mm`` is an optional
     HxW uint16 depth image in millimetres. ``points`` is an Nx3 float array in
-    metres, with +Y up and the camera looking down -Z.
+    metres, with +Y up and the camera looking down -Z. Scan-only captures may
+    omit ``points`` because the scanning engine builds its own cloud. ``warning``
+    describes non-fatal issues such as a missing RGB frame. ``sequence_number``
+    is optional: only drivers exposing a sensor frame number can report gaps
+    that occurred before Python received the frame.
     """
 
     color_rgb: Any
@@ -19,6 +24,8 @@ class SensorFrame:
     points: Any
     captured_at: float
     calibration: str = ""
+    warning: str = ""
+    sequence_number: int | None = None
 
 
 REQUIREMENT_KINDS = ("driver", "python")
@@ -69,6 +76,10 @@ class SensorAdapter:
     def capture(self) -> SensorFrame:
         raise NotImplementedError
 
+    def capture_for_scan(self) -> SensorFrame:
+        """Capture for the engine; adapters may skip the unused preview cloud."""
+        return self.capture()
+
     def close(self) -> None:
         """Release the device. Adapters without a persistent handle do nothing."""
 
@@ -90,6 +101,8 @@ class SensorAdapter:
             "state": state,
             "connected": probe.get("connected"),
             "error": probe.get("error") or (self.dependency_error() if self.implemented and not dependencies_available else ""),
+            "errorCode": probe.get("code", ""),
+            "hint": probe.get("hint", ""),
             "windows": self.windows,
             "driver": self.driver,
             "limitations": self.limitations,

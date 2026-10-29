@@ -4,11 +4,10 @@
 накапливала ошибку (дрейф). Здесь каждый кадр сравнивается с общей моделью сцены.
 
 Этапы на кадр:
-1. начальная оценка — последняя принятая поза (как в KinectFusion). Постоянная скорость
-   здесь не используется: ошибки ICP попадают в оценку скорости и усиливаются от кадра
-   к кадру (проверено на синтетике: ошибка предсказания росла ×2.5 за кадр);
+1. начальная оценка — последняя принятая поза; при достаточно быстром движении
+   ограниченный по времени и скорости прогноз переноса помогает не потерять перекрытие;
 2. обрезка модели по видимому фрустуму камеры;
-3. ICP point-to-plane в три масштаба (5, 2.5, 1.2 см) по нормалям модели из TSDF;
+3. ICP point-to-plane в два масштаба (4 и 2 см) по нормалям модели из TSDF;
 4. проверка вырождения (как в KinectFusion): собственные значения 6x6 гессиана
    point-to-plane по соответствиям в финальной позе. Если наименьшее собственное
    значение пренебрежимо мало, ICP скользит вдоль плоскости (стена без признаков) —
@@ -21,8 +20,6 @@
 ≤5 мм. Флаг ``use_color_icp`` оставлен для экспериментов. Цвет используется для текстуры
 меша (см. texture.py).
 
-Стартовая оценка позы — последняя принятая поза, без экстраполяции скорости (см. пункт 1).
-
 Модель подготавливается один раз на её версию (даунсэмпл по масштабам), поэтому на кадр
 остаются обрезка и ICP по небольшим облакам.
 """
@@ -33,15 +30,115 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .camera import Intrinsics, invert_pose, relative_motion
-from .config import ScanSettings, TARGET_FPS
+from .config import ROBOT_PROFILE, ScanSettings, TARGET_FPS
+from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture, reference_seed_pose
+from .landmarks import LandmarkGuard
 
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
 MAX_TARGET_POINTS = 8000           # ограничение цели на масштаб: стоимость растёт с ней
 INLIER_DISTANCE_M = 0.012          # соответствия ближе 1.2 см — «внутренние» для RMS и гессиана
-DEGENERACY_RATIO = 1e-3            # λmin/λmax гессиана ниже — ICP скользит (вырождение)
+# Reject a little more aggressively near poorly constrained planes. The
+# faster profile keeps fewer keyframes, which can otherwise re-lock on a wall
+# with a deceptively good residual after tracking has already been lost.
+DEGENERACY_RATIO = 2e-3            # λmin/λmax гессиана ниже — ICP скользит (вырождение)
+# Only a narrow borderline band can be rescued by the independent raw-frame
+# check. Near-degenerate frames above the cutoff are cross-checked as well.
+FRAME_RESCUE_MIN_RATIO = 1.5e-3
+FRAME_CROSSCHECK_RATIO = 3.5e-3
 MIN_MODEL_POINTS = 500
 MIN_SOURCE_POINTS = 400
 MAX_SOURCE_POINTS = 6000
+# На границе 7 км/ч погрешность ICP в несколько миллиметров не должна сама
+# приводить к отбраковке. Это допуск измерения, а не гарантия фактической скорости.
+SPEED_STEP_TOLERANCE_M = 0.006
+PREDICT_MIN_SPEED_MPS = 0.7
+PREDICT_MAX_SECONDS = 0.35
+RECOVERY_RADIUS_M = 0.05
+RECOVERY_ROTATION_DEG = 5.0
+PREDICTION_CORRECTION_MIN_M = 0.025
+PREDICTION_CORRECTION_RATIO = 0.35
+MAX_RELIABLE_FRAME_GAP_S = 0.5
+# An unobserved interval can make a plausible ICP match jump far before two
+# frames are rejected. Robot mode requires confirmation after 50 ms, or the
+# last trusted view after 120 ms. Other profiles require it when the estimated
+# translation/turn is fast. An alias can look slow, so this is not a guarantee;
+# RGB/depth are not registered or guaranteed synchronous.
+GAP_CONFIRMATION_S = 0.05
+GAP_FAST_SPEED_MPS = 0.7
+GAP_FAST_ANGULAR_RPS = 0.7
+ROBOT_UNOBSERVED_GAP_S = 0.12
+SLOW_MOTION_MIN_SPEED_MPS = 0.15
+SLOW_MOTION_ERROR_MIN_M = 0.035
+SLOW_MOTION_ERROR_RATIO = 0.6
+# Once tracking is repeatedly lost, automatic re-lock requires a similar view
+# near the last trusted pose. This cannot prove correctness on repeated walls.
+RECOVERY_SIGNATURE_HEIGHT = 30
+RECOVERY_SIGNATURE_WIDTH = 40
+RECOVERY_DEPTH_TOLERANCE_MM = 80
+RECOVERY_MIN_DEPTH_INLIERS = 0.70
+RECOVERY_MAX_COLOR_MEDIAN = 35.0
+RECOVERY_MIN_COLOR_INLIERS = 0.65
+
+
+def _view_signature(depth_mm, color_rgb=None):
+    if depth_mm is None:
+        return None
+    depth = np.asarray(depth_mm)
+    if depth.ndim != 2 or not depth.size:
+        return None
+    rows = np.linspace(0, depth.shape[0] - 1, min(RECOVERY_SIGNATURE_HEIGHT, depth.shape[0])).astype(int)
+    cols = np.linspace(0, depth.shape[1] - 1, min(RECOVERY_SIGNATURE_WIDTH, depth.shape[1])).astype(int)
+    sampled_depth = np.asarray(depth[np.ix_(rows, cols)], dtype=np.int32).copy()
+    sampled_color = None
+    if color_rgb is not None:
+        color = np.asarray(color_rgb)
+        if color.ndim == 3 and color.shape[:2] == depth.shape and color.shape[2] >= 3:
+            sampled_color = np.asarray(color[rows][:, cols, :3], dtype=np.int16).copy()
+    return sampled_depth, sampled_color
+
+
+def _recovery_view_matches(reference, current):
+    """Conservative image-space check in addition to ICP's last-pose radius."""
+    if reference is None or current is None:
+        return False
+    old_depth, old_color = reference
+    depth, color = current
+    if old_depth.shape != depth.shape:
+        return False
+    valid = (old_depth > 0) & (depth > 0)
+    if np.count_nonzero(valid) < max(12, int(old_depth.size * 0.2)):
+        return False
+    depth_delta = np.abs(old_depth[valid] - depth[valid])
+    if float(np.mean(depth_delta <= RECOVERY_DEPTH_TOLERANCE_MM)) < RECOVERY_MIN_DEPTH_INLIERS:
+        return False
+    if old_color is not None and color is not None:
+        color_delta = np.mean(np.abs(old_color[valid] - color[valid]), axis=1)
+        if (float(np.median(color_delta)) > RECOVERY_MAX_COLOR_MEDIAN or
+                float(np.mean(color_delta <= 60.0)) < RECOVERY_MIN_COLOR_INLIERS):
+            return False
+    return True
+
+
+def _slow_motion_disagreement(previous_pose, pose, candidate, dt, previous_dt):
+    """Return an implausible translation disagreement, without changing ICP's initial guess.
+
+    A slow, noisy step is not reliable enough to extrapolate for ICP itself, but
+    it can still rule out a large sudden slide. Scale by the full capture gap:
+    the processed frames may be far apart even if the previous pair was close.
+    This conservative check can also reject a real abrupt turn or acceleration.
+    """
+    previous_step = pose[:3, 3] - previous_pose[:3, 3]
+    previous_speed = float(np.linalg.norm(previous_step)) / previous_dt
+    if not SLOW_MOTION_MIN_SPEED_MPS <= previous_speed < PREDICT_MIN_SPEED_MPS:
+        return None
+    expected = previous_step * min(dt / previous_dt, 15.0)
+    expected_length = float(np.linalg.norm(expected))
+    if expected_length <= 0.02:
+        return None
+    actual = candidate[:3, 3] - pose[:3, 3]
+    disagreement = float(np.linalg.norm(actual - expected))
+    allowed = max(SLOW_MOTION_ERROR_MIN_M, expected_length * SLOW_MOTION_ERROR_RATIO)
+    return (disagreement, allowed) if disagreement > allowed else None
 
 
 @dataclass
@@ -78,43 +175,34 @@ def crop_model_to_view(points, normals, colors, intrinsics: Intrinsics, pose_wc,
     return points[keep], normals[keep], colors[keep]
 
 
-def geometric_rmse(source, target, transform, max_distance: float) -> float:
-    import open3d as o3d
-
-    src = o3d.geometry.PointCloud(source)
-    src.transform(transform)
-    result = o3d.pipelines.registration.evaluate_registration(src, target, max_distance, np.eye(4))
-    return float(result.inlier_rmse) if len(result.correspondence_set) else float("inf")
-
-
-def degeneracy_ratio(source, target, transform, max_distance: float) -> float:
-    """λmin/λmax гессиана point-to-plane в позе ``transform`` (1.0 — хорошо, ~0 — вырождено).
-
-    Гессиан A = Σ JᵀJ по соответствиям, J = [p×n, n]. Малое λmin означает направление
-    (например, сдвиг вдоль стены), которое ICP не наблюдает.
-    """
+def registration_diagnostics(source, target, transform, max_distance: float) -> tuple[float, float]:
+    """One correspondence search for geometric RMS and the point-to-plane Hessian."""
     import open3d as o3d
 
     if source is None or target is None or len(source.points) == 0:
-        return 0.0
+        return float("inf"), 0.0
     src = o3d.geometry.PointCloud(source)
     src.transform(transform)
     result = o3d.pipelines.registration.evaluate_registration(src, target, max_distance, np.eye(4))
     pairs = np.asarray(result.correspondence_set)
+    rmse = float(result.inlier_rmse) if len(pairs) else float("inf")
     if len(pairs) < 6:
-        return 0.0
+        return rmse, 0.0
     points = np.asarray(src.points)[pairs[:, 0]]
     normals = np.asarray(target.normals)[pairs[:, 1]]
+    if not (np.isfinite(points).all() and np.isfinite(normals).all()):
+        return float("inf"), 0.0
     jac = np.hstack((np.cross(points, normals), normals))
-    hessian = jac.T @ jac
-    eig = np.linalg.eigvalsh(hessian)
-    if eig[-1] <= 0:
-        return 0.0
-    return float(max(eig[0], 0.0) / eig[-1])
+    try:
+        eig = np.linalg.eigvalsh(jac.T @ jac)
+    except np.linalg.LinAlgError:
+        return float("inf"), 0.0
+    ratio = float(max(eig[0], 0.0) / eig[-1]) if eig[-1] > 0 else 0.0
+    return rmse, ratio
 
 
 class PreparedModel:
-    """Модель в трёх масштабах: точки, нормали и цвет (кэш на версию модели)."""
+    """Модель в двух масштабах: точки, нормали и цвет (кэш на версию модели)."""
 
     def __init__(self, points, normals, colors):
         import open3d as o3d
@@ -144,6 +232,19 @@ class FrameToModelTracker:
         self.settings = settings
         self.pose: np.ndarray | None = None      # последняя принятая поза
         self._previous_pose: np.ndarray | None = None
+        self._last_accepted_dt: float | None = None
+        self._recovery_state: str | None = None
+        self._consecutive_rejections = 0
+        self._last_view = None
+        self._last_reference: ReferenceFrame | None = None
+        self.frame_checks = 0
+        self.frame_checks_passed = 0
+        self.frames_rescued = 0
+        self.early_recovery_rejections = 0
+        self.landmark_guard = LandmarkGuard() if settings.visual_landmark_veto else None
+        self.landmark_checks = 0
+        self.landmark_vetoes = 0
+        self._crosscheck_after_rescue = False
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
         self.last_result: TrackResult | None = None
@@ -151,6 +252,17 @@ class FrameToModelTracker:
     def reset(self, pose: np.ndarray | None = None) -> None:
         self.pose = None if pose is None else np.array(pose, dtype=np.float64)
         self._previous_pose = None
+        self._last_accepted_dt = None
+        self._recovery_state = None
+        self._consecutive_rejections = 0
+        self._last_view = None
+        self._last_reference = None
+        self.frame_checks = self.frame_checks_passed = self.frames_rescued = 0
+        self.early_recovery_rejections = 0
+        self.landmark_checks = self.landmark_vetoes = 0
+        if self.landmark_guard is not None:
+            self.landmark_guard.reset()
+        self._crosscheck_after_rescue = False
         self._prepared = None
         self.last_result = None
 
@@ -163,10 +275,25 @@ class FrameToModelTracker:
         self._prepared = PreparedModel(points, normals, colors)
         self._prepared_version = version
 
-    def _predict(self) -> np.ndarray:
-        return np.eye(4) if self.pose is None else self.pose
+    def _predict(self, dt: float) -> np.ndarray:
+        predicted = np.eye(4) if self.pose is None else self.pose.copy()
+        if (self.pose is None or self._previous_pose is None or not self._last_accepted_dt or self._recovery_state or
+                (self.last_result is not None and self.last_result.state != "ok")):
+            return predicted
+        if dt > PREDICT_MAX_SECONDS:
+            return predicted
+        delta = self.pose[:3, 3] - self._previous_pose[:3, 3]
+        speed = float(np.linalg.norm(delta)) / self._last_accepted_dt
+        # Do not extrapolate the small noisy steps common when scanning slowly.
+        if speed < PREDICT_MIN_SPEED_MPS:
+            return predicted
+        horizon = min(dt, self._last_accepted_dt * 3.0)
+        direction = delta / max(float(np.linalg.norm(delta)), 1e-12)
+        predicted[:3, 3] += direction * min(speed, self.settings.max_speed_mps) * horizon
+        return predicted
 
-    def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None) -> TrackResult:
+    def track(self, cam_points, cam_colors, intrinsics: Intrinsics, dt: float | None = None,
+              observation=None, *, _retry_seed=None) -> TrackResult:
         """Оценить позу кадра относительно подготовленной модели.
 
         Побочные эффекты только при принятии кадра: обновляются поза и скорость.
@@ -174,26 +301,64 @@ class FrameToModelTracker:
         import open3d as o3d
 
         dt = dt if dt and dt > 0 else 1.0 / TARGET_FPS
-        predicted = self._predict()          # начальная оценка = последняя принятая поза
+        predicted = self._predict(dt)
 
         if self._prepared is None or self.pose is None:
             # Первый кадр прохода: модели ещё нет, поза задаёт начало координат.
             base = self.pose if self.pose is not None else np.eye(4)
             self._accept(base)
+            self._last_view = _view_signature(*observation) if observation is not None else None
+            self._last_reference = ReferenceFrame.capture(observation, base)
+            if self.landmark_guard is not None:
+                self.landmark_guard.accept(observation, intrinsics, base)
+            self._consecutive_rejections = 0
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
+
+        # Robot mode retains its stronger last-pose AND last-view recovery for
+        # long gaps. For other gaps the original bounded ICP initial prediction
+        # and its consistency check remain in place; gap confirmation below is
+        # an additional requirement, not a replacement for those checks.
+        needs_gap_confirmation = bool(
+            dt > GAP_CONFIRMATION_S and self._recovery_state is None and
+            not (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S))
+        if (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S and
+                self._recovery_state is None):
+            self._recovery_state = "lost"
+            predicted = self.pose.copy()
+        # Keep the original prediction for the motion check even on a retry.
+        motion_prediction = predicted.copy()
+        if _retry_seed is not None:
+            predicted = _retry_seed
+
+        # This is the *same mandatory recovery check* that was previously
+        # performed after both ICP scales. A different view could never be
+        # accepted in recovery, so reject it before allocating point clouds or
+        # running ICP. A matching view still goes through every existing
+        # geometric, residual, speed and independent-confirmation check below.
+        # A higher processed FPS while lost is not an increase in tracked FPS.
+        current_view = None
+        if self._recovery_state and self._last_view is not None:
+            current_view = _view_signature(*observation) if observation is not None else None
+            if not _recovery_view_matches(self._last_view, current_view):
+                self.early_recovery_rejections += 1
+                return self._reject(self._recovery_state, predicted, "return_to_last_view",
+                                    extra={"earlyRecoveryReject": True})
 
         if len(cam_points) > MAX_SOURCE_POINTS:
             step = int(np.ceil(len(cam_points) / MAX_SOURCE_POINTS))
             cam_points = cam_points[::step]
-            cam_colors = cam_colors[::step]
+            if cam_colors is not None:
+                cam_colors = cam_colors[::step]
         if len(cam_points) < MIN_SOURCE_POINTS:
             return self._reject("lost", predicted, "insufficient_points")
 
         source_world = cam_points @ predicted[:3, :3].T + predicted[:3, 3]
         source_base = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source_world))
-        source_base.colors = o3d.utility.Vector3dVector(np.clip(cam_colors, 0.0, 1.0))
-        source_base.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=20))
+        if self.settings.use_color_icp and cam_colors is not None:
+            source_base.colors = o3d.utility.Vector3dVector(np.clip(cam_colors, 0.0, 1.0))
+        # Point-to-plane ICP uses the model normals; source normals are only
+        # required by the optional colored ICP. Avoid estimating them twice.
 
         transform = np.eye(4)
         fitness = rmse = 0.0
@@ -201,7 +366,7 @@ class FrameToModelTracker:
         finest_source = finest_target = None
         for level in self._prepared.levels:
             vp, vn, vc = crop_model_to_view(level["points"], level["normals"], level["colors"],
-                                            intrinsics, predicted)
+                                            intrinsics, predicted, far=self.settings.depth_max_m + 0.5)
             if len(vp) > MAX_TARGET_POINTS:
                 every = int(np.ceil(len(vp) / MAX_TARGET_POINTS))
                 vp, vn, vc = vp[::every], vn[::every], vc[::every]
@@ -210,9 +375,11 @@ class FrameToModelTracker:
                 return self._reject("lost", predicted, "insufficient_model_view")
             target = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(vp))
             target.normals = o3d.utility.Vector3dVector(vn)
-            target.colors = o3d.utility.Vector3dVector(vc)
+            if self.settings.use_color_icp:
+                target.colors = o3d.utility.Vector3dVector(vc)
             source = source_base.voxel_down_sample(level["radius"])
-            source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=level["radius"] * 2, max_nn=30))
+            if self.settings.use_color_icp:
+                source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=level["radius"] * 2, max_nn=30))
             criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
                 relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=level["iterations"])
             try:
@@ -222,8 +389,14 @@ class FrameToModelTracker:
                         o3d.pipelines.registration.TransformationEstimationForColoredICP(0.968), criteria)
                     method = "colored_icp"
                 else:
+                    search_distance = max(level["radius"] * 2,
+                                          min(0.25, self.settings.max_speed_mps * dt + 0.03))
+                    if _retry_seed is not None:
+                        # A guarded raw-view estimate permits a narrower search;
+                        # distant correspondences must not drag it across a wall.
+                        search_distance = level["radius"] * 1.5
                     icp = o3d.pipelines.registration.registration_icp(
-                        source, target, level["radius"] * 2, transform,
+                        source, target, search_distance, transform,
                         o3d.pipelines.registration.TransformationEstimationPointToPlane(), criteria)
                     method = "point_to_plane_icp"
             except RuntimeError:
@@ -232,32 +405,174 @@ class FrameToModelTracker:
             transform = np.asarray(icp.transformation)
             fitness = float(icp.fitness)
             finest_source, finest_target = source, target
-        # RMS — геометрическая (точка–точка) на самом тонком масштабе: цветной член его не искажает.
-        rmse = geometric_rmse(finest_source, finest_target, transform, INLIER_DISTANCE_M)
-
+        # Одни и те же соответствия используются для RMS и проверки вырождения.
+        if not (np.isfinite(transform).all() and np.isfinite(fitness)):
+            return self._reject("lost", predicted, "invalid_registration", method=method)
+        rmse, ratio = registration_diagnostics(finest_source, finest_target, transform, INLIER_DISTANCE_M)
         candidate = transform @ predicted
-        ratio = degeneracy_ratio(finest_source, finest_target, transform, INLIER_DISTANCE_M)
+        if not (np.isfinite(candidate).all() and np.isfinite(fitness) and np.isfinite(rmse) and np.isfinite(ratio)):
+            return self._reject("lost", predicted, "invalid_registration", method=method)
         if fitness < self.settings.icp_max_fitness_loss or rmse > self.settings.icp_max_rmse_m:
             return self._reject("lost", predicted, "icp_residual", fitness, rmse, method=method,
                                 extra={"eigenRatio": ratio})
-        if ratio < DEGENERACY_RATIO:
-            return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
-                                extra={"eigenRatio": ratio})
-
         step_m, step_deg = relative_motion(self.pose, candidate)
-        speed = step_m / dt
         angular = np.radians(step_deg) / dt
-        if speed > self.settings.max_speed_mps or angular > self.settings.max_angular_rps:
+        physically_plausible = (step_m <= self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M and
+                                angular <= self.settings.max_angular_rps and dt <= MAX_RELIABLE_FRAME_GAP_S)
+        checked = confirmed = rescued = False
+
+        def confirm_once():
+            nonlocal checked, confirmed
+            if not checked:
+                checked = True
+                self.frame_checks += 1
+                confirmed = bool(observation is not None and confirm_model_pose(
+                    observation[0], observation[1], intrinsics, candidate, self._last_reference))
+                if confirmed:
+                    self.frame_checks_passed += 1
+            return confirmed
+
+        def retry_from_reference():
+            # A seed is not a pose to integrate. At most one retry, only after
+            # an observed gap, and never in robot mode or during recovery.
+            if (not needs_gap_confirmation or self.settings.profile == ROBOT_PROFILE or
+                    _retry_seed is not None or not physically_plausible or observation is None):
+                return None
+            seed = reference_seed_pose(observation[0], observation[1], intrinsics,
+                                       candidate, self._last_reference)
+            if seed is None:
+                return None
+            return self.track(cam_points, cam_colors, intrinsics, dt, observation, _retry_seed=seed)
+
+        if ratio < DEGENERACY_RATIO:
+            can_check = (ratio >= FRAME_RESCUE_MIN_RATIO and physically_plausible and not self._recovery_state)
+            if not can_check or not confirm_once():
+                return self._reject("lost", predicted, "degenerate_geometry", fitness, rmse, method=method,
+                                    extra={"eigenRatio": ratio})
+            rescued = True
+        elif (ratio < FRAME_CROSSCHECK_RATIO and physically_plausible and
+              (self.settings.profile == ROBOT_PROFILE or not self._recovery_state)):
+            # For a moving robot, weak geometry can drift *before* any rescue,
+            # especially while turning past a wall. Fail closed if RGB-D is
+            # missing or cannot confirm it; the local raw view remains separate.
+            # Other profiles keep the previous after-rescue behaviour.
+            robot_check = self.settings.profile == ROBOT_PROFILE
+            after_rescue_check = (self._crosscheck_after_rescue and observation is not None and
+                                  self._last_reference is not None and
+                                  has_usable_texture(observation[1]) and
+                                  has_usable_texture(self._last_reference.color))
+            if (robot_check or after_rescue_check) and not confirm_once():
+                return self._reject("lost", predicted, "frame_disagreement", fitness, rmse, step_m, step_deg,
+                                    method=method, extra={"eigenRatio": ratio})
+
+        if self._recovery_state and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
+            return self._reject(self._recovery_state, predicted, "return_to_last_pose", fitness, rmse,
+                                step_m, step_deg, method=method)
+        if step_m > self.settings.max_speed_mps * dt + SPEED_STEP_TOLERANCE_M or angular > self.settings.max_angular_rps:
+            self._recovery_state = "too_fast"
             return self._reject("too_fast", predicted, "speed_limit", fitness, rmse, step_m, step_deg,
                                 method=method)
+        if dt > MAX_RELIABLE_FRAME_GAP_S and (step_m > RECOVERY_RADIUS_M or step_deg > RECOVERY_ROTATION_DEG):
+            # A large jump after a long interruption is not reliably localized
+            # by ICP just because it falls below the average speed limit.
+            self._recovery_state = "lost"
+            return self._reject("lost", predicted, "long_capture_gap", fitness, rmse, step_m, step_deg, method=method)
+        if (self._previous_pose is not None and self._last_accepted_dt and not self._recovery_state and
+                self.last_result is not None and self.last_result.state == "ok" and dt <= MAX_RELIABLE_FRAME_GAP_S):
+            mismatch = _slow_motion_disagreement(self._previous_pose, self.pose, candidate, dt, self._last_accepted_dt)
+            if mismatch is not None:
+                if not confirm_once():
+                    retry = retry_from_reference()
+                    if retry is not None:
+                        return retry
+                    self._recovery_state = "lost"
+                    return self._reject("lost", predicted, "slow_motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                        method=method, extra={"motionDisagreementM": mismatch[0],
+                                                              "motionAllowedM": mismatch[1], "eigenRatio": ratio})
+                rescued = True
+        predicted_step = float(np.linalg.norm(motion_prediction[:3, 3] - self.pose[:3, 3]))
+        correction = float(np.linalg.norm(candidate[:3, 3] - motion_prediction[:3, 3]))
+        if predicted_step > 0.02 and correction > max(PREDICTION_CORRECTION_MIN_M,
+                                                      predicted_step * PREDICTION_CORRECTION_RATIO):
+            # A sudden stop/turn or weak geometry can make ICP confidently slide
+            # along a wall. Only keep the estimate if the independent raw frame
+            # and its RGB-D view corroborate it; the speed limit still applies.
+            if not confirm_once():
+                retry = retry_from_reference()
+                if retry is not None:
+                    return retry
+                self._recovery_state = "lost"
+                return self._reject("lost", predicted, "motion_inconsistent", fitness, rmse, step_m, step_deg,
+                                    method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
+            rescued = True
 
+        # For the robot profile, independently corroborate every estimate
+        # after a gap. In the other profiles do so when the *estimated* motion
+        # is fast; an incorrectly slow estimate may evade this additional gate.
+        # Missing RGB or disagreement fails closed. Confirmation cannot bypass
+        # any of the speed, residual or geometry checks above.
+        gap_high_motion = (self.settings.profile == ROBOT_PROFILE or
+                           step_m / dt >= GAP_FAST_SPEED_MPS or angular >= GAP_FAST_ANGULAR_RPS)
+        if needs_gap_confirmation and (gap_high_motion or _retry_seed is not None) and (
+                not physically_plausible or not confirm_once()):
+            # Try one different ICP starting point, never an accepted raw pose.
+            # The independent frame must itself be distinctive, and the retry
+            # must pass the *same* motion, geometry, residual, speed and RGB-D
+            # checks even if its estimated speed looks slow. Robot mode keeps
+            # its original conservative behavior and does not use this retry.
+            retry = retry_from_reference()
+            if retry is not None:
+                return retry
+            self._recovery_state = "lost"
+            return self._reject("lost", predicted, "gap_unconfirmed", fitness, rmse,
+                                step_m, step_deg, method=method, extra={"eigenRatio": ratio})
+
+        # Distributed visual corners only veto a large, coherent disagreement.
+        # They never provide a pose or bypass any of the checks above. RGB and
+        # depth are not registered in the Kinect v1 driver, so this is a rough
+        # conservative check and can reject good motion; agreement is not proof.
+        landmarks = None
+        features = None
+        if self.landmark_guard is not None:
+            landmarks, features = self.landmark_guard.evaluate(observation, intrinsics, candidate)
+            if landmarks["status"] != "unavailable":
+                self.landmark_checks += 1
+            if landmarks["status"] == "disagreement":
+                self.landmark_vetoes += 1
+                self._recovery_state = "lost"
+                return self._reject("lost", predicted, "landmark_disagreement", fitness, rmse,
+                                    step_m, step_deg, method=method, extra={"landmarks": landmarks})
+
+        self._recovery_state = None
+        self._consecutive_rejections = 0
         self._accept(candidate)
+        self._last_view = (current_view if current_view is not None else
+                           _view_signature(*observation) if observation is not None else None)
+        self._last_reference = ReferenceFrame.capture(observation, candidate)
+        if self.landmark_guard is not None:
+            self.landmark_guard.accept(observation, intrinsics, candidate, features=features)
+        if rescued:
+            self.frames_rescued += 1
+            self._crosscheck_after_rescue = True
+        self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
-                                       method=method, extra={"viewPoints": view_size})
+                                       method=method, extra={"viewPoints": view_size,
+                                                             "frameConfirmed": confirmed, "rescued": rescued,
+                                                             "landmarks": landmarks})
         return self.last_result
+
+    def note_input_rejection(self) -> None:
+        """After repeated bad frames, require a return to the last trusted view."""
+        if self.pose is None:
+            return
+        self._consecutive_rejections += 1
+        if self._consecutive_rejections >= 2 and self._recovery_state is None:
+            self._recovery_state = "lost"
 
     def _reject(self, state, predicted, reason, fitness=0.0, rmse=0.0, step_m=0.0, step_deg=0.0,
                 method="", extra=None) -> TrackResult:
+        if state in ("lost", "too_fast"):
+            self.note_input_rejection()
         result = TrackResult(state, self.pose, predicted, fitness, rmse, step_m, step_deg,
                              reason=reason, method=method, extra=extra or {})
         self.last_result = result

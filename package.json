@@ -1,6 +1,6 @@
 {
   "name": "depth-studio",
-  "version": "1.2.0",
+  "version": "1.2.9",
   "private": true,
   "description": "Experimental depth-camera room scanning and point-cloud viewer.",
   "author": "Depth Studio contributors",
@@ -10,8 +10,8 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "npm run test:python && npm run test:desktop",
-    "test:python": "python -m unittest discover -s tests -p 'test_*.py'",
-    "test:desktop": "node --test desktop/tests/bootstrap.test.cjs",
+    "test:python": "python -m unittest discover -s tests -p \"test_*.py\"",
+    "test:desktop": "node --test desktop/tests/*.test.cjs",
     "prepare:python": "node scripts/prepare-python-runtime.mjs",
     "check:python-bundle": "node scripts/prepare-python-runtime.mjs --check",
     "lock:python": "node scripts/make-python-lock.mjs --wheels python-bundle/wheels --pip-wheel python-bundle/wheels/pip-24.2-py3-none-any.whl",
@@ -47,6 +47,35 @@
       {
         "from": "sensor_drivers",
         "to": "sensor_drivers"
+      },
+      {
+        "from": "scan_pipeline",
+        "to": "scan_pipeline",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "scripts/benchmark-synthetic-fps.py",
+        "to": "scripts/benchmark-synthetic-fps.py"
+      },
+      {
+        "from": "scripts/benchmark-tracking-stability.py",
+        "to": "scripts/benchmark-tracking-stability.py"
+      },
+      {
+        "from": "scripts/benchmark-robot-turn.py",
+        "to": "scripts/benchmark-robot-turn.py"
+      },
+      {
+        "from": "tests/synthetic_room.py",
+        "to": "tests/synthetic_room.py"
+      },
+      {
+        "from": "tests/synthetic_robot.py",
+        "to": "tests/synthetic_robot.py"
       },
       {
         "from": "requirements-scan.txt",

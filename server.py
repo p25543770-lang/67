@@ -1,8 +1,7 @@
-"""Local Depth Studio API and experimental point-cloud registration worker.
+"""Local Depth Studio HTTP bridge and experimental TSDF scanning API.
 
-The HTTP bridge binds to localhost only. Hardware is provided through
-``sensor_drivers`` adapters; demo mode is implemented in the UI and needs no
-Python server or depth sensor.
+The bridge binds to localhost only. Demo mode runs entirely in the UI; NumPy,
+Open3D and sensor SDKs are loaded lazily so health works without them.
 """
 from __future__ import annotations
 
@@ -12,45 +11,44 @@ import math
 import os
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse, urlsplit
+
+# Set the OpenMP/BLAS defaults before NumPy/Open3D are imported. An explicit
+# user setting is preserved; larger CPUs no longer inherit a fixed two-thread cap.
+from scan_pipeline.runtime import configure_threads
+
+configure_threads()
 
 from sensor_drivers.registry import ADAPTERS, catalog, device_family, get_adapter, preferred_source
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DEPTH_STUDIO_PORT", "8765"))
 MAX_PREVIEW_POINTS = 9000
-MAX_SCAN_PREVIEW_POINTS = 14000
-
-# Depth Studio always launches this bridge from its own isolated environment in
-# %LOCALAPPDATA%\DepthStudio. The guard below refuses to serve sensor data from
-# a random system interpreter so a wrong "python server.py" cannot silently
-# masquerade as a configured installation.
+# The renderer gives up after 15 s. An abandoned native open must not later
+# leave a sensor connected behind the user's back.
+DEVICE_CONNECT_DEADLINE = 14.0
+DEVICE_FRAME_DEADLINE = 6.0
+DEVICE_TILT_DEADLINE = 6.0
 ENV_ROOT = os.environ.get("DEPTH_STUDIO_ENV_ROOT", "")
 STATE_FILE = os.environ.get("DEPTH_STUDIO_STATE", "")
 REQUIRE_APP_ENV = os.environ.get("DEPTH_STUDIO_REQUIRE_APP_ENV") == "1"
 INSTANCE = os.environ.get("DEPTH_STUDIO_INSTANCE", "")
 SETUP_STEPS = ("prepare", "python", "packages", "verify", "sensors")
 
-capture_lock = threading.Lock()
+# All commands that change the device/scan are serialized. The capture lock is
+# shared with ScanRunner and protects the device against concurrent frame reads.
+operation_lock = threading.RLock()
+capture_lock = threading.RLock()
 state_lock = threading.RLock()
 probe_results = {}
-scan = {
-    "running": False,
-    "source": None,
-    "cloud": None,
-    "latest_frame": None,
-    "last": None,
-    "pose": None,
-    "frames": 0,
-    "error": "",
-    "warning": "",
-    "tracking": "idle",
-    "speed_mps": 0.0,
-    "worker": None,
-}
+connected_source = None
+scan_runner = None
+scan_start_pending = None
 
 
 def _optional_modules():
@@ -90,9 +88,9 @@ def _is_inside(root, candidate):
     try:
         root_path = os.path.realpath(root)
         candidate_path = os.path.realpath(candidate)
-    except OSError:
+        return os.path.commonpath([root_path, candidate_path]) == root_path
+    except (OSError, ValueError):  # Windows paths on different drives
         return False
-    return os.path.commonpath([root_path, candidate_path]) == root_path
 
 
 def _read_setup_state():
@@ -153,408 +151,556 @@ def _encode_array(array, max_side=320, dtype=None):
     }
 
 
-def _frame_response(frame, source_id="kinect_v1"):
+def _approximate_preview_rgb(points, depth_mm, color_rgb, source_id):
+    """Same-pixel RGB for a depth preview; explicitly NOT calibrated/registered."""
+    import numpy as np
+
+    if source_id not in ("kinect_v1_sdk", "kinect_v1") or color_rgb is None or depth_mm is None:
+        return None, None
+    depth, color = np.asarray(depth_mm), np.asarray(color_rgb)
+    if depth.ndim != 2 or color.ndim != 3 or color.shape[2] < 3 or not depth.size or not color.size:
+        return None, None
+    h, w = depth.shape
+    ch, cw = color.shape[:2]
+    if min(h, w, ch, cw) < 2 or max(h, w, ch, cw) > 4096:
+        return None, None
+    xyz = np.asarray(points, dtype=np.float64)
+    z = -xyz[:, 2]
+    valid = np.isfinite(xyz).all(axis=1) & (z > 0)
+    safe_z = np.where(valid, z, 1.0)
+    u = np.rint(xyz[:, 0] / safe_z * (594.2 * w / 640.0) + (w - 1) / 2.0)
+    v = np.rint(-xyz[:, 1] / safe_z * (591.0 * h / 480.0) + (h - 1) / 2.0)
+    valid &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    rgb = np.full((len(xyz), 3), -1, dtype=np.int16)
+    if valid.any():
+        cols = np.clip(np.rint(u[valid] * (cw - 1) / (w - 1)), 0, cw - 1).astype(np.int64)
+        rows = np.clip(np.rint(v[valid] * (ch - 1) / (h - 1)), 0, ch - 1).astype(np.int64)
+        rgb[valid] = np.asarray(color[rows, cols, :3], dtype=np.uint8)
+    return rgb, valid
+
+
+def _frame_response(frame, source_id="kinect_v1", *, include_color=False):
     import numpy as np
 
     xyz = np.asarray(frame.points, dtype=np.float32).reshape((-1, 3))
     if len(xyz) > MAX_PREVIEW_POINTS:
         stride = int(math.ceil(len(xyz) / MAX_PREVIEW_POINTS))
         xyz = xyz[::stride]
-    points = [[round(float(x), 4), round(float(y), 4), round(float(z), 4),
-               round(float(math.sqrt(x * x + y * y + z * z)), 3)]
-              for x, y, z in xyz]
+    # Use float64 for rounded JSON numbers, and avoid a Python loop per point.
+    xyz64 = xyz.astype(np.float64, copy=False)
+    columns = [np.round(xyz64, 4), np.round(np.linalg.norm(xyz64, axis=1), 3)]
+    point_color = None
+    if include_color:
+        rgb, valid = _approximate_preview_rgb(xyz64, frame.depth_mm, frame.color_rgb, source_id)
+        if rgb is not None:
+            columns.append(rgb)
+        point_color = {"available": bool(valid is not None and valid.any()),
+                       "status": "unavailable" if valid is None or not valid.any() else "approximate" if valid.all() else "partial",
+                       "registered": False, "synchronized": False, "verifiedOnHardware": False}
+    points = np.column_stack(columns).tolist()
     return {
         "source": source_id,
         "capturedAt": frame.captured_at,
         "color": _encode_array(frame.color_rgb, dtype=np.uint8),
         "depth": _encode_array(frame.depth_mm, dtype="<u2"),
         "points": points,
+        "pointColor": point_color,
         "calibration": frame.calibration,
+        "warning": getattr(frame, "warning", ""),
     }
 
 
-def _release_adapter(source_id):
-    """Close the device handle of an adapter; safe for unknown or demo sources."""
-    adapter = get_adapter(source_id) if source_id else None
-    if adapter is None:
-        return
+
+def _scan_root():
+    if ENV_ROOT:
+        return Path(ENV_ROOT) / "scans"
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    return (Path(local_app_data) / "DepthStudio" if local_app_data else Path.home() / ".depth-studio") / "scans"
+
+
+def _sensor_released(source_id, error):
+    """ScanRunner owns the handle during capture and always closes it on exit."""
+    global connected_source
+    with state_lock:
+        if connected_source == source_id:
+            connected_source = None
+        probe_results[source_id] = {
+            "state": "no_device" if error else "detected", "connected": False,
+            "error": error, "hint": "", "code": "capture_failed" if error else "",
+        }
+
+
+def _scan_engine_factory():
+    # Open3D native calls can hold the GIL for hundreds of milliseconds; keep
+    # them in a process that cannot stall the Python SDK capture thread.
+    from scan_pipeline.process_engine import IsolatedScanEngine
+    return IsolatedScanEngine
+
+
+def _runner():
+    global scan_runner
+    with state_lock:
+        if scan_runner is None:
+            # Imports are deliberately lazy: /api/health must not need NumPy/Open3D.
+            from scan_pipeline.runner import ScanRunner
+            from scan_pipeline.storage import ScanStorage
+            scan_runner = ScanRunner(ScanStorage(_scan_root()), capture_lock, _sensor_released,
+                                     engine_factory=_scan_engine_factory())
+        return scan_runner
+
+
+def _scan_snapshot(include_preview=True, include_color=False, include_points=True, known_points_version=None):
+    with state_lock:
+        runner = scan_runner
+        pending = scan_start_pending
+    # Starting can include opening a device or replaying a saved pass; expose it
+    # without waiting on the runner's lock so the UI can still offer Stop/Cancel.
+    if pending is None and runner is not None:
+        return runner.snapshot(include_preview=include_preview, include_color=include_color,
+                               include_points=include_points, known_points_version=known_points_version)
+    return {
+        "running": pending is not None, "phase": "starting" if pending is not None else "idle",
+        "passId": None, "source": pending.get("source") if pending is not None else None,
+        "frames": 0, "keyframes": 0, "pointCount": 0, "error": "", "warning": "", "hint": "",
+        "tracking": "idle", "poseFresh": False, "poseAgeMs": None,
+        "speedMps": None, "angularDegS": None, "lastEvent": {}, "preview": None,
+        "points": [] if include_points else None, "pointsVersion": None,
+        "pipeline": None, "quality": None, "lastResultId": None,
+        "resultMetrics": None, "verifiedOnHardware": False,
+    }
+
+
+def _front_snapshot(include_color=False):
+    # Do not create an engine merely to ask for the local camera view. This
+    # route remains responsive even while the Open3D worker or /api/scan waits.
+    with state_lock:
+        runner = scan_runner
+    if runner is None:
+        return {"available": False, "reason": "scan_not_running", "depth": None,
+                "coordinateFrame": "camera", "oneFrameOnly": True,
+                "notForNavigation": True, "verifiedOnHardware": False}
+    return runner.front_snapshot(include_color=include_color)
+
+
+def _adapter_for(source_id):
+    adapter = get_adapter(source_id)
+    if adapter is None or not adapter.implemented:
+        raise ValueError("Для выбранного устройства нет реализованного модуля. Выберите Kinect 360 или демо-режим.")
+    return adapter
+
+
+def _validate_frame(frame):
+    depth = getattr(frame, "depth_mm", None)
+    shape = getattr(depth, "shape", ())
+    if depth is None or len(shape) != 2 or not shape[0] or not shape[1]:
+        raise RuntimeError("Датчик не вернул корректный кадр глубины.")
+    return int(shape[1]), int(shape[0])
+
+
+def _record_sensor_error(source_id, operation, exc, state="no_device"):
+    global connected_source
+    hint = getattr(exc, "hint", "") or ""
+    code = getattr(exc, "code", "") or ""
+    print(f"[Depth Studio] {operation}: источник={source_id}, код={code or 'unknown'}, ошибка={exc}, подсказка={hint}", flush=True)
+    traceback.print_exc()
+    with state_lock:
+        if connected_source == source_id:
+            connected_source = None
+        probe_results[source_id] = {"state": state, "connected": False, "error": str(exc),
+                                    "hint": hint, "code": code}
+
+
+def _close_adapter(adapter):
     try:
         adapter.close()
-    except Exception:  # noqa: BLE001 - освобождение не должно ломать HTTP-ответ
-        pass
+    except Exception:  # noqa: BLE001 - не скрывать исходную ошибку
+        traceback.print_exc()
 
 
-def _scan_snapshot():
+def _ensure_no_capture():
     with state_lock:
-        cloud = scan["cloud"]
-        running = scan["running"]
-        frames = scan["frames"]
-        error = scan["error"]
-        warning = scan["warning"]
-        tracking = scan["tracking"]
-        speed = scan["speed_mps"]
-        source = scan["source"]
-        preview_frame = scan["latest_frame"]
-        if cloud is None:
-            xyz = []
-        else:
-            import numpy as np
-            all_points = np.asarray(cloud.points, dtype=np.float32)
-            if len(all_points) > MAX_SCAN_PREVIEW_POINTS:
-                stride = int(math.ceil(len(all_points) / MAX_SCAN_PREVIEW_POINTS))
-                all_points = all_points[::stride]
-            xyz = [[round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4),
-                    round(float(np.linalg.norm(p)), 3)] for p in all_points]
-            point_count = len(cloud.points)
-        if cloud is None:
-            point_count = 0
-    preview = None
-    if preview_frame is not None:
-        import numpy as np
-        preview = {
-            "color": _encode_array(preview_frame.color_rgb, dtype=np.uint8),
-            "depth": _encode_array(preview_frame.depth_mm, dtype="<u2"),
-        }
-    return {
-        "running": running,
-        "frames": frames,
-        "pointCount": point_count,
-        "error": error,
-        "warning": warning,
-        "tracking": tracking,
-        "speedMps": round(float(speed), 3),
-        "source": source,
-        "preview": preview,
-        "points": xyz,
-    }
+        runner = scan_runner
+    if runner is not None:
+        with runner.lock:
+            if runner.active is not None:
+                raise RuntimeError("Сначала завершите или отмените сканирование.")
 
 
-def _scan_worker(source_id):
-    """Accumulate frames using pairwise ICP; report, don't hide, tracking loss."""
-    adapter = None
-    try:
-        import numpy as np
-        import open3d as o3d
+def _devices_response():
+    with state_lock:
+        probes = dict(probe_results)
+    return {"devices": catalog(probes), "demoAvailable": True,
+            "preferredSource": preferred_source(probes)}
 
-        adapter = get_adapter(source_id)
-        if adapter is None or not adapter.implemented:
-            raise RuntimeError("Для выбранного источника нет реализованного адаптера.")
 
-        last_cloud = None
-        pose = np.eye(4)
-        last_time = None
-        while True:
-            with state_lock:
-                if not scan["running"]:
-                    break
-            with capture_lock:
-                frame = adapter.capture()
-            with state_lock:
-                scan["latest_frame"] = frame
-            xyz = np.asarray(frame.points, dtype=np.float64).reshape((-1, 3))
-            if len(xyz) < 250:
-                with state_lock:
-                    scan["tracking"] = "lost"
-                    scan["warning"] = "Потеряно отслеживание: слишком мало точек глубины. Верните текстурированную поверхность в кадр."
-                    scan["speed_mps"] = 0.0
-                time.sleep(0.1)
+def _probe_devices():
+    """Probe, then release temporary handles; only /connect opens a live stream."""
+    global connected_source
+    detected = []
+    found_families = {}
+    with capture_lock:
+        _ensure_no_capture()
+        for sensor_id, adapter in list(ADAPTERS.items()):
+            if not adapter.implemented:
                 continue
-
-            cloud = o3d.geometry.PointCloud()
-            cloud.points = o3d.utility.Vector3dVector(xyz)
-            cloud = cloud.voxel_down_sample(0.035)
-            now = time.monotonic()
-            if last_cloud is None:
-                aligned = o3d.geometry.PointCloud(cloud)
-                tracking = "tracking"
-                warning = ""
-                speed = 0.0
-            else:
-                result = o3d.pipelines.registration.registration_icp(
-                    cloud,
-                    last_cloud,
-                    0.15,
-                    np.eye(4),
-                    o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=40),
-                )
-                dt = max(0.02, now - (last_time if last_time is not None else now - 0.1))
-                rotation = result.transformation[:3, :3]
-                angle = math.acos(float(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)))
-                speed = float(np.linalg.norm(result.transformation[:3, 3]) / dt)
-                angular_speed = angle / dt
-
-                if result.fitness < 0.25 or result.inlier_rmse > 0.12:
-                    tracking = "lost"
-                    warning = "Потеряно отслеживание кадров. Остановитесь, наведите датчик на уже просмотренную неподвижную поверхность и продолжайте медленно."
-                    # Re-anchor on the newest frame so ICP can recover after a short loss.
-                    last_cloud = cloud
-                    last_time = now
-                    with state_lock:
-                        scan["tracking"] = tracking
-                        scan["warning"] = warning
-                        scan["speed_mps"] = speed
-                    time.sleep(0.08)
-                    continue
-
-                if speed > 0.45 or angular_speed > 1.0:
-                    tracking = "moving"
-                    warning = "Датчик движется слишком быстро. Замедлите движение и сохраняйте перекрытие между кадрами."
-                    # Skip this integration and re-anchor to avoid adding a visibly bad frame.
-                    last_cloud = cloud
-                    last_time = now
-                    with state_lock:
-                        scan["tracking"] = tracking
-                        scan["warning"] = warning
-                        scan["speed_mps"] = speed
-                    time.sleep(0.04)
-                    continue
-
-                pose = pose @ result.transformation
-                aligned = o3d.geometry.PointCloud(cloud)
-                aligned.transform(pose)
-                tracking = "tracking"
-                warning = ""
-
+            family = device_family(sensor_id)
             with state_lock:
-                if not scan["running"]:
-                    break
-                scan["cloud"] = (aligned if scan["cloud"] is None
-                                 else (scan["cloud"] + aligned).voxel_down_sample(0.025))
-                scan["frames"] += 1
-                scan["tracking"] = tracking
-                scan["warning"] = warning
-                scan["speed_mps"] = speed
-                scan["error"] = ""
-
-            last_cloud = cloud
-            last_time = now
-            time.sleep(0.08)
-    except Exception as exc:
-        with state_lock:
-            scan["error"] = str(exc)
-            scan["warning"] = ""
-            scan["tracking"] = "lost"
-            scan["running"] = False
-    finally:
-        # Сенсор должен быть освобождён всегда: иначе другое приложение не сможет его открыть.
-        if adapter is not None:
+                current = connected_source
+            if current and current != sensor_id and device_family(current) == family:
+                with state_lock:
+                    probe_results[sensor_id] = {"state": "not_checked", "connected": False,
+                                                "error": "Датчик уже открыт другим адаптером. Отключите его перед выбором этого источника."}
+                continue
+            if family in found_families:
+                with state_lock:
+                    probe_results[sensor_id] = {"state": "not_checked", "connected": False,
+                                                "error": "Датчик обнаружен другим адаптером. Для проверки этого варианта выберите его и подключите."}
+                continue
+            if not adapter.dependencies_available():
+                error = adapter.dependency_error()
+                print(f"[Depth Studio] Обнаружение: источник={sensor_id}, компоненты недоступны: {error}", flush=True)
+                with state_lock:
+                    probe_results[sensor_id] = {"state": "driver_missing", "connected": False,
+                                                "error": error}
+                continue
+            was_connected = current == sensor_id
             try:
-                adapter.close()
-            except Exception:  # noqa: BLE001 - закрытие не должно скрывать исходную ошибку
-                pass
+                frame = adapter.capture()
+                _validate_frame(frame)
+                detected.append(sensor_id)
+                found_families[family] = sensor_id
+                with state_lock:
+                    probe_results[sensor_id] = {"state": "connected" if was_connected else "detected",
+                                                "connected": was_connected, "error": "", "hint": "", "code": ""}
+            except Exception as exc:  # noqa: BLE001 - точная ошибка важна для диагностики
+                _record_sensor_error(sensor_id, "Обнаружение", exc)
+                _close_adapter(adapter)
+            else:
+                if not was_connected:
+                    _close_adapter(adapter)
+    response = _devices_response()
+    response["detected"] = detected
+    response["connected"] = [d["id"] for d in response["devices"] if d.get("connected")]
+    return response
+
+
+class DeviceOpenTimeout(RuntimeError):
+    code = "open_timeout"
+    hint = "Закройте другие Kinect-приложения, проверьте питание и USB и повторите подключение."
+
+    def __init__(self):
+        super().__init__("Датчик не открылся за отведённое время.")
+
+
+class DeviceFrameTimeout(RuntimeError):
+    code = "frame_timeout"
+    hint = "Проверьте USB, питание и другие приложения Kinect, затем подключите источник снова."
+
+    def __init__(self):
+        super().__init__("Датчик не вернул кадр за отведённое время.")
+
+
+def _deadline_expired(deadline):
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _connect_device(source_id, deadline=None):
+    global connected_source
+    adapter = _adapter_for(source_id)
+    with capture_lock:
+        _ensure_no_capture()
+        if _deadline_expired(deadline):
+            error = DeviceOpenTimeout()
+            print(f"[Depth Studio] Подключение: источник={source_id}, код={error.code}, ошибка={error}, подсказка={error.hint}", flush=True)
+            raise error
         with state_lock:
-            scan["running"] = False
-            if scan["tracking"] in ("tracking", "moving") and not scan["error"]:
-                scan["tracking"] = "stopped"
-                scan["warning"] = ""
+            previous = connected_source
+        if previous and previous != source_id:
+            _close_adapter(_adapter_for(previous))
+            with state_lock:
+                connected_source = None
+                probe_results[previous] = {"state": "detected", "connected": False, "error": ""}
+        try:
+            if not adapter.dependencies_available():
+                raise RuntimeError(adapter.dependency_error())
+            frame = adapter.capture()
+            _validate_frame(frame)
+            frame_response = _frame_response(frame, source_id)
+            if _deadline_expired(deadline):
+                raise DeviceOpenTimeout()
+        except Exception as exc:
+            _record_sensor_error(source_id, "Подключение", exc,
+                                 "driver_missing" if not adapter.dependencies_available() else "no_device")
+            _close_adapter(adapter)
+            raise
+        with state_lock:
+            connected_source = source_id
+            probe_results[source_id] = {"state": "connected", "connected": True, "error": "", "hint": "", "code": ""}
+    return {"ok": True, "source": source_id, "frame": frame_response}
 
 
-def _cloud_text(format_name, xyz):
-    """Serialize vertices as ASCII PLY or vertex-only OBJ (no mesh faces)."""
-    rows = [tuple(float(value) for value in point[:3]) for point in xyz]
-    if format_name == "obj":
-        lines = ["# Depth Studio point cloud; vertices only, no mesh faces", "o DepthStudio"]
-        lines.extend("v %.6f %.6f %.6f" % point for point in rows)
-        return ("\n".join(lines) + "\n").encode("utf-8")
-    header = (
-        "ply\nformat ascii 1.0\ncomment Depth Studio point cloud; no mesh faces\n"
-        f"element vertex {len(rows)}\n"
-        "property float x\nproperty float y\nproperty float z\nend_header\n"
-    )
-    return (header + "".join("%.6f %.6f %.6f\n" % point for point in rows)).encode("ascii")
+def _disconnect_device(source_id):
+    global connected_source
+    with capture_lock:
+        _ensure_no_capture()
+        with state_lock:
+            current = connected_source
+        if current and (not source_id or source_id == current):
+            _close_adapter(_adapter_for(current))
+            with state_lock:
+                connected_source = None
+                probe_results[current] = {"state": "detected", "connected": False, "error": ""}
+    return {"ok": True}
+
+
+def _capture_connected(source_id, deadline=None, *, include_color=False):
+    adapter = _adapter_for(source_id)
+    with capture_lock:
+        _ensure_no_capture()
+        with state_lock:
+            current = connected_source
+        if current != source_id:
+            raise RuntimeError("Источник не подключён. Нажмите «Подключить выбранный источник».")
+        try:
+            if _deadline_expired(deadline):
+                raise DeviceFrameTimeout()
+            frame = adapter.capture()
+            _validate_frame(frame)
+            response = _frame_response(frame, source_id, include_color=include_color)
+            if _deadline_expired(deadline):
+                raise DeviceFrameTimeout()
+        except Exception as exc:
+            _record_sensor_error(source_id, "Чтение кадра", exc)
+            _close_adapter(adapter)
+            raise
+    return response
+
+
+def _tilt_adapter(source_id):
+    if source_id != "kinect_v1_sdk":
+        raise RuntimeError("Наклон доступен только для Kinect 360 через Microsoft Kinect SDK 1.8.")
+    adapter = _adapter_for(source_id)
+    with state_lock:
+        current = connected_source
+    if current != source_id:
+        raise RuntimeError("Подключите Kinect через Microsoft Kinect SDK 1.8.")
+    if not callable(getattr(adapter, "tilt_status", None)) or not callable(getattr(adapter, "set_tilt", None)):
+        raise RuntimeError("Этот адаптер не поддерживает управление наклоном.")
+    return adapter
+
+
+def _tilt_status(source_id):
+    with capture_lock:
+        _ensure_no_capture()
+        return {"source": source_id, **_tilt_adapter(source_id).tilt_status()}
+
+
+def _set_tilt(payload, deadline=None):
+    source_id = str(payload.get("source", ""))
+    with capture_lock:
+        # Moving the camera during a pass can corrupt the map. Keep this check
+        # on the server, not merely in the UI, and serialize with capture/start.
+        _ensure_no_capture()
+        with state_lock:
+            pending = scan_start_pending
+        if pending is not None:
+            raise RuntimeError("Сканирование запускается: команда наклона отменена.")
+        if _deadline_expired(deadline):
+            raise RuntimeError("Запрос наклона устарел; команда мотору не отправлена.")
+        adapter = _tilt_adapter(source_id)
+        return {"ok": True, "source": source_id, **adapter.set_tilt(payload.get("angle"), deadline=deadline)}
+
+
+def _validate_tilt_request(headers):
+    # Motor actions must not be triggerable by a cross-origin HTML form or a
+    # browser's no-cors text/plain POST. No OPTIONS/CORS handler is exposed.
+    content_type = (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json" or headers.get("X-Depth-Studio-Tilt") != "1":
+        raise ValueError("Для управления наклоном нужен запрос приложения Depth Studio.")
+    origin = headers.get("Origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != (headers.get("Host") or "").lower() or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("Запрос наклона пришёл с другого источника.")
+
+
+def _require_scan_modules():
+    try:
+        import numpy  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(f"NumPy не импортируется в среде Depth Studio: {exc}. Нажмите «Восстановить среду».") from exc
+    try:
+        import open3d  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError("Open3D не импортируется в среде Depth Studio: "
+                           f"{exc}. Проверьте Microsoft Visual C++ Redistributable (x64) и настройку среды.") from exc
+
+
+def _start_scan(payload):
+    source_id = str(payload.get("source", ""))
+    adapter = _adapter_for(source_id)
+    with state_lock:
+        current = connected_source
+    if current != source_id:
+        raise RuntimeError("Источник не подключён. Сначала подключите выбранный датчик.")
+    # A successful SDK setter is not proof the motor is stationary. Enforce a
+    # minimum pause and still ask the operator to check it physically.
+    scan_wait = getattr(adapter, "tilt_scan_wait", lambda: 0.0)()
+    if scan_wait > 0:
+        raise RuntimeError(f"После наклона подождите не менее {math.ceil(scan_wait)} с и убедитесь, что мотор остановился.")
+    _require_scan_modules()
+    from scan_pipeline.camera import Intrinsics
+    from scan_pipeline.config import MAX_FPS_PROFILE, ROBOT_PROFILE, ScanSettings
+
+    # Reject invalid options before grabbing a frame or creating a pass. The
+    # experimental RGB veto is opt-in: it can be slower and misfire when RGB
+    # and depth are not registered/synchronized. A resumed pass keeps its own
+    # saved settings instead of the current UI selection.
+    settings = ScanSettings.for_profile(payload.get("profile", MAX_FPS_PROFILE))
+    # This is an application-side upper bound, not a claim that Kinect can
+    # measure that far. The SDK adapter still rejects its out-of-range codes.
+    settings.depth_max_m = payload.get("depthMaxM", 4.0)
+    settings.validate()
+    landmarks = payload.get("visualLandmarks", False)
+    if not isinstance(landmarks, bool):
+        raise ValueError("Параметр RGB-опор должен быть логическим значением.")
+    if landmarks and settings.profile != ROBOT_PROFILE:
+        raise ValueError("Экспериментальная сверка RGB-опор доступна только в профиле «Робот».")
+    settings.visual_landmark_veto = landmarks
+    runner = _runner()
+    with runner.lock:
+        if runner.active is not None or runner._working():
+            raise RuntimeError("Предыдущий проход ещё не завершён.")
+    with capture_lock:
+        try:
+            frame = adapter.capture()
+            width, height = _validate_frame(frame)
+        except Exception as exc:
+            _record_sensor_error(source_id, "Запуск сканирования", exc)
+            _close_adapter(adapter)
+            raise
+    result = runner.start(adapter, source=source_id, settings=settings,
+                          intrinsics=Intrinsics.kinect_v1(width, height),
+                          name=str(payload.get("name", ""))[:120],
+                          resume_pass_id=payload.get("resumePassId") or None)
+    return {"ok": True, "source": source_id, **result}
+
+
+def _start_scan_with_pending(payload):
+    global scan_start_pending
+    with state_lock:
+        if scan_start_pending is not None:
+            raise RuntimeError("Запуск сканирования уже выполняется. Дождитесь ответа или отмените его.")
+        scan_start_pending = {"source": str(payload.get("source", ""))}
+    try:
+        with operation_lock:
+            return _start_scan(payload)
+    finally:
+        with state_lock:
+            scan_start_pending = None
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "DepthStudioBridge/2.0"
+    server_version = "DepthStudioBridge/3.0"
 
     def do_GET(self):
         url = urlparse(self.path)
         try:
             if url.path == "/api/health":
-                modules = _optional_modules()
-                self.respond(200, {
-                    "ok": True,
-                    "python": os.sys.version.split()[0],
-                    "modules": modules,
-                    "host": HOST,
-                    "instance": INSTANCE,
-                    "environment": _environment_info(),
-                })
-                return
-            if url.path == "/api/devices":
-                self.respond(
-                    200,
-                    {
-                        "devices": catalog(probe_results),
-                        "demoAvailable": True,
-                        "preferredSource": preferred_source(probe_results),
-                    },
-                )
-                return
-            if url.path == "/api/frame":
+                self.respond(200, {"ok": True, "python": os.sys.version.split()[0],
+                                   "modules": _optional_modules(), "host": HOST, "instance": INSTANCE,
+                                   "environment": _environment_info()})
+            elif url.path == "/api/devices":
+                self.respond(200, _devices_response())
+            elif url.path == "/api/devices/tilt":
+                source_id = parse_qs(url.query).get("source", [""])[0]
+                self.respond(200, _tilt_status(source_id))
+            elif url.path == "/api/frame":
+                source_id = parse_qs(url.query).get("source", [""])[0]
+                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
+                self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE,
+                                                     include_color=include_color))
+            elif url.path == "/api/scan":
+                query = parse_qs(url.query)
+                include_preview = query.get("preview", [""])[0] != "0"
+                include_color = query.get("color", [""])[0] == "1"
+                include_points = query.get("points", [""])[0] != "0"
+                known_version = query.get("pointsVersion", [None])[0]
+                self.respond(200, _scan_snapshot(include_preview=include_preview, include_color=include_color,
+                                                 include_points=include_points, known_points_version=known_version))
+            elif url.path == "/api/scan/front":
+                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
+                self.respond(200, _front_snapshot(include_color=include_color))
+            elif url.path == "/api/scan/passes":
+                self.respond(200, {"passes": _runner().list_passes(), "verifiedOnHardware": False})
+            elif url.path == "/api/export":
                 params = parse_qs(url.query)
-                source_id = params.get("source", [""])[0]
-                adapter = get_adapter(source_id)
-                if adapter is None or not adapter.implemented:
-                    raise ValueError("Выберите реализованный источник глубины. Для демонстрации датчик не нужен.")
-                if not adapter.dependencies_available():
-                    raise RuntimeError(adapter.dependency_error())
-                with capture_lock:
-                    frame = adapter.capture()
-                with state_lock:
-                    probe_results[source_id] = {"state": "connected", "connected": True, "error": ""}
-                self.respond(200, _frame_response(frame, source_id))
-                return
-            if url.path == "/api/scan":
-                self.respond(200, _scan_snapshot())
-                return
-            if url.path == "/api/export":
-                format_name = parse_qs(url.query).get("format", ["ply"])[0].lower()
-                if format_name not in ("ply", "obj"):
-                    raise ValueError("Формат экспорта должен быть PLY или OBJ.")
-                with state_lock:
-                    cloud = scan["cloud"]
-                    if cloud is None:
-                        raise RuntimeError("Нет данных для экспорта. Сначала выполните сканирование.")
-                    import numpy as np
-                    xyz = np.asarray(cloud.points).copy()
-                body = _cloud_text(format_name, xyz)
-                filename = "depth-studio-scan." + format_name
+                fmt = params.get("format", ["ply"])[0].lower()
+                target = params.get("target", [None])[0]
+                body, filename, content_type = _runner().export(fmt, target)
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
-                return
-            self.send_error(404)
+            else:
+                self.send_error(404)
         except ValueError as exc:
-            self.respond(400, {"error": str(exc)})
-        except Exception as exc:
-            # Подсказка адаптера (что именно сделать) полезна интерфейсу не меньше текста ошибки.
-            self.respond(503, {"error": str(exc), "hint": getattr(exc, "hint", "")})
+            self.respond(400, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
+        except Exception as exc:  # noqa: BLE001
+            self.respond(503, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
 
     def do_POST(self):
         url = urlparse(self.path)
         try:
+            if url.path == "/api/devices/tilt":
+                _validate_tilt_request(self.headers)
             payload = self.read_json()
-            if url.path == "/api/devices/probe":
-                devices = []
-                busy_families = {}
-                for sensor_id, adapter in list(ADAPTERS.items()):
-                    if not adapter.implemented:
-                        continue
-                    family = device_family(sensor_id)
-                    if family in busy_families:
-                        # Kinect 360 уже открыт другим адаптером: второй раз сенсор не трогаем.
-                        probe_results[sensor_id] = {
-                            "state": "no_device",
-                            "connected": False,
-                            "error": (
-                                "Датчик Kinect 360 уже открыт адаптером "
-                                f"«{busy_families[family]}». Выберите один источник Kinect 360."
-                            ),
-                        }
-                        continue
-                    if not adapter.dependencies_available():
-                        probe_results[sensor_id] = {
-                            "state": "driver_missing", "connected": False,
-                            "error": adapter.dependency_error(),
-                        }
-                        continue
-                    try:
-                        with capture_lock:
-                            frame = adapter.capture()
-                        if len(frame.points) < 1:
-                            raise RuntimeError("Драйвер не вернул точки глубины.")
-                        probe_results[sensor_id] = {"state": "connected", "connected": True, "error": ""}
-                        busy_families[family] = adapter.name
-                        # Тот же физический сенсор нельзя держать открытым двумя адаптерами.
-                        for other_id, other in ADAPTERS.items():
-                            if other_id != sensor_id and device_family(other_id) == family:
-                                try:
-                                    other.close()
-                                except Exception:  # noqa: BLE001
-                                    pass
-                    except Exception as exc:
-                        probe_results[sensor_id] = {
-                            "state": "no_device", "connected": False, "error": str(exc),
-                        }
-                devices = catalog(probe_results)
-                connected = [item["id"] for item in devices if item.get("connected")]
-                self.respond(200, {"devices": devices, "connected": connected})
-                return
+            connect_deadline = time.monotonic() + DEVICE_CONNECT_DEADLINE if url.path == "/api/devices/connect" else None
+            tilt_deadline = time.monotonic() + DEVICE_TILT_DEADLINE if url.path == "/api/devices/tilt" else None
             if url.path == "/api/scan/start":
-                source_id = str(payload.get("source", ""))
-                adapter = get_adapter(source_id)
-                if adapter is None or not adapter.implemented:
-                    raise ValueError("Для выбранного устройства нет реализованного модуля. Выберите демо-режим или Kinect 360 (v1).")
-                if not adapter.dependencies_available():
-                    raise RuntimeError(adapter.dependency_error())
-                modules = _optional_modules()
-                if not modules.get("numpy"):
-                    raise RuntimeError(
-                        "В среде Depth Studio нет NumPy. Откройте «Настройка среды» и нажмите «Восстановить среду»."
-                    )
-                if not modules.get("open3d"):
-                    raise RuntimeError(
-                        "Open3D не импортируется в среде Depth Studio, поэтому совмещение кадров недоступно. "
-                        "Проверьте Microsoft Visual C++ Redistributable (x64) и повторите настройку среды."
-                    )
-                # Fail early with a readable sensor error rather than starting a dead worker.
-                with capture_lock:
-                    test_frame = adapter.capture()
-                if len(test_frame.points) < 250:
-                    raise RuntimeError("Недостаточно точек глубины. Проверьте подключение и освещение/поверхности.")
-                with state_lock:
-                    worker = scan["worker"]
-                    if scan["running"] or (worker and worker.is_alive()):
-                        raise RuntimeError("Предыдущее сканирование ещё завершается. Подождите и повторите.")
-                    scan.update(running=True, source=source_id, cloud=None, latest_frame=None, last=None, pose=None,
-                                frames=0, error="", warning="", tracking="tracking", speed_mps=0.0)
-                    worker = threading.Thread(target=_scan_worker, args=(source_id,), daemon=True,
-                                              name="depth-studio-scanner")
-                    scan["worker"] = worker
-                    worker.start()
-                self.respond(200, {"ok": True, "source": source_id})
-                return
-            if url.path == "/api/scan/stop":
-                with state_lock:
-                    scan["running"] = False
-                    worker = scan["worker"]
-                    source_id = scan["source"]
-                if worker and worker.is_alive():
-                    worker.join(timeout=1.5)
-                _release_adapter(source_id)
-                with state_lock:
-                    if scan["tracking"] in ("tracking", "moving") and not scan["error"]:
-                        scan["tracking"] = "stopped"
-                        scan["warning"] = ""
-                self.respond(200, {"ok": True})
-                return
-            if url.path == "/api/scan/clear":
-                with state_lock:
-                    scan["running"] = False
-                    worker = scan["worker"]
-                    source_id = scan["source"]
-                if worker and worker.is_alive():
-                    worker.join(timeout=1.5)
-                _release_adapter(source_id)
-                with state_lock:
-                    scan.update(source=None, cloud=None, latest_frame=None, last=None, pose=None, frames=0,
-                                error="", warning="", tracking="idle", speed_mps=0.0)
-                    if not worker or not worker.is_alive():
-                        scan["worker"] = None
-                self.respond(200, {"ok": True})
-                return
-            self.send_error(404)
-        except ValueError as exc:
-            self.respond(400, {"error": str(exc)})
-        except Exception as exc:
-            # Подсказка адаптера (что именно сделать) полезна интерфейсу не меньше текста ошибки.
-            self.respond(503, {"error": str(exc), "hint": getattr(exc, "hint", "")})
+                response = _start_scan_with_pending(payload)
+            else:
+                with operation_lock:
+                    response = self._device_or_scan_command(url.path, payload, connect_deadline, tilt_deadline)
+            if response is None:
+                self.send_error(404)
+            else:
+                self.respond(200, response)
+        except (ValueError, TypeError) as exc:
+            self.respond(400, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
+        except Exception as exc:  # noqa: BLE001
+            self.respond(503, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
+
+    def _device_or_scan_command(self, path, payload, connect_deadline=None, tilt_deadline=None):
+        if path == "/api/devices/probe":
+            response = _probe_devices()
+        elif path == "/api/devices/connect":
+            response = _connect_device(str(payload.get("source", "")), connect_deadline)
+        elif path == "/api/devices/disconnect":
+            response = _disconnect_device(str(payload.get("source", "")))
+        elif path == "/api/devices/tilt":
+            response = _set_tilt(payload, tilt_deadline)
+        elif path == "/api/scan/stop":
+            response = _runner().stop()
+            if not response.get("ok"):
+                raise RuntimeError(response.get("message", "Не удалось завершить проход."))
+        elif path == "/api/scan/cancel":
+            response = _runner().cancel()
+        elif path == "/api/scan/clear":
+            response = _runner().clear_view()
+        elif path == "/api/scan/passes/delete":
+            response = _runner().delete_pass(payload.get("passId"))
+        elif path == "/api/scan/passes/select":
+            response = _runner().select_pass(payload.get("passId"))
+        elif path == "/api/scan/merge":
+            response = _runner().merge(payload.get("passIds", []),
+                                       remove_floor=bool(payload.get("removeFloor", False)))
+        else:
+            return None
+        return response
 
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -563,53 +709,58 @@ class Handler(BaseHTTPRequestHandler):
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Ожидается JSON-объект.")
+            return payload
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError("Некорректный JSON в запросе.") from exc
 
     def respond(self, status, data):
         body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            pass  # client timed out or closed the window
 
     def log_message(self, fmt, *args):
+        # The single-frame view can be polled several times per second. Avoid
+        # filling the disk with successful preview requests; errors still log.
+        if getattr(self, "path", "").split("?", 1)[0] == "/api/scan/front" and len(args) > 1 and str(args[1]) == "200":
+            return
         print("[Depth Studio] %s - %s" % (self.address_string(), fmt % args), flush=True)
 
 
 def main():
     environment = _environment_info()
     if REQUIRE_APP_ENV and not environment["isolated"]:
-        print(
-            "Depth Studio: запуск из чужого интерпретатора запрещён. "
-            "Ожидалась среда в " + (ENV_ROOT or "%LOCALAPPDATA%\\DepthStudio") + ", "
-            "получено " + environment["executable"] + ".",
-            flush=True,
-        )
+        print("Depth Studio: запуск из чужого интерпретатора запрещён. Ожидалась среда в " +
+              (ENV_ROOT or "%LOCALAPPDATA%\\DepthStudio") + ", получено " + environment["executable"] + ".", flush=True)
         raise SystemExit(2)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    server.daemon_threads = True
-    print(
-        f"Depth Studio API: http://{HOST}:{PORT} (localhost only) | python={environment['executable']} | "
-        f"isolated={environment['isolated']}",
-        flush=True,
-    )
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    httpd.daemon_threads = True
+    print(f"Depth Studio API: http://{HOST}:{PORT} (localhost only) | python={environment['executable']} | "
+          f"isolated={environment['isolated']}", flush=True)
     try:
-        server.serve_forever(poll_interval=0.25)
+        httpd.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass
     finally:
         with state_lock:
-            scan["running"] = False
-        for adapter in ADAPTERS.values():
+            runner = scan_runner
+        if runner is not None:
             try:
-                adapter.close()
-            except Exception:  # noqa: BLE001
-                pass
-        server.server_close()
+                runner.shutdown()
+            except Exception:  # noqa: BLE001 - keep interrupted files on shutdown
+                traceback.print_exc()
+        for adapter in ADAPTERS.values():
+            _close_adapter(adapter)
+        httpd.server_close()
 
 
 if __name__ == "__main__":

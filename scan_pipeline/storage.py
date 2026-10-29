@@ -4,19 +4,22 @@
 
     manifest.json        состояние, настройки, интринсики, счётчики (атомарная запись)
     poses.jsonl          по одной строке на интегрированный кадр (поза, время, файл)
-    keyframes/kf_NNNNNN.npz  глубина uint16 (мм), RGB uint8, интринсики — сжатый npz
+    keyframes/kf_NNNNNN.npz  глубина uint16 (мм), RGB uint8, интринсики — npz
     mesh.ply / mesh.glb  результат после завершения прохода
     metrics.json         метрики качества результата
 
 Запись кадра: сначала npz во временный файл и ``os.replace``, затем строка в
 poses.jsonl. Поэтому при сбое в журнале нет строк без файла; неполная последняя строка
-игнорируется при чтении. Так восстановимы все интегрированные кадры.
+игнорируется при чтении. При работе через AsyncPassStore несколько последних кадров
+могут ещё ожидать записи при аварийном закрытии; Stop и Cancel дожидаются записи.
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -105,7 +108,9 @@ class PassStore:
         color = (np.zeros(np.shape(depth_mm) + (3,), dtype=np.uint8) if color_rgb is None
                  else np.asarray(color_rgb, dtype=np.uint8))
         with open(tmp, "wb") as handle:
-            np.savez_compressed(
+            # Uncompressed NPZ is still readable by np.load, but avoids spending
+            # frame time compressing RGB/depth on the tracking CPU.
+            np.savez(
                 handle,
                 depth_mm=np.asarray(depth_mm, dtype=np.uint16),
                 color=color,
@@ -161,6 +166,85 @@ class PassStore:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
+class AsyncPassStore:
+    """Persist keyframes in order without blocking ICP on compression/fsync.
+
+    The bounded queue limits memory; if the disk cannot keep up, the producer
+    eventually waits rather than silently dropping an integrated keyframe. A
+    clean stop must call close() before finalization, deletion, or release.
+    """
+
+    def __init__(self, store: PassStore, max_pending: int = 4):
+        self.store = store
+        self._queue = queue.Queue(maxsize=max_pending)
+        self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._error: Exception | None = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._write_loop, name="depth-studio-keyframes", daemon=True)
+        self._thread.start()
+
+    def _write_loop(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                with self._lock:
+                    failed = self._error is not None
+                if not failed:
+                    try:
+                        self.store.append_keyframe(*item)
+                    except Exception as exc:  # noqa: BLE001 - surface failures to the engine
+                        with self._lock:
+                            self._error = exc
+            finally:
+                self._queue.task_done()
+
+    def append_keyframe(self, index, depth_mm, color_rgb, pose, intrinsics, captured_at):
+        # Own the buffers: adapters may recycle their native frame arrays.
+        item = (index, np.array(depth_mm, dtype=np.uint16, copy=True),
+                None if color_rgb is None else np.array(color_rgb, dtype=np.uint8, copy=True),
+                np.array(pose, dtype=np.float64, copy=True), intrinsics, captured_at)
+        while True:
+            with self._lock:
+                error, closed = self._error, self._closed
+            if error is not None:
+                raise OSError(f"Запись ключевых кадров: {error}") from error
+            if closed:
+                raise OSError("Запись ключевых кадров уже остановлена.")
+            try:
+                self._queue.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                continue  # bounded backpressure, never discard an accepted keyframe
+
+    @property
+    def error(self):
+        with self._lock:
+            return self._error
+
+    def close(self):
+        # A second caller must also wait until the writer has actually stopped.
+        with self._close_lock:
+            with self._lock:
+                first_close = not self._closed
+                self._closed = True
+            if first_close:
+                self._queue.put(None)
+            self._thread.join()  # outer runner timeout keeps resources alive if disk is stuck
+            with self._lock:
+                error = self._error
+            if error is not None:
+                raise OSError(f"Запись ключевых кадров: {error}") from error
+
+    def load_keyframes(self):
+        return self.store.load_keyframes()
+
+    def keyframe_records(self):
+        return self.store.keyframe_records()
+
+
 class ScanStorage:
     """Корень всех проходов. Каталог по умолчанию: %LOCALAPPDATA%\\DepthStudio\\scans."""
 
@@ -171,7 +255,10 @@ class ScanStorage:
         return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def store(self, pass_id: str) -> PassStore:
-        if "/" in pass_id or "\\" in pass_id or pass_id in ("", ".", ".."):
+        # Идентификатор приходит из HTTP-запроса: не допускаем пути, буквы диска
+        # Windows и служебный каталог объединённого результата.
+        if (not isinstance(pass_id, str) or not pass_id or pass_id == "merged" or
+                any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in pass_id)):
             raise ValueError("Некорректный идентификатор прохода.")
         return PassStore(self.root / pass_id)
 

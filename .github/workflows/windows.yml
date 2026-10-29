@@ -65,8 +65,51 @@ jobs:
           console.log('requirements-scan.txt and python-lock.json agree.');
           "
 
+  windows-tracking-regression:
+    # Run the installed Open3D version early on Windows as well as in the
+    # clean-installer smoke test. This uses the existing pinned runtime lock.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-scan.lock.txt
+      - name: Install pinned scan runtime for tracking tests
+        shell: pwsh
+        run: |
+          python -m pip install --quiet --only-binary=:all: --require-hashes -r requirements-scan.lock.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows Open3D tracking regressions
+        shell: pwsh
+        timeout-minutes: 8
+        env:
+          OMP_NUM_THREADS: '2'
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'tracking-regression.log'
+          python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $trace = (Get-Content $log -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows Open3D tracking tests::$trace"
+            exit $code
+          }
+          $robotLog = Join-Path $env:RUNNER_TEMP 'robot-tracking-regression.log'
+          python -m unittest discover -s tests -p test_robot_tracking.py -v 2>&1 | Tee-Object -FilePath $robotLog
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $trace = (Get-Content $robotLog -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows robot tracking tests::$trace"
+            exit $code
+          }
+
   build:
-    needs: [renderer, unit-tests]
+    needs: [renderer, unit-tests, windows-tracking-regression]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +123,24 @@ jobs:
       - run: npm ci
       - run: python -m pip install --quiet packaging numpy
       - run: npm run check:python-lock
-      - run: npm run test:python
-      - run: npm run test:desktop
+      - name: Python bridge tests on Windows
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'python-tests.log'
+          npm run test:python 2>&1 | Tee-Object -FilePath $log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $tail = (Get-Content $log -Tail 120) -join "`n"
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error::Python bridge tests failed: $escaped"
+            exit $testExitCode
+          }
+      - name: Desktop tests on Windows
+        timeout-minutes: 5
+        run: node scripts/run-windows-desktop-tests.cjs
       - uses: actions/download-artifact@v4
         with:
           name: depth-studio-renderer
@@ -173,7 +232,17 @@ jobs:
             'resources\python-wheels',
             'resources\python-lock.json',
             'resources\requirements-scan.lock.txt',
-            'resources\server.py'
+            'resources\server.py',
+            'resources\scan_pipeline\process_engine.py',
+            'resources\scan_pipeline\frame_validation.py',
+            'resources\scan_pipeline\front_view.py',
+            'resources\scan_pipeline\landmarks.py',
+            'resources\scan_pipeline\runtime.py',
+            'resources\scripts\benchmark-synthetic-fps.py',
+            'resources\scripts\benchmark-tracking-stability.py',
+            'resources\scripts\benchmark-robot-turn.py',
+            'resources\tests\synthetic_room.py',
+            'resources\tests\synthetic_robot.py'
           )
           foreach ($relative in $required) {
             if (-not (Test-Path (Join-Path 'release/win-unpacked' $relative))) {
@@ -212,6 +281,7 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: Depth-Studio-Windows-Installer
@@ -298,6 +368,124 @@ jobs:
           }
           $sizeMb = [math]::Round($data.environment.envSizeBytes / 1MB, 1)
           Write-Output "::notice::Первый запуск без Python прошёл: $($data.environment.python.version), NumPy $($data.environment.packages.numpy.version), Open3D $($data.environment.packages.open3d.version); среда занимает $sizeMb MiB"
+
+      - name: Smoke-test installed scan pipeline and real .NET pixel arrays
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $env:PATH = Get-Content (Join-Path $env:RUNNER_TEMP 'clean-path.txt') -Raw
+          $env:OMP_NUM_THREADS = '2'
+          $env:PYTHONIOENCODING = 'utf-8'
+          $env:DEPTH_STUDIO_EXPECT_RESOURCES = Join-Path '${{ steps.install.outputs.installDir }}' 'resources'
+          $python = Join-Path $env:LOCALAPPDATA 'DepthStudio\runtime\python\python.exe'
+          if (-not (Test-Path $python)) { Write-Output '::error::Встроенный Python не найден.'; exit 1 }
+          & $python -c "import os,server,scan_pipeline; root=os.path.normcase(os.path.abspath(os.environ['DEPTH_STUDIO_EXPECT_RESOURCES'])); paths=[os.path.normcase(os.path.abspath(server.__file__)),os.path.normcase(os.path.abspath(scan_pipeline.__file__))]; print('Installed modules:', paths); assert all(os.path.commonpath([root,p]) == root for p in paths), paths"
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Загружены не модули установленного приложения.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_kinect_sdk_v1.py -k TiltMotorTests -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Fake SDK motor tests failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_kinect_sdk_v1.py -k sdk_out_of_range_codes -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::SDK unknown-depth sentinel test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k depth_limit -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Depth-limit API and resume test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k unchanged_model -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Versioned map and resume test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_pipeline.py -k synthetic_surface_is_integrated_only -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Synthetic extended-range TSDF boundary test failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k tilt -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Motor API interlock tests failed.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k http_path_integrates_actual_tsdf_and_exports_mesh -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка установленного Open3D-конвейера на синтетическом кадре.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_process_replays_saved_keyframes -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка продолжения прохода в отдельном процессе Open3D.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_scan_api.py -k isolated_worker_crash -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка освобождения ресурсов после сбоя процесса Open3D.'; exit 1 }
+          $trackingLog = Join-Path $env:RUNNER_TEMP 'installed-tracking-tests.log'
+          & $python -m unittest discover -s tests -p test_scan_performance.py -k SyntheticFastMotionTests -v 2>&1 | Tee-Object -FilePath $trackingLog
+          $trackingExitCode = $LASTEXITCODE
+          if ($trackingExitCode -ne 0) {
+            # GitHub truncates long annotations; retain the actual failure,
+            # not the preceding list of successful tests.
+            $trace = (Get-Content $trackingLog -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Installed synthetic tracking tests::$trace"
+            exit $trackingExitCode
+          }
+          $robotLog = Join-Path $env:RUNNER_TEMP 'installed-robot-tests.log'
+          & $python -m unittest discover -s tests -p test_robot_tracking.py -v 2>&1 | Tee-Object -FilePath $robotLog
+          $robotExitCode = $LASTEXITCODE
+          if ($robotExitCode -ne 0) {
+            $trace = (Get-Content $robotLog -Tail 22) -join "`n"
+            $trace = $trace.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Installed robot tracking tests::$trace"
+            exit $robotExitCode
+          }
+          & $python -m unittest discover -s tests -p test_landmarks.py -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка экспериментальной проверки RGB-опор.'; exit 1 }
+          & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами и IntPtr через pythonnet.'; exit 1 }
+          $bench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-synthetic-fps.py'
+          & $python $bench --frames 12 --profiles max_fps
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Не удалось запустить установленный синтетический FPS-тест.'; exit 1 }
+          $trackingBench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-tracking-stability.py'
+          Write-Output "::notice::Windows CI logical processors: $([Environment]::ProcessorCount); synthetic results are not Kinect or i5-13400 measurements."
+          foreach ($threads in @('2', '4')) {
+            $env:OMP_NUM_THREADS = $threads
+            $results = & $python $trackingBench --frames 75 --steps 3
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Синтетический тест отслеживания OMP=$threads завершился ошибкой."; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Синтетический тест не вернул результат.'; exit 1 }
+            Write-Output "::notice title=Windows synthetic OMP $($threads)::$json"
+          }
+          foreach ($threads in @('2', '4')) {
+            $env:OMP_NUM_THREADS = $threads
+            $results = & $python $bench --frames 75 --profiles max_fps
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Синтетический поток OMP=$threads завершился ошибкой."; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Синтетический поток не вернул результат.'; exit 1 }
+            Write-Output "::notice title=Windows simulated realtime OMP $($threads)::$json"
+          }
+          # A moving robot's forward-facing turn is a different trajectory
+          # from the older orbit test. These are reports, not quality gates:
+          # early tracking loss is a valid fail-closed result.
+          $env:OMP_NUM_THREADS = '2'
+          $robotBench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-robot-turn.py'
+          foreach ($profile in @('max_fps', 'robot')) {
+            $results = & $python $robotBench --frames 30 --steps 1 3 --scene clutter --speed-kmh 7 --yaw-deg-s 20 --profile $profile
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Robot benchmark failed: $profile"; exit 1 }
+            $rows = @($results | Where-Object { $_ -is [string] -and $_.StartsWith('{') })
+            if ($rows.Count -ne 2) { Write-Output '::error::Robot benchmark did not report both frame strides.'; exit 1 }
+            foreach ($row in $rows) { Write-Output "::notice title=Windows robot offline $($profile)::$row" }
+          }
+          $results = & $python $bench --frames 45 --trajectory robot --scene clutter --speed-kmh 7 --yaw-deg-s 20 --profiles robot --front-poll-ms 50 --front-color --status-without-preview --landmarks
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Robot realtime/front benchmark failed.'; exit 1 }
+          $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+          if (-not $json) { Write-Output '::error::Robot realtime benchmark returned no result.'; exit 1 }
+          $data = $json | ConvertFrom-Json
+          if ($data.hardwareVerified -ne $false -or $data.frontRequests -lt 1 -or $data.trajectory -ne 'robot' -or
+              $data.frontColorRequested -ne $true -or $data.statusPreviewOmitted -ne $true -or $data.landmarkEnabled -ne $true) {
+            Write-Output '::error::Robot realtime report is incomplete or claims hardware verification.'; exit 1
+          }
+          Write-Output "::notice title=Windows robot simulated realtime::$json"
+          # The requested robot can rotate about 90°/s, with a slightly
+          # down-tilted front camera. 10° is just a synthetic assumption.
+          foreach ($profile in @('max_fps', 'robot')) {
+            $results = & $python $robotBench --frames 30 --steps 1 --scene clutter --speed-kmh 7 --yaw-deg-s 90 --tilt-deg 10 --profile $profile
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Fast-turn robot benchmark failed: $profile"; exit 1 }
+            $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+            if (-not $json) { Write-Output '::error::Fast-turn benchmark returned no result.'; exit 1 }
+            $data = $json | ConvertFrom-Json
+            if ($data.yawDegS -ne 90 -or $data.cameraTiltDeg -ne 10 -or $data.hardwareVerified -ne $false) {
+              Write-Output '::error::Fast-turn report has incorrect parameters.'; exit 1
+            }
+            Write-Output "::notice title=Windows fast robot turn $($profile)::$json"
+          }
+          try {
+            $ciCpu = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()
+            $ciRam = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+            Write-Output "::notice title=Windows CI host::$ciCpu; $ciRam GiB RAM (not the user's PC)."
+          } catch { Write-Output '::notice::Windows CI host details unavailable.' }
+          $env:OMP_NUM_THREADS = '2'
+          Write-Output '::notice::Установленный процесс Open3D, синтетическая скорость и .NET-буферы проверены без физического Kinect.'
 
       - name: Second launch reuses the prepared environment
         shell: pwsh
@@ -392,7 +580,9 @@ jobs:
 
   release:
     needs: verify-installer
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Keep the existing installer-latest release untouched, including on a
+    # merge to main. Verified installers remain downloadable as CI artifacts.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

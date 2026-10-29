@@ -48,6 +48,14 @@ class TsdfFusion:
         o3d = _o3d()
         started = time.perf_counter()
         depth = np.ascontiguousarray(depth_mm, dtype=np.uint16)
+        # Open3D's truncation only enforces an upper limit. Enforce the same
+        # minimum and inclusive maximum used by tracking/preview, including on
+        # resumed keyframes, without mutating the driver's frame.
+        invalid = (depth != 0) & ((depth < self.settings.depth_min_m * 1000.0) |
+                                  (depth > self.settings.depth_max_m * 1000.0))
+        if np.any(invalid):
+            depth = depth.copy()
+            depth[invalid] = 0
         if color_rgb is None:
             color = np.zeros((depth.shape[0], depth.shape[1], 3), dtype=np.uint8)
         else:
@@ -61,7 +69,9 @@ class TsdfFusion:
             o3d.geometry.Image(color),
             o3d.geometry.Image(depth),
             depth_scale=1000.0,
-            depth_trunc=self.settings.depth_max_m,
+            # Open3D excludes values >= depth_trunc; pixels outside our
+            # inclusive limit were already masked above.
+            depth_trunc=self.settings.depth_max_m + 0.001,
             convert_rgb_to_intensity=False,
         )
         o3d_intrinsic = o3d.camera.PinholeCameraIntrinsic(

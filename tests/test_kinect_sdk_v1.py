@@ -6,6 +6,10 @@ open failures and resource release are exercised deterministically.
 """
 from __future__ import annotations
 
+import array
+import contextlib
+import ctypes
+import io
 import importlib.machinery
 import os
 import sys
@@ -39,10 +43,18 @@ class FakeFrame:
         self._pixels = pixels
         self.Width = width
         self.Height = height
+        self.PixelDataLength = len(pixels)
         self.disposed = False
+        self.copied = False
 
-    def GetPixels(self):
-        return self._pixels
+    def CopyPixelDataTo(self, target):
+        if len(target) != self.PixelDataLength:
+            raise ValueError("incorrect managed array length")
+        self.copied = True
+        if isinstance(target, array.array):
+            target[:] = array.array("h", self._pixels)
+        else:
+            target[:] = bytes(self._pixels)
 
     def Dispose(self):
         self.disposed = True
@@ -151,7 +163,17 @@ class AdapterEnvironment:
         self._tempdir = None
 
     def __enter__(self):
-        modules = {"clr": self.clr, "Microsoft.Kinect": self.namespace}
+        class FakeArray:
+            @staticmethod
+            def CreateInstance(element_type, count):
+                if element_type == "Int16":
+                    return array.array("h", [0]) * count
+                if element_type == "Byte":
+                    return bytearray(count)
+                raise ValueError("unexpected managed array type")
+
+        system = make_module("System", Array=FakeArray, Int16="Int16", Byte="Byte")
+        modules = {"clr": self.clr, "Microsoft.Kinect": self.namespace, "System": system}
         self._patch_modules = mock.patch.dict(sys.modules, modules)
         self._patch_modules.start()
         env: dict[str, str] = {}
@@ -192,6 +214,8 @@ class CaptureTests(unittest.TestCase):
         # BGRA → RGB: красный пиксель остаётся красным.
         self.assertEqual(list(frame.color_rgb[0, 0]), [255, 0, 0])
         # Кадры .NET освобождаются, сенсор открыт и потоки включены.
+        self.assertTrue(depth.copied)
+        self.assertTrue(color.copied)
         self.assertTrue(depth.disposed)
         self.assertTrue(color.disposed)
         sensor = env.sensors[0]
@@ -202,6 +226,42 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(sensor.DepthStream.timeouts)
         self.assertTrue(all(value == 0 for value in sensor.DepthStream.timeouts))
         self.assertIn("Microsoft.Kinect", env.calls)
+
+    def test_sdk_frame_number_survives_dispose_for_sensor_gap_metrics(self):
+        depth = FakeFrame(depth_pixels(1200))
+        depth.FrameNumber = 12345
+        with AdapterEnvironment(depth_frames=[depth], color_frames=[FakeFrame(color_pixels())]) as env:
+            frame = env.adapter.capture_for_scan()
+        self.assertTrue(depth.disposed)
+        self.assertEqual(frame.sequence_number, 12345)
+
+    def test_scan_capture_skips_only_the_unused_preview_cloud(self):
+        with AdapterEnvironment(
+            depth_frames=[FakeFrame(depth_pixels(1200)), FakeFrame(depth_pixels(1200))],
+            color_frames=[FakeFrame(color_pixels()), FakeFrame(color_pixels())],
+        ) as env:
+            scan_frame = env.adapter.capture_for_scan()
+            preview_frame = env.adapter.capture()
+        self.assertIsNone(scan_frame.points)
+        self.assertGreater(len(preview_frame.points), 0)
+        np.testing.assert_array_equal(scan_frame.depth_mm, preview_frame.depth_mm)
+        np.testing.assert_array_equal(scan_frame.color_rgb, preview_frame.color_rgb)
+
+    def test_packed_depth_is_exact_integer_millimetres(self):
+        raw = np.array([999 << 3, (1001 << 3) | 3, 1501 << 3, 1999 << 3], dtype=np.uint16)
+        frame = sdk.depth_and_color_to_frame(raw, 4, 1, None, None, None, captured_at=5.0)
+        np.testing.assert_array_equal(frame.depth_mm, [[999, 1001, 1501, 1999]])
+        self.assertEqual(frame.captured_at, 5.0)
+
+    def test_missing_rgb_does_not_delay_or_retimestamp_depth_by_hundreds_of_ms(self):
+        clock = [10.0]
+        with AdapterEnvironment(depth_frames=[FakeFrame(depth_pixels(1200))], color_frames=[]) as env:
+            env.adapter._clock = lambda: clock[0]
+            env.adapter._sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+            frame = env.adapter.capture()
+        self.assertEqual(frame.captured_at, 10.0)  # before the short RGB wait
+        self.assertLessEqual(clock[0] - frame.captured_at, 0.02)
+        self.assertIn("RGB", frame.warning)
 
     def test_zero_depth_pixels_are_not_turned_into_points(self):
         pixels = np.zeros(640 * 480, dtype=np.int16)
@@ -219,6 +279,22 @@ class CaptureTests(unittest.TestCase):
             frame = env.adapter.capture()
         self.assertIsNone(frame.color_rgb)
         self.assertEqual(int(frame.depth_mm[10, 10]), 1200)
+        self.assertIn("не вернул RGB-кадр", frame.warning)
+        self.assertIn("Проверьте", frame.warning)
+
+    def test_rgb_copy_failure_preserves_exact_warning_and_logs_it(self):
+        bad_color = FakeFrame(color_pixels())
+        bad_color.CopyPixelDataTo = mock.Mock(side_effect=RuntimeError("RGB buffer failure"))
+        output = io.StringIO()
+        with AdapterEnvironment(depth_frames=[FakeFrame(depth_pixels(1200))], color_frames=[bad_color]) as env:
+            with contextlib.redirect_stdout(output):
+                frame = env.adapter.capture()
+        self.assertIsNone(frame.color_rgb)
+        self.assertEqual(int(frame.depth_mm[0, 0]), 1200)
+        self.assertIn("RGB buffer failure", frame.warning)
+        self.assertIn("Проверьте USB и SDK", frame.warning)
+        self.assertIn("RGB buffer failure", output.getvalue())
+        self.assertTrue(bad_color.disposed)
 
     def test_frame_timeout_is_reported_and_sensor_stays_open(self):
         with AdapterEnvironment(depth_frames=[]) as env:
@@ -273,6 +349,18 @@ class SensorLifecycleTests(unittest.TestCase):
             frame = env.adapter.capture()
             self.assertEqual(int(frame.depth_mm[0, 0]), 1500)
             self.assertEqual(sensor.DepthStream.timeouts.count(0) > 1, True)
+
+    def test_default_capture_does_not_add_a_33ms_sleep_at_hardware_cap(self):
+        slept = []
+        with AdapterEnvironment(
+            depth_frames=[FakeFrame(depth_pixels(1000)), FakeFrame(depth_pixels(1000))],
+            color_frames=[FakeFrame(color_pixels()), FakeFrame(color_pixels())],
+        ) as env:
+            env.adapter._clock = lambda: 0.0
+            env.adapter._sleep = slept.append
+            env.adapter.capture()
+            env.adapter.capture()
+        self.assertEqual(slept, [])  # the real SDK stream supplies its own 30-FPS cadence
 
     def test_frame_rate_is_limited(self):
         slept: list[float] = []
@@ -410,6 +498,47 @@ class ConversionTests(unittest.TestCase):
     def test_pixels_to_bytes_reads_color_as_single_bytes(self):
         self.assertEqual(sdk._pixels_to_bytes([0, 128, 255], 1), bytes([0, 128, 255]))
 
+    def test_native_copy_uses_element_count_and_keeps_exact_bytes(self):
+        system = make_module("System", IntPtr=int, Int64=int)
+
+        class PointerFrame:
+            def __init__(self, data, count):
+                self.data, self.PixelDataLength = data, count
+                self.calls = []
+
+            def CopyPixelDataTo(self, address, count):
+                self.calls.append(count)
+                ctypes.memmove(address, self.data, len(self.data))
+
+        with mock.patch.dict(sys.modules, {"System": system}):
+            depth = PointerFrame(b"\x20\x03\x00\xfa\x00\x00", 3)
+            self.assertEqual(sdk._SdkSession._copy_pixels(depth, 2, 3), depth.data)
+            self.assertEqual(depth.calls, [3])  # Int16 elements, not six bytes
+            color = PointerFrame(bytes([0, 128, 255, 42]), 4)
+            self.assertEqual(sdk._SdkSession._copy_pixels(color, 1, 4), color.data)
+            self.assertEqual(color.calls, [4])
+
+    def test_native_copy_falls_back_to_the_managed_overload_when_missing(self):
+        class FakeArray:
+            @staticmethod
+            def CreateInstance(element_type, count):
+                return array.array("h", [0]) * count
+
+        system = make_module("System", IntPtr=int, Int64=int, Array=FakeArray, Int16="Int16", Byte="Byte")
+        frame = FakeFrame([800, -1536, 0], width=3, height=1)
+        with mock.patch.dict(sys.modules, {"System": system}):
+            raw = sdk._SdkSession._copy_pixels(frame, 2, 3)
+        self.assertEqual(raw, b"\x20\x03\x00\xfa\x00\x00")
+        self.assertTrue(frame.copied)
+
+    def test_native_copy_does_not_mask_a_real_sdk_error(self):
+        system = make_module("System", IntPtr=int, Int64=int)
+        frame = types.SimpleNamespace(PixelDataLength=2, CopyPixelDataTo=mock.Mock(side_effect=RuntimeError("SDK copy failed")))
+        with mock.patch.dict(sys.modules, {"System": system}):
+            with self.assertRaisesRegex(RuntimeError, "SDK copy failed"):
+                sdk._SdkSession._copy_pixels(frame, 2, 2)
+        frame.CopyPixelDataTo.assert_called_once()
+
     def test_dispose_never_raises(self):
         class Broken:
             def Dispose(self):
@@ -427,9 +556,151 @@ class ConversionTests(unittest.TestCase):
         self.assertAlmostEqual(float(metres[2]), 2.047, places=4)
 
     @REQUIRES_NUMPY
+    def test_sdk_out_of_range_codes_never_become_distant_surfaces(self):
+        # 4095 mm is TooFarDepth; a signed -1 buffer becomes 8191 after an
+        # unsigned shift. Neither is a 4.095 m/8.191 m measurement.
+        packed = np.array([0, (800 << 3) | 7, (4000 << 3) | 3, 4001 << 3,
+                           4095 << 3, 0xffff, 5000 << 3, 8191 << 3], dtype=np.uint16)
+        frame = sdk.depth_and_color_to_frame(packed, 8, 1, None, None, None, include_points=False)
+        np.testing.assert_array_equal(frame.depth_mm[0], [0, 800, 4000, 0, 0, 0, 0, 0])
+        np.testing.assert_allclose(sdk.depth_pixels_to_metres(packed), [0, 0.8, 4.0, 0, 0, 0, 0, 0])
+        preview = sdk.depth_and_color_to_frame(packed, 8, 1, None, None, None)
+        # Preview samples indices 0 and 4: both unknown, not fabricated geometry.
+        self.assertEqual(len(preview.points), 0)
+
+    @REQUIRES_NUMPY
     def test_short_depth_buffer_is_rejected(self):
         with self.assertRaises(RuntimeError):
             sdk.depth_and_color_to_frame(np.zeros(10, dtype=np.uint16), 640, 480, None, None, None)
+
+
+
+
+class TiltMotorTests(unittest.TestCase):
+    """SDK tilt tests use fake .NET objects; no physical-device claims."""
+
+    class Motor(FakeSensor):
+        MinElevationAngle = -27
+        MaxElevationAngle = 27
+
+        def __init__(self):
+            super().__init__()
+            self._angle = 0
+            self.attempted = []
+            self.fail = False
+            self.fail_read = False
+            self.Start()
+
+        @property
+        def ElevationAngle(self):
+            if not self.IsRunning or self.fail_read:
+                raise RuntimeError("angle read failed")
+            return self._angle
+
+        @ElevationAngle.setter
+        def ElevationAngle(self, value):
+            self.attempted.append(value)
+            if self.fail:
+                raise RuntimeError("motor error")
+            self._angle = value
+
+    def setUp(self):
+        self.now = [100.0]
+        self.adapter = sdk.KinectSdkV1Adapter(clock=lambda: self.now[0])
+        self.sensor = self.Motor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+
+    def tearDown(self):
+        self.adapter.close()
+
+    def test_read_and_set_uses_running_sdk_sensor_and_never_claims_hardware(self):
+        status = self.adapter.tilt_status()
+        self.assertEqual((status["angle"], status["minAngle"], status["maxAngle"]), (0, -27, 27))
+        self.assertFalse(status["verifiedOnHardware"])
+        result = self.adapter.set_tilt(12)
+        self.assertTrue(result["commandSent"])
+        self.assertEqual(self.sensor.attempted, [12])
+        self.assertEqual(result["targetAngle"], 12)
+        self.assertGreaterEqual(result["scanWaitMs"], 8000)
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(13)
+        self.assertEqual(caught.exception.code, "tilt_cooldown")
+        self.assertEqual(self.sensor.attempted, [12])
+        self.now[0] += 8.0
+        self.assertEqual(self.adapter.tilt_scan_wait(), 0.0)
+        # Equal target is a no-op, not another motor write.
+        self.assertFalse(self.adapter.set_tilt(12)["commandSent"])
+        self.assertEqual(self.sensor.attempted, [12])
+
+    def test_input_and_device_limits_are_enforced_before_writing(self):
+        for bad in (-28, 28, 1.5, "3", True, None, float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.adapter.set_tilt(bad)
+        self.sensor.MinElevationAngle = -10
+        self.sensor.MaxElevationAngle = 10
+        with self.assertRaises(ValueError):
+            self.adapter.set_tilt(11)
+        self.assertEqual(self.sensor.attempted, [])
+
+    def test_failed_write_still_enters_cooldown_and_does_not_claim_success(self):
+        self.sensor.fail = True
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(-10)
+        self.assertEqual(caught.exception.code, "tilt_failed")
+        self.assertEqual(self.sensor.attempted, [-10])
+        self.assertGreater(self.adapter.tilt_scan_wait(), 0)
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(10)
+        self.assertEqual(self.sensor.attempted, [-10])
+
+    def test_limit_survives_reconnect_and_cannot_be_bypassed_by_rapid_api_calls(self):
+        for i in range(10):
+            self.adapter.set_tilt(1 if i % 2 == 0 else 0)
+            self.now[0] += 3.0
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(1)
+        self.adapter.close()
+        self.sensor = self.Motor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        with self.assertRaises(sdk.KinectSdkUnavailable):
+            self.adapter.set_tilt(1)
+        self.now[0] += 90.0
+        self.assertTrue(self.adapter.set_tilt(1)["commandSent"])
+
+    def test_expired_command_is_never_sent_and_blocking_setter_gets_full_settle_pause(self):
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.set_tilt(10, deadline=self.now[0] - 1)
+        self.assertEqual(caught.exception.code, "tilt_timeout")
+        self.assertEqual(self.sensor.attempted, [])
+        now = self.now
+
+        class SlowMotor(self.Motor):
+            @self.Motor.ElevationAngle.setter
+            def ElevationAngle(sensor, value):
+                now[0] += 30.0  # Native setter may block before the motor starts.
+                sensor._angle = value
+                sensor.attempted.append(value)
+
+        self.sensor = SlowMotor()
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        result = self.adapter.set_tilt(10, deadline=now[0] + 5)
+        self.assertTrue(result["commandSent"])
+        self.assertEqual(result["scanWaitMs"], 8000)
+        self.assertEqual(result["cooldownMs"], 3000)
+
+    def test_tilt_never_opens_a_device_and_read_errors_are_reported(self):
+        self.adapter.close()
+        with mock.patch.object(self.adapter, "_open_session") as opened:
+            with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+                self.adapter.tilt_status()
+            self.assertEqual(caught.exception.code, "tilt_not_connected")
+            opened.assert_not_called()
+        self.sensor = self.Motor()
+        self.sensor.fail_read = True
+        self.adapter._session = sdk._SdkSession(self.sensor, object())
+        with self.assertRaises(sdk.KinectSdkUnavailable) as caught:
+            self.adapter.tilt_status()
+        self.assertEqual(caught.exception.code, "tilt_read_failed")
 
 
 if __name__ == "__main__":
