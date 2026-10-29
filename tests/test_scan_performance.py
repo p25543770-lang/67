@@ -665,46 +665,14 @@ class SyntheticFastMotionTests(unittest.TestCase):
         scenarios = (range(0, 120, 3), range(0, 95, 5))
         needed = sorted(set(scenarios[0]) | set(scenarios[1]))
         frames = {k: sr.render(trajectory.poses[k], self.intr, noise=True, seed=k)[:2] for k in needed}
-        from scan_pipeline import tracking
-        from scan_pipeline.frame_validation import _cloud_from_depth, _projective_consistency
-        original_confirmation = tracking.confirm_model_pose
         for indices, minimum, last_min in ((scenarios[0], 38, 114), (scenarios[1], 14, 65)):
             clock = [0.0]
             self.engine = ScanEngine(ScanSettings.for_profile(), self.intr, clock=lambda: clock[0])
             errors, accepted, first_rejection = [], [], None
-            confirmation_failures = []
-            def traced_confirmation(depth, color, intrinsics, candidate, reference):
-                result = original_confirmation(depth, color, intrinsics, candidate, reference)
-                if (not result and len(confirmation_failures) < 3 and
-                        reference is not None and color is not None):
-                    try:
-                        source = _cloud_from_depth(depth, intrinsics)
-                        target = (reference._cloud if reference._cloud is not None
-                                  else _cloud_from_depth(reference.depth, intrinsics, normals=True))
-                        initial = invert_pose(reference.pose) @ candidate
-                        registration = open3d.pipelines.registration.registration_icp(
-                            source, target, 0.10, initial,
-                            open3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                            open3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=15))
-                        raw = reference.pose @ registration.transformation
-                        truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
-                        rmse, ratio = tracking.registration_diagnostics(source, target, registration.transformation, 0.02)
-                        confirmation_failures.append({"frame": k,
-                            "modelTruthMmDeg": tuple(round(v, 3) for v in pose_error(candidate, truth)),
-                            "rawTruthMmDeg": tuple(round(v, 3) for v in pose_error(raw, truth)),
-                            "modelRawMmDeg": tuple(round(v, 3) for v in pose_error(candidate, raw)),
-                            "fitness": round(registration.fitness, 4), "rmseMm": round(rmse * 1000, 3),
-                            "ratio": round(ratio, 5),
-                            "modelProjective": _projective_consistency(depth, color, reference, intrinsics, initial),
-                            "rawProjective": _projective_consistency(depth, color, reference, intrinsics, registration.transformation)})
-                    except Exception as exc:  # diagnostics only, never affects the tracker
-                        confirmation_failures.append({"frame": k, "diagnostic_error": repr(exc)})
-                return result
             for k in indices:
                 clock[0] = k / 30.0
                 depth, color = frames[k]
-                with mock.patch.object(tracking, "confirm_model_pose", side_effect=traced_confirmation):
-                    event = self.engine.process(depth, color, clock[0])
+                event = self.engine.process(depth, color, clock[0])
                 if event["state"] == "tracking":
                     accepted.append(k)
                     truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[k]
@@ -715,8 +683,7 @@ class SyntheticFastMotionTests(unittest.TestCase):
                                        "fitness": event.get("fitness"), "rmseMm": event.get("rmseMm")}
             print(f"[tracking] stride={indices.step}, accepted={len(accepted)}/{len(indices)}, "
                   f"last={accepted[-1] if accepted else None}, worst_mm={max(errors) if errors else None}, "
-                  f"rescued={self.engine.tracker.frames_rescued}, first_rejection={first_rejection}, "
-                  f"confirmation_failures={confirmation_failures}")
+                  f"rescued={self.engine.tracker.frames_rescued}, first_rejection={first_rejection}")
             self.assertGreaterEqual(len(accepted), minimum)
             self.assertGreaterEqual(accepted[-1], last_min)
             self.assertLess(max(errors), 50.0)
