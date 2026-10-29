@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -42,6 +43,14 @@ def main() -> None:
                         help="robot camera tilt downward from horizontal (0–45 degrees)")
     parser.add_argument("--front-poll-ms", type=int, default=0,
                         help="also poll raw camera view at this interval (0 disables)")
+    parser.add_argument("--front-color", action="store_true",
+                        help="include RGB in the independent camera-view polls")
+    parser.add_argument("--status-without-preview", action="store_true",
+                        help="omit the older processing-bound status preview")
+    parser.add_argument("--landmarks", action="store_true",
+                        help="enable experimental RGB veto (requires robot profile)")
+    parser.add_argument("--trace", action="store_true",
+                        help="include a per-processed-frame synthetic truth trace in the JSON report")
     args = parser.parse_args()
     if args.frames < 4 or args.frames > 330:
         parser.error("--frames must be between 4 and 330")
@@ -141,24 +150,62 @@ def main() -> None:
         else:
             settings = ScanSettings(keyframe_translation_m=0.075, keyframe_rotation_deg=5.0,
                                     model_refresh_every=4)
+        if args.landmarks:
+            if name != "robot" or not hasattr(settings, "visual_landmark_veto"):
+                parser.error("--landmarks requires the robot profile and RGB-veto support")
+            settings.visual_landmark_veto = True
         with tempfile.TemporaryDirectory(prefix="depth-studio-benchmark-") as folder:
             sensor = TimedSensor()
-            if use_process:
+            trace = []
+            if args.trace:
+                from scan_pipeline.engine import ScanEngine
+                engine_type = IsolatedScanEngine if use_process else ScanEngine
+
+                def factory(*engine_args, **engine_kwargs):
+                    engine = engine_type(*engine_args, **engine_kwargs)
+                    original_process = engine.process
+
+                    def traced_process(depth, color, captured_at):
+                        event = original_process(depth, color, captured_at)
+                        index = round((captured_at - sensor.start) * 30)
+                        entry = {"frame": index, "state": event.get("state"),
+                                 "reason": event.get("reason"), "integrated": event.get("integrated"),
+                                 "stepMm": event.get("stepMm"), "stepDeg": event.get("stepDeg"),
+                                 "rmseMm": event.get("rmseMm"), "fitness": event.get("fitness")}
+                        if (engine.last_pose is not None and sensor.first_index is not None and
+                                0 <= index < len(trajectory.poses)):
+                            truth = invert_pose(trajectory.poses[sensor.first_index]) @ trajectory.poses[index]
+                            mm, deg = pose_error(engine.last_pose, truth)
+                            entry.update(poseErrorMm=round(mm, 2), poseErrorDeg=round(deg, 2))
+                        trace.append(entry)
+                        return event
+
+                    engine.process = traced_process
+                    return engine
+
+                runner = ScanRunner(ScanStorage(Path(folder)), engine_factory=factory)
+            elif use_process:
                 runner = ScanRunner(ScanStorage(Path(folder)), engine_factory=IsolatedScanEngine)
             else:
                 runner = ScanRunner(ScanStorage(Path(folder)))
             if args.front_poll_ms and not hasattr(runner, "front_snapshot"):
                 parser.error("this checkout has no independent camera view")
+            if (args.front_color and (not args.front_poll_ms or
+                    "include_color" not in inspect.signature(runner.front_snapshot).parameters)):
+                parser.error("--front-color needs front polling and a checkout that supports RGB preview")
+            if args.status_without_preview and "include_preview" not in inspect.signature(runner.snapshot).parameters:
+                parser.error("this checkout cannot omit the processing-bound status preview")
             runner.start(sensor, source="synthetic", settings=settings, intrinsics=intr)
             active = runner.active
             poll_stop = threading.Event()
             poll_times = []
-            front_times, front_available = [], []
+            front_times, front_available, front_color_available, front_ids = [], [], [], []
 
             def poll_ui():
                 while not poll_stop.is_set():
                     started = time.perf_counter()
-                    json.dumps(runner.snapshot())  # include JSON conversion, as the bridge does
+                    snapshot = runner.snapshot(include_preview=False) if args.status_without_preview else runner.snapshot()
+                    json.dumps(snapshot)  # include JSON conversion, as the bridge does
                     duration = time.perf_counter() - started
                     poll_times.append(duration * 1000)
                     poll_stop.wait(max(0.0, 0.45 - duration))
@@ -166,11 +213,15 @@ def main() -> None:
             def poll_front():
                 while not poll_stop.is_set():
                     started = time.perf_counter()
-                    payload = runner.front_snapshot()
+                    payload = (runner.front_snapshot(include_color=True) if args.front_color
+                               else runner.front_snapshot())
                     json.dumps(payload)  # conversion cost, but no HTTP/browser transport
                     duration = time.perf_counter() - started
                     front_times.append(duration * 1000)
                     front_available.append(bool(payload.get("available")))
+                    front_color_available.append(bool(payload.get("color")))
+                    if payload.get("available") and payload.get("captureId") is not None:
+                        front_ids.append(payload["captureId"])
                     poll_stop.wait(max(0.0, args.front_poll_ms / 1000.0 - duration))
 
             poller = threading.Thread(target=poll_ui, daemon=True)
@@ -234,6 +285,9 @@ def main() -> None:
                 "elapsedSeconds": performance["elapsedSeconds"],
                 "framesTracked": quality["framesTracked"],
                 "frameChecks": quality.get("frameChecks"),
+                "landmarkEnabled": getattr(settings, "visual_landmark_veto", False),
+                "landmarkChecks": quality.get("landmarkChecks"),
+                "landmarkVetoes": quality.get("landmarkVetoes"),
                 "framesRescued": quality.get("framesRescued"),
                 "keyframesIntegrated": quality["keyframesIntegrated"],
                 "rejected": quality["rejected"],
@@ -246,10 +300,16 @@ def main() -> None:
                 "uiPollMedianMs": round(statistics.median(poll_times), 2) if poll_times else None,
                 "frontRequests": len(front_times),
                 "frontAvailable": sum(front_available),
+                "frontColorAvailable": sum(front_color_available),
+                "frontUniqueFrames": len(set(front_ids)) if front_ids else None,
+                "frontColorRequested": args.front_color,
+                "statusPreviewOmitted": args.status_without_preview,
                 "frontPollMedianMs": round(statistics.median(front_times), 2) if front_times else None,
                 "openmpThreadsRequested": os.environ.get("OMP_NUM_THREADS"),
                 "hardwareVerified": False,
             }
+            if args.trace:
+                result["trace"] = trace
             print(json.dumps(result, ensure_ascii=False), flush=True)
             runner.stop(finish=False)
 

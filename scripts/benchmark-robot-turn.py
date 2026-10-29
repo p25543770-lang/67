@@ -30,6 +30,13 @@ def main():
     parser.add_argument("--profile", choices=("robot", "max_fps", "standard"), default="robot")
     parser.add_argument("--scene", choices=("clutter", "plain", "bench"), default="clutter")
     parser.add_argument("--color-shift-px", type=int, default=0)
+    parser.add_argument("--texture", choices=("checker", "world_noise"), default="checker")
+    parser.add_argument("--color-delay-frames", type=int, default=0,
+                        help="render RGB from up to 3 earlier 30-Hz poses (not Kinect exposure timing)")
+    parser.add_argument("--landmarks", action="store_true",
+                        help="enable the experimental reject-only RGB landmark check (robot profile only)")
+    parser.add_argument("--landmark-truth-test", action="store_true",
+                        help="separately compare known poses to poses shifted 150 mm (synthetic only)")
     parser.add_argument("--package-root", type=Path, default=ROOT)
     args = parser.parse_args()
     if (not math.isfinite(args.speed_kmh) or not 0 <= args.speed_kmh <= 12 or
@@ -41,6 +48,10 @@ def main():
         parser.error("frames must be 2–150; each step must be between 1 and frames")
     if abs(args.color_shift_px) > 100:
         parser.error("--color-shift-px must be between -100 and 100")
+    if not 0 <= args.color_delay_frames <= 3:
+        parser.error("--color-delay-frames must be between 0 and 3")
+    if (args.landmarks or args.landmark_truth_test) and args.profile != "robot":
+        parser.error("landmark options require --profile robot")
 
     sys.path.insert(0, str(ROOT / "tests"))
     sys.path.insert(0, str(args.package_root.resolve()))
@@ -64,9 +75,18 @@ def main():
     effective_tilt = math.degrees(math.asin(-trajectory.poses[0][1, 2]))
     scene = robot.robot_scene(args.scene)
     needed = sorted({index for step in args.steps for index in range(0, args.frames, step)})
+    # Also render earlier RGB poses needed by the artificial delay, including
+    # when the depth input is intentionally thinned with --steps.
+    render_indices = sorted(set(needed) | {max(0, index - args.color_delay_frames) for index in needed})
+    rendered = {}
+    for index in render_indices:
+        depth, color, _ = room.render(trajectory.poses[index], intr, noise=True, seed=index + 2000,
+                                      scene=scene, texture=args.texture)
+        rendered[index] = (depth, color)
     frames = {}
     for index in needed:
-        depth, color, _ = room.render(trajectory.poses[index], intr, noise=True, seed=index + 2000, scene=scene)
+        depth = rendered[index][0]
+        color = rendered[max(0, index - args.color_delay_frames)][1]
         if args.color_shift_px:
             color = np.roll(color, args.color_shift_px, axis=1)
         frames[index] = depth, color
@@ -74,7 +94,12 @@ def main():
 
     for step in args.steps:
         clock = [0.0]
-        engine = ScanEngine(ScanSettings.for_profile(args.profile), intr, clock=lambda: clock[0])
+        settings = ScanSettings.for_profile(args.profile)
+        if args.landmarks:
+            if not hasattr(settings, "visual_landmark_veto"):
+                parser.error("this checkout does not support --landmarks")
+            settings.visual_landmark_veto = True
+        engine = ScanEngine(settings, intr, clock=lambda: clock[0])
         accepted, integrated, rejected = [], [], {}
         begin = time.perf_counter()
         try:
@@ -109,12 +134,48 @@ def main():
                 "worstIntegratedMm": round(max((p[0] for p in integrated), default=0.0), 2),
                 "integratedFrames": len(integrated),
                 "frameChecks": getattr(engine.tracker, "frame_checks", None),
+                "landmarkEnabled": getattr(settings, "visual_landmark_veto", False),
+                "landmarkChecks": getattr(engine.tracker, "landmark_checks", None),
+                "landmarkVetoes": getattr(engine.tracker, "landmark_vetoes", None),
                 "rejected": rejected,
                 "offlineProcessedFps": round(processed / elapsed, 2),
+                "texture": args.texture,
                 "colorShiftPx": args.color_shift_px,
+                "colorDelayFrames": args.color_delay_frames,
                 "openmpThreadsRequested": os.environ.get("OMP_NUM_THREADS"),
                 "hardwareVerified": False,
             }
+            if args.landmark_truth_test:
+                try:
+                    from scan_pipeline.landmarks import LandmarkGuard, compare_anchor
+                except ImportError:
+                    parser.error("this checkout does not support --landmark-truth-test")
+                guard = LandmarkGuard()
+                true_vetoes = false_vetoes = true_observed = tested = 0
+                landmark_intr = intr.downscaled(settings.depth_stride)
+                for index in range(0, args.frames, step):
+                    depth, color = frames[index]
+                    stride = settings.depth_stride
+                    observation = (depth[::stride, ::stride], color[::stride, ::stride])
+                    truth = invert_pose(trajectory.poses[0]) @ trajectory.poses[index]
+                    correct, features = guard.evaluate(observation, landmark_intr, truth)
+                    if guard.anchors:
+                        tested += 1
+                        false_vetoes += correct["status"] == "disagreement"
+                        true_observed += correct["status"] == "observed"
+                        shifted = truth.copy()
+                        shifted[0, 3] += 0.15
+                        if features is not None:
+                            wrong = [compare_anchor(anchor, features, shifted) for anchor in guard.anchors]
+                            true_vetoes += any(item["status"] == "disagreement" for item in wrong)
+                    # Known truth is used only to seed this independent test;
+                    # it is never provided to the ScanEngine above.
+                    guard.accept(observation, landmark_intr, truth, features=features)
+                result["landmarkTruthTest"] = {
+                    "testedCandidates": tested, "correctPoseObserved": true_observed,
+                    "correctPoseVetoes": false_vetoes, "shifted150mmVetoes": true_vetoes,
+                    "anchorsSeededWithGroundTruth": True,
+                }
             print(json.dumps(result, ensure_ascii=False), flush=True)
         finally:
             engine.release()

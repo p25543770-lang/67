@@ -83,9 +83,12 @@ class ScanEngine:
         if stride > 1:
             depth = depth[::stride, ::stride]
             color = color[::stride, ::stride]
-        depth_m = depth.astype(np.float32) / 1000.0
+        # Projection uses float64; convert directly so a 450 mm boundary
+        # value is not rounded just below the configured 0.45 m cutoff.
+        depth_m = depth.astype(np.float64) / 1000.0
         cam_points, cam_colors = depth_to_points_rgb(
-            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS)
+            depth_m, color, self.intrinsics, stride=self.settings.tracking_stride, max_points=MAX_SOURCE_POINTS,
+            min_depth_m=self.settings.depth_min_m, max_depth_m=self.settings.depth_max_m)
 
         dt = self._dt(captured_at)
         result = self.tracker.track(cam_points, cam_colors, self.intrinsics, dt=dt,
@@ -99,6 +102,8 @@ class ScanEngine:
         if result.state == "lost":
             self.rejected["lost"] += 1
             self._set_state("lost", "lost")
+            if result.reason == "landmark_disagreement":
+                self.hint += " Распределённые RGB-признаки резко расходятся с оценкой ICP; это только защитная проверка."
             return self._event(False, "lost", result)
         if result.state == "too_fast":
             self.rejected["too_fast"] += 1
@@ -213,7 +218,8 @@ class ScanEngine:
         }
         if result is not None:
             event.update(fitness=round(result.fitness, 3), rmseMm=round(result.rmse_m * 1000, 2),
-                         stepMm=round(result.step_m * 1000, 2), stepDeg=round(result.step_deg, 2))
+                         stepMm=round(result.step_m * 1000, 2), stepDeg=round(result.step_deg, 2),
+                         reason=result.reason, landmarks=result.extra.get("landmarks"))
         return event
 
     # ----- восстановление и выход --------------------------------------------
@@ -262,6 +268,8 @@ class ScanEngine:
             "frameChecks": self.tracker.frame_checks,
             "frameChecksPassed": self.tracker.frame_checks_passed,
             "framesRescued": self.tracker.frames_rescued,
+            "landmarkChecks": self.tracker.landmark_checks,
+            "landmarkVetoes": self.tracker.landmark_vetoes,
             "keyframesIntegrated": self.integrated,
             "skippedRedundant": self.policy.skipped_redundant,
             "rejected": dict(self.rejected),
@@ -283,6 +291,7 @@ class ScanEngine:
             "resolution": [self.intrinsics.width, self.intrinsics.height],
             "baseResolution": [self.base_intrinsics.width, self.base_intrinsics.height],
             "trackingStride": self.settings.tracking_stride,
+            "visualLandmarkVeto": self.settings.visual_landmark_veto,
             "targetFps": TARGET_FPS,
             "degraded": bool(self.degradations),
             "degradations": [note.__dict__ for note in self.degradations],

@@ -232,6 +232,10 @@ class ScanApiTests(unittest.TestCase):
             started = self.start(profile="standard")
             self.wait_for(lambda data: data["keyframes"] >= 1)
             self.assertGreater(scan_capture.call_count, 0)
+            _, with_preview = self.request("/api/scan")
+            _, no_preview = self.request("/api/scan?preview=0")
+            self.assertIsNotNone(with_preview["preview"])
+            self.assertIsNone(no_preview["preview"])
         manifest = server._runner().storage.store(started["passId"]).manifest()
         self.assertEqual(manifest["settings"]["profile"], "standard")
         self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
@@ -290,6 +294,13 @@ class ScanApiTests(unittest.TestCase):
                 self.assertFalse(front["tracking"]["fresh"])
                 self.assertEqual(front["depth"]["width"], 8)
                 self.assertEqual(front["depth"]["height"], 6)
+                self.assertIsNone(front["color"])
+                status, feed = self.request("/api/scan/front?color=1")
+                self.assertEqual(status, 200)
+                self.assertTrue(feed["available"])
+                self.assertEqual((feed["color"]["width"], feed["color"]["height"]), (32, 24))
+                self.assertFalse(feed["colorDepthRegistered"])
+                self.assertIsNotNone(feed["captureId"])
             finally:
                 release.set()
                 if "snapshot_thread" in locals():
@@ -393,12 +404,34 @@ class ScanApiTests(unittest.TestCase):
                 if snapshot_thread is not None:
                     snapshot_thread.join(timeout=3)
 
+    def test_visual_landmarks_are_explicit_robot_only_and_saved(self):
+        self.connect()
+        before = self.sensor.captures
+        for profile, option in (("max_fps", True), ("robot", "true")):
+            status, response = self.request("/api/scan/start", {
+                "source": self.sensor.id, "profile": profile, "visualLandmarks": option})
+            self.assertEqual(status, 400, response)
+            self.assertEqual(self.sensor.captures, before)
+        started = self.start(profile="robot", visualLandmarks=True)
+        self.wait_for(lambda data: data["keyframes"] >= 1)
+        manifest = server._runner().storage.store(started["passId"]).manifest()
+        self.assertTrue(manifest["settings"]["visual_landmark_veto"])
+        self.assertEqual(self.request("/api/scan/stop", {})[0], 200)
+        self.wait_for(lambda data: data["phase"] == "ready")
+        self.connect()
+        self.start(resumePassId=started["passId"], profile="max_fps", visualLandmarks=False)
+        self.wait_for(lambda data: data["keyframes"] >= 1)
+        resumed = server._runner().storage.store(started["passId"]).manifest()
+        self.assertEqual(resumed["settings"]["profile"], "robot")
+        self.assertTrue(resumed["settings"]["visual_landmark_veto"])
+
     def test_new_pass_defaults_to_max_fps_profile(self):
         self.connect()
         started = self.start()
         self.wait_for(lambda data: data["keyframes"] >= 1)
         manifest = server._runner().storage.store(started["passId"]).manifest()
         self.assertEqual(manifest["settings"]["profile"], "max_fps")
+        self.assertFalse(manifest["settings"]["visual_landmark_veto"])
         self.assertEqual(manifest["settings"]["keyframe_translation_m"], 0.075)
 
     def test_selected_alternative_is_connected_without_reprobing_sdk(self):

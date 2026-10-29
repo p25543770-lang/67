@@ -42,6 +42,13 @@ class FrameRateTests(unittest.TestCase):
         self.assertEqual(standard.profile, STANDARD_PROFILE)
         robot = ScanSettings.for_profile(ROBOT_PROFILE).validate()
         self.assertEqual(robot.profile, ROBOT_PROFILE)
+        self.assertFalse(robot.visual_landmark_veto)  # RGB veto is experimental and opt-in
+        robot.visual_landmark_veto = True
+        robot.validate()
+        fast.visual_landmark_veto = True
+        with self.assertRaises(ValueError):
+            fast.validate()
+        fast.visual_landmark_veto = False
         self.assertEqual(robot.max_speed_mps, fast.max_speed_mps)
         self.assertEqual(robot.model_refresh_every, fast.model_refresh_every)
         self.assertEqual(standard.tracking_stride, fast.tracking_stride)
@@ -114,6 +121,19 @@ class FrameRateTests(unittest.TestCase):
             limited_points, limited_rgb = depth_to_points_rgb(depth, color, intrinsics, stride=stride, max_points=6000)
             np.testing.assert_array_equal(limited_points, points[::every])
             np.testing.assert_array_equal(limited_rgb, rgb[::every])
+
+    def test_tracking_points_exclude_unsupported_depths_before_the_cap(self):
+        from scan_pipeline.camera import depth_to_points_rgb
+
+        intr = Intrinsics.kinect_v1(5, 1)
+        depth = np.array([[0.1, 0.45, 1.5, 4.0, 8.191]], dtype=np.float64)
+        color = np.full((1, 5, 3), 127, dtype=np.uint8)
+        points, colors = depth_to_points_rgb(depth, color, intr, min_depth_m=0.45, max_depth_m=4.0)
+        np.testing.assert_array_equal(points[:, 2], [0.45, 1.5, 4.0])
+        self.assertEqual(len(colors), 3)
+        limited, _ = depth_to_points_rgb(depth, color, intr, min_depth_m=0.45, max_depth_m=4.0,
+                                         max_points=2)
+        np.testing.assert_array_equal(limited[:, 2], [0.45, 4.0])
 
     def test_reference_frame_owns_its_data_and_rejects_textureless_rgb(self):
         from scan_pipeline.frame_validation import ReferenceFrame, has_usable_texture

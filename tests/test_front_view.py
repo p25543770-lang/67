@@ -58,6 +58,23 @@ class FrontViewTests(unittest.TestCase):
         values = np.frombuffer(base64.b64decode(encoded["data"]), dtype="<u2").reshape(2, 2)
         np.testing.assert_array_equal(values, [[0, 0], [1250, 2000]])
 
+    def test_optional_rgb_comes_from_latest_container_and_expires_with_depth(self):
+        color = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+        self.frame.color_rgb = color
+        without_rgb = front_frame(self.frame, 99.99, self.intr, clock=lambda: 100.0)
+        self.assertIsNone(without_rgb["color"])
+        with_rgb = front_frame(self.frame, 99.99, self.intr, True, clock=lambda: 100.0)
+        self.assertEqual(with_rgb["captureId"], 99.98)
+        self.assertFalse(with_rgb["colorDepthRegistered"])
+        raw = base64.b64decode(with_rgb["color"]["data"])
+        np.testing.assert_array_equal(np.frombuffer(raw, dtype=np.uint8).reshape(8, 8, 3), color)
+        expired = front_frame(self.frame, 99.99, self.intr, True, clock=lambda: 100.5)
+        self.assertFalse(expired["available"])
+        self.assertIsNone(expired["color"])
+        self.assertIsNone(expired["captureId"])
+        self.frame.color_rgb = np.zeros((8, 8, 3), dtype=np.float32)
+        self.assertIsNone(front_frame(self.frame, 99.99, self.intr, True, clock=lambda: 100.0)["color"])
+
     def test_stale_unknown_or_invalid_frames_are_never_returned(self):
         result = front_frame(self.frame, 99.99, self.intr, clock=lambda: 100.0 + FRONT_MAX_AGE_S)
         self.assertEqual(result["reason"], "stale")

@@ -22,6 +22,11 @@ export function formatFrameChecks(quality) {
   return `${count(quality?.frameChecksPassed)} / ${count(quality?.frameChecks)}`;
 }
 
+export function formatLandmarkChecks(quality) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 ? String(value) : "—";
+  return `${count(quality?.landmarkChecks)} / ${count(quality?.landmarkVetoes)}`;
+}
+
 export function formatCpu(cpu) {
   const logical = Number.isSafeInteger(cpu?.logicalCpus) && cpu.logicalCpus > 0 ? cpu.logicalCpus : "—";
   // OpenMP supports a comma-separated list for nested levels; show the

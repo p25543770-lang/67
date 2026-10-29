@@ -60,6 +60,36 @@ class RobotTrajectoryTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_OPEN3D, "нужен импортируемый Open3D")
 class RobotGuardTests(unittest.TestCase):
+    def test_gap_after_initial_frame_or_one_rejection_does_not_integrate_alias(self):
+        # Regression: at +90°/s, poses 0 -> 9 or 0 -> 5 -> 10 allowed a
+        # seemingly plausible ICP match that was 0.84–0.87 m from ground truth.
+        # The RGB veto cannot help with the scene's repetitive checker texture.
+        intr = Intrinsics.kinect_v1()
+        trajectory = robot.robot_trajectory(frames=11, speed_kmh=7, yaw_deg_s=90, tilt_deg=10)
+        scene = robot.robot_scene("clutter")
+        frames = [room.render(pose, intr, noise=True, seed=k + 2000, scene=scene)[:2]
+                  for k, pose in enumerate(trajectory.poses)]
+        for sequence in ((0, 9), (0, 5, 10)):
+            for landmarks in (False, True):
+                with self.subTest(sequence=sequence, landmarks=landmarks):
+                    settings = ScanSettings.for_profile("robot")
+                    settings.visual_landmark_veto = landmarks
+                    engine = ScanEngine(settings, intr, clock=lambda: 0.0)
+                    try:
+                        self.assertEqual(engine.process(*frames[0], 0.0)["state"], "tracking")
+                        trusted = engine.last_pose.copy()
+                        for index in sequence[1:]:
+                            event = engine.process(*frames[index], trajectory.times[index])
+                            self.assertNotEqual(event["state"], "tracking", event)
+                            self.assertFalse(event["integrated"])
+                            self.assertEqual(engine.integrated, 1)
+                            np.testing.assert_array_equal(engine.last_pose, trusted)
+                        # A known return to the same trusted view may recover.
+                        recovered = engine.process(*frames[0], 0.6)
+                        self.assertEqual(recovered["state"], "tracking", recovered)
+                    finally:
+                        engine.release()
+
     def test_forward_turn_does_not_integrate_a_large_known_synthetic_error(self):
         intr = Intrinsics.kinect_v1()
         trajectory = robot.robot_trajectory(frames=15, speed_kmh=7, yaw_deg_s=20)

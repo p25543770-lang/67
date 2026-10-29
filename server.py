@@ -210,14 +210,14 @@ def _runner():
         return scan_runner
 
 
-def _scan_snapshot():
+def _scan_snapshot(include_preview=True):
     with state_lock:
         runner = scan_runner
         pending = scan_start_pending
     # Starting can include opening a device or replaying a saved pass; expose it
     # without waiting on the runner's lock so the UI can still offer Stop/Cancel.
     if pending is None and runner is not None:
-        return runner.snapshot()
+        return runner.snapshot(include_preview=include_preview)
     return {
         "running": pending is not None, "phase": "starting" if pending is not None else "idle",
         "passId": None, "source": pending.get("source") if pending is not None else None,
@@ -229,7 +229,7 @@ def _scan_snapshot():
     }
 
 
-def _front_snapshot():
+def _front_snapshot(include_color=False):
     # Do not create an engine merely to ask for the local camera view. This
     # route remains responsive even while the Open3D worker or /api/scan waits.
     with state_lock:
@@ -238,7 +238,7 @@ def _front_snapshot():
         return {"available": False, "reason": "scan_not_running", "depth": None,
                 "coordinateFrame": "camera", "oneFrameOnly": True,
                 "notForNavigation": True, "verifiedOnHardware": False}
-    return runner.front_snapshot()
+    return runner.front_snapshot(include_color=include_color)
 
 
 def _adapter_for(source_id):
@@ -456,10 +456,19 @@ def _start_scan(payload):
         raise RuntimeError("Источник не подключён. Сначала подключите выбранный датчик.")
     _require_scan_modules()
     from scan_pipeline.camera import Intrinsics
-    from scan_pipeline.config import MAX_FPS_PROFILE, ScanSettings
+    from scan_pipeline.config import MAX_FPS_PROFILE, ROBOT_PROFILE, ScanSettings
 
-    # Reject invalid profiles before grabbing a frame or creating a pass.
+    # Reject invalid options before grabbing a frame or creating a pass. The
+    # experimental RGB veto is opt-in: it can be slower and misfire when RGB
+    # and depth are not registered/synchronized. A resumed pass keeps its own
+    # saved settings instead of the current UI selection.
     settings = ScanSettings.for_profile(payload.get("profile", MAX_FPS_PROFILE))
+    landmarks = payload.get("visualLandmarks", False)
+    if not isinstance(landmarks, bool):
+        raise ValueError("Параметр RGB-опор должен быть логическим значением.")
+    if landmarks and settings.profile != ROBOT_PROFILE:
+        raise ValueError("Экспериментальная сверка RGB-опор доступна только в профиле «Робот».")
+    settings.visual_landmark_veto = landmarks
     runner = _runner()
     with runner.lock:
         if runner.active is not None or runner._working():
@@ -509,9 +518,11 @@ class Handler(BaseHTTPRequestHandler):
                 source_id = parse_qs(url.query).get("source", [""])[0]
                 self.respond(200, _capture_connected(source_id, time.monotonic() + DEVICE_FRAME_DEADLINE))
             elif url.path == "/api/scan":
-                self.respond(200, _scan_snapshot())
+                include_preview = parse_qs(url.query).get("preview", [""])[0] != "0"
+                self.respond(200, _scan_snapshot(include_preview=include_preview))
             elif url.path == "/api/scan/front":
-                self.respond(200, _front_snapshot())
+                include_color = parse_qs(url.query).get("color", [""])[0] == "1"
+                self.respond(200, _front_snapshot(include_color=include_color))
             elif url.path == "/api/scan/passes":
                 self.respond(200, {"passes": _runner().list_passes(), "verifiedOnHardware": False})
             elif url.path == "/api/export":

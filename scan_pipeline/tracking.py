@@ -32,6 +32,7 @@ import numpy as np
 from .camera import Intrinsics, invert_pose, relative_motion
 from .config import ROBOT_PROFILE, ScanSettings, TARGET_FPS
 from .frame_validation import ReferenceFrame, confirm_model_pose, has_usable_texture
+from .landmarks import LandmarkGuard
 
 SCALES = ((0.04, 10), (0.02, 8))   # (вокс. радиус м, макс. итераций), грубо → точно; 2 уровня: 3 дают то же при +30% времени
 MAX_TARGET_POINTS = 8000           # ограничение цели на масштаб: стоимость растёт с ней
@@ -57,6 +58,11 @@ RECOVERY_ROTATION_DEG = 5.0
 PREDICTION_CORRECTION_MIN_M = 0.025
 PREDICTION_CORRECTION_RATIO = 0.35
 MAX_RELIABLE_FRAME_GAP_S = 0.5
+# In robot mode, a long unobserved interval can make an apparently plausible
+# ICP result jump hundreds of millimetres even before two frames are rejected.
+# Restrict re-lock to the last trusted view; this deliberately sacrifices
+# continuity and is not a guarantee on repetitive scenes.
+ROBOT_UNOBSERVED_GAP_S = 0.12
 SLOW_MOTION_MIN_SPEED_MPS = 0.15
 SLOW_MOTION_ERROR_MIN_M = 0.035
 SLOW_MOTION_ERROR_RATIO = 0.6
@@ -230,6 +236,9 @@ class FrameToModelTracker:
         self.frame_checks = 0
         self.frame_checks_passed = 0
         self.frames_rescued = 0
+        self.landmark_guard = LandmarkGuard() if settings.visual_landmark_veto else None
+        self.landmark_checks = 0
+        self.landmark_vetoes = 0
         self._crosscheck_after_rescue = False
         self._prepared: PreparedModel | None = None
         self._prepared_version = None
@@ -244,6 +253,9 @@ class FrameToModelTracker:
         self._last_view = None
         self._last_reference = None
         self.frame_checks = self.frame_checks_passed = self.frames_rescued = 0
+        self.landmark_checks = self.landmark_vetoes = 0
+        if self.landmark_guard is not None:
+            self.landmark_guard.reset()
         self._crosscheck_after_rescue = False
         self._prepared = None
         self.last_result = None
@@ -291,9 +303,20 @@ class FrameToModelTracker:
             self._accept(base)
             self._last_view = _view_signature(*observation) if observation is not None else None
             self._last_reference = ReferenceFrame.capture(observation, base)
+            if self.landmark_guard is not None:
+                self.landmark_guard.accept(observation, intrinsics, base)
             self._consecutive_rejections = 0
             self.last_result = TrackResult("ok", base, base, reason="first_frame", method="init")
             return self.last_result
+
+        # A dropped interval is unobserved motion, not evidence of a steady
+        # velocity. Even the very first candidate after initialization can be a
+        # geometrically plausible but catastrophic wrong alignment. Robot mode
+        # falls back to the existing last-pose AND last-view recovery rules.
+        if (self.settings.profile == ROBOT_PROFILE and dt > ROBOT_UNOBSERVED_GAP_S and
+                self._recovery_state is None):
+            self._recovery_state = "lost"
+            predicted = self.pose.copy()
 
         if len(cam_points) > MAX_SOURCE_POINTS:
             step = int(np.ceil(len(cam_points) / MAX_SOURCE_POINTS))
@@ -435,18 +458,37 @@ class FrameToModelTracker:
                                     method=method, extra={"predictionCorrectionM": correction, "eigenRatio": ratio})
             rescued = True
 
+        # Distributed visual corners only veto a large, coherent disagreement.
+        # They never provide a pose or bypass any of the checks above. RGB and
+        # depth are not registered in the Kinect v1 driver, so this is a rough
+        # conservative check and can reject good motion; agreement is not proof.
+        landmarks = None
+        features = None
+        if self.landmark_guard is not None:
+            landmarks, features = self.landmark_guard.evaluate(observation, intrinsics, candidate)
+            if landmarks["status"] != "unavailable":
+                self.landmark_checks += 1
+            if landmarks["status"] == "disagreement":
+                self.landmark_vetoes += 1
+                self._recovery_state = "lost"
+                return self._reject("lost", predicted, "landmark_disagreement", fitness, rmse,
+                                    step_m, step_deg, method=method, extra={"landmarks": landmarks})
+
         self._recovery_state = None
         self._consecutive_rejections = 0
         self._accept(candidate)
         self._last_view = _view_signature(*observation) if observation is not None else None
         self._last_reference = ReferenceFrame.capture(observation, candidate)
+        if self.landmark_guard is not None:
+            self.landmark_guard.accept(observation, intrinsics, candidate, features=features)
         if rescued:
             self.frames_rescued += 1
             self._crosscheck_after_rescue = True
         self._last_accepted_dt = dt
         self.last_result = TrackResult("ok", candidate, predicted, fitness, rmse, step_m, step_deg,
                                        method=method, extra={"viewPoints": view_size,
-                                                             "frameConfirmed": confirmed, "rescued": rescued})
+                                                             "frameConfirmed": confirmed, "rescued": rescued,
+                                                             "landmarks": landmarks})
         return self.last_result
 
     def note_input_rejection(self) -> None:

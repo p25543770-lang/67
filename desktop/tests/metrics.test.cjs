@@ -29,6 +29,8 @@ test("corroboration counters and configured OpenMP threads are honest and resett
   assert.equal(metrics.formatFrameChecks({ frameChecksPassed: 3, frameChecks: 5 }), "3 / 5");
   assert.equal(metrics.formatFrameChecks({ frameChecksPassed: -1, frameChecks: Infinity }), "— / —");
   assert.equal(metrics.formatFrameChecks(null), "— / —");
+  assert.equal(metrics.formatLandmarkChecks({ landmarkChecks: 12, landmarkVetoes: 2 }), "12 / 2");
+  assert.equal(metrics.formatLandmarkChecks(null), "— / —");
   assert.equal(metrics.formatCpu({ logicalCpus: 16, openmpThreads: "4" }), "16 / 4");
   assert.equal(metrics.formatCpu({ logicalCpus: 8, openmpThreads: "4,2" }), "8 / 4,2");
   assert.equal(metrics.formatCpu(null), "— / —");

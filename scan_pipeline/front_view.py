@@ -19,6 +19,7 @@ FRONT_MAX_AGE_S = 0.25
 FRONT_SAMPLE_STRIDE = 4
 FRONT_MIN_DEPTH_MM = 450
 FRONT_MAX_DEPTH_MM = 4000
+FRONT_COLOR_MAX_SIDE = 320
 
 
 def monotonic_age(now: float, stamp) -> float | None:
@@ -37,6 +38,8 @@ def empty_front(reason: str) -> dict:
         "available": False,
         "reason": reason,
         "depth": None,
+        "color": None,
+        "captureId": None,
         "captureAgeMs": None,
         "receivedAgeMs": None,
         "maxAgeMs": round(FRONT_MAX_AGE_S * 1000),
@@ -47,8 +50,13 @@ def empty_front(reason: str) -> dict:
     }
 
 
-def front_frame(frame, received_at, intrinsics, *, clock=time.monotonic) -> dict:
-    """Prepare a downsampled LE depth image; untrusted/stale data fail closed."""
+def front_frame(frame, received_at, intrinsics, include_color=False, *, clock=time.monotonic) -> dict:
+    """Prepare a fresh LE depth image and optional unregistered RGB preview.
+
+    Color is sampled from the same published sensor-frame container, not a
+    claim of exposure-time synchronization or RGB/depth registration. It is
+    never returned when the depth frame's receipt timestamp has expired.
+    """
     now = clock()
     result = empty_front("no_frame")
     if frame is None or intrinsics is None:
@@ -83,6 +91,17 @@ def front_frame(frame, received_at, intrinsics, *, clock=time.monotonic) -> dict
     # Copy a small fixed-resolution image; never return stale or unsupported
     # ranges as valid points. Projection uses source intrinsics and stride.
     encoded = np.ascontiguousarray(np.where(valid, sampled, 0), dtype="<u2")
+    color_payload = None
+    if include_color:
+        color = getattr(frame, "color_rgb", None)
+        if color is not None:
+            color = np.asarray(color)
+            if (color.ndim == 3 and color.shape[2] == 3 and color.dtype == np.uint8 and
+                    0 < color.shape[0] <= 4096 and 0 < color.shape[1] <= 4096):
+                color_stride = max(1, math.ceil(max(color.shape[:2]) / FRONT_COLOR_MAX_SIDE))
+                small = np.ascontiguousarray(color[::color_stride, ::color_stride])
+                color_payload = {"width": int(small.shape[1]), "height": int(small.shape[0]),
+                                 "data": base64.b64encode(small.tobytes()).decode("ascii")}
     # Conversion itself can be delayed if the host is overloaded.
     finished = clock()
     capture_age = monotonic_age(finished, frame.captured_at)
@@ -101,7 +120,12 @@ def front_frame(frame, received_at, intrinsics, *, clock=time.monotonic) -> dict
         "reason": "",
         "captureAgeMs": round(capture_age * 1000, 1),
         "receivedAgeMs": round(receive_age * 1000, 1),
+        # Opaque local identifier for detecting repeated polling of one frame;
+        # it is monotonic receipt time, not wall-clock or exposure time.
+        "captureId": float(frame.captured_at),
         "sequenceNumber": sequence,
+        "color": color_payload,
+        "colorDepthRegistered": False,
         "sampleStride": FRONT_SAMPLE_STRIDE,
         "intrinsics": intrinsics.to_dict(),
         "depth": {"width": int(encoded.shape[1]), "height": int(encoded.shape[0]),

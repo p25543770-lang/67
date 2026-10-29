@@ -62,16 +62,19 @@ def depth_to_points(depth_m, intrinsics: Intrinsics, *, stride: int = 1, mask=No
 
 
 def depth_to_points_rgb(depth_m, color_rgb, intrinsics: Intrinsics, *, stride: int = 1,
-                        max_points: int | None = None):
-    """Project valid pixels; optional cap preserves the tracker's old sampling order.
+                        max_points: int | None = None, min_depth_m: float = 0.0,
+                        max_depth_m: float = float("inf")):
+    """Project valid pixels; optional cap preserves the tracker's sampling order.
 
     Select indices before constructing XYZ/RGB arrays, avoiding allocation and
     projection of tens of thousands of points that ICP would immediately drop.
+    Explicit limits keep unsupported sensor depths out of geometric matching.
     """
     depth = np.asarray(depth_m, dtype=np.float64)[::stride, ::stride]
     _, width = depth.shape
     flat = depth.ravel()
-    indices = np.flatnonzero(np.isfinite(flat) & (flat > 0))
+    indices = np.flatnonzero(np.isfinite(flat) & (flat > 0) &
+                             (flat >= min_depth_m) & (flat <= max_depth_m))
     if max_points is not None and max_points > 0 and len(indices) > max_points:
         every = int(np.ceil(len(indices) / max_points))
         indices = indices[::every]

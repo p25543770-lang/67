@@ -631,7 +631,7 @@ class ScanRunner:
         return mesh_io.write_glb(*args), f"{stem}.glb", "model/gltf-binary"
 
     # ----- состояние для интерфейса -----------------------------------------
-    def front_snapshot(self) -> dict:
+    def front_snapshot(self, include_color=False) -> dict:
         """Latest raw camera view without waiting for the model/engine lock.
 
         A fresh depth frame is not evidence of a correct global pose. In
@@ -651,7 +651,7 @@ class ScanRunner:
             result = empty_front("no_frame")
         else:
             frame, received_at = published
-            result = front_frame(frame, received_at, status["intrinsics"])
+            result = front_frame(frame, received_at, status["intrinsics"], include_color)
         now = time.monotonic()
         tracked_age = monotonic_age(now, status["last_tracked_at"])
         processed_age = monotonic_age(now, status["last_processed_at"])
@@ -675,7 +675,7 @@ class ScanRunner:
                 return empty_front("scan_not_running")
         return result
 
-    def snapshot(self, preview_points=PREVIEW_POINTS) -> dict:
+    def snapshot(self, preview_points=PREVIEW_POINTS, *, include_preview=True) -> dict:
         with self.lock:
             active = self.active
             event = dict(self.last_event)
@@ -708,7 +708,7 @@ class ScanRunner:
                 points = _preview_mesh(arrays["vertices"], preview_points)
             running = active is not None
             preview = None
-            if running and self.last_preview is not None:
+            if include_preview and running and self.last_preview is not None:
                 preview = _encode_preview(self.last_preview)
             tracking = event.get("state", "idle") if running else ("stopped" if phase == "ready" else "idle")
             # A snapshot may have waited on the engine lock while the next

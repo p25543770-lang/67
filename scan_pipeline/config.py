@@ -45,6 +45,7 @@ class ScanSettings:
     icp_max_fitness_loss: float = 0.35   # fitness ниже — трекинг потерян
     icp_max_rmse_m: float = 0.012        # RMS выше ≈ 2 вокселя — трекинг потерян
     use_color_icp: bool = False          # цветной ICP срывался на синтетике (см. tracking.py)
+    visual_landmark_veto: bool = False    # только отбраковка; не источник или подтверждение позы
     max_speed_mps: float = 7.0 / 3.6     # целевой предел: 7 км/ч, не гарантия для устройства
     max_angular_rps: float = 1.0
     keyframe_translation_m: float = 0.015
@@ -80,6 +81,9 @@ class ScanSettings:
     def validate(self) -> "ScanSettings":
         if self.profile not in (STANDARD_PROFILE, MAX_FPS_PROFILE, ROBOT_PROFILE):
             raise ValueError("Неизвестный профиль сканирования.")
+        if (not isinstance(self.visual_landmark_veto, bool) or
+                (self.visual_landmark_veto and self.profile != ROBOT_PROFILE)):
+            raise ValueError("RGB-опоры доступны только как логический параметр профиля «Робот».")
         if not (4.0 <= self.voxel_mm <= 12.0):
             raise ValueError("Размер вокселя должен быть в пределах 4–12 мм (рекомендуется 5–8 мм).")
         if self.depth_stride not in (1, 2):

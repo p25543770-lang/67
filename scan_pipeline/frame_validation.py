@@ -49,7 +49,10 @@ def has_usable_texture(color) -> bool:
 def _cloud_from_depth(depth, intrinsics, *, normals=False):
     import open3d as o3d
 
-    points = depth_to_points(depth.astype(np.float32) / 1000.0, intrinsics, stride=2)
+    # The depth sensor may return nonzero sentinel/out-of-range values. Do
+    # not let points the TSDF cannot integrate corroborate a candidate pose.
+    valid = (depth >= 450) & (depth <= 4000)
+    points = depth_to_points(depth.astype(np.float32) / 1000.0, intrinsics, stride=2, mask=valid)
     cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).voxel_down_sample(0.025)
     if normals and len(cloud.points):
         cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.06, max_nn=25))

@@ -1,8 +1,10 @@
 import * as THREE from "three";
 import { environmentStatus, isScanInProgress, scanActions, setupHeadline } from "./readiness.js";
 import { apiRequest } from "./api.js";
-import { frontDepthToPoints, frontViewDeadline, isPoseFresh } from "./front-view.js";
-import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatSpeed } from "./metrics.js";
+import { frontDepthToPackedPoints, PreviewClock, isPoseFresh } from "./front-view.js";
+import { fillPointBuffers } from "./point-buffer.js";
+import { decodePixelFrame } from "./pixel-frames.js";
+import { formatAngularSpeed, formatCpu, formatFps, formatFrameChecks, formatLandmarkChecks, formatSpeed } from "./metrics.js";
 import { version as appVersion } from "../package.json";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import Box from "lucide/dist/esm/icons/box.js";
@@ -193,12 +195,15 @@ document.querySelector("#app").innerHTML = `
             <div><span>FPS · ТРЕКИНГ / TSDF</span><strong id="trackedFpsMetric">— / —</strong></div>
             <div><span>ПРИНЯТО ДЛЯ ТРЕКИНГА</span><strong id="acceptedMetric">—</strong></div>
             <div><span>СВЕРКА · ПРОШЛИ / ПРОВЕРОК</span><strong id="frameChecksMetric">— / —</strong></div>
+            <div title="Распределённые RGB-признаки только отбраковывают сильное расхождение; это не распознавание объектов и не гарантия позы"><span>RGB-ОПОРЫ · ПРОВЕРКИ / ОТКЛОНЕНО</span><strong id="landmarkChecksMetric">— / —</strong></div>
             <div title="Логические процессоры / запрошенное число потоков OpenMP"><span>CPU · ЛОГИЧ. / OMP</span><strong id="cpuMetric">— / —</strong></div>
           </div>
           <div class="scan-progress"><div class="scan-progress-fill" id="scanProgressFill"></div></div>
           <label class="field-label scan-profile-label" for="scanProfile">Профиль нового прохода</label>
           <div class="select-wrap"><select id="scanProfile" aria-describedby="scanProfileHint"><option value="max_fps">Максимум FPS</option><option value="robot">Робот · осторожная сверка</option><option value="standard">Стандарт · плотнее</option></select><i data-lucide="chevron-down"></i></div>
-          <p class="movement-hint" id="scanProfileHint">Режим «Робот» отбраковывает спорные позы и может быстро потерять трекинг. При стандартном пределе оценка ICP выше ≈57°/с не принимается; реальное вращение может быть оценено неверно. Это не управление роботом и не гарантия карты. Продолжение сохраняет профиль прохода. 320×240; Kinect физически не проверен.</p>
+          <p class="movement-hint" id="scanProfileHint">Режим «Робот» при разрыве более 120 мс от последней принятой позы требует возврата к последнему виду и может быстро потерять трекинг. «Максимум FPS» не включает эту дополнительную проверку. Повороты ≈90°/с не подтверждены: оценка ICP выше ≈57°/с отбраковывается, реальное вращение может быть оценено неверно. Это не управление роботом и не гарантия карты. Продолжение сохраняет настройки прохода. Kinect физически не проверен.</p>
+          <label class="landmark-option"><input id="scanVisualLandmarks" type="checkbox" aria-describedby="landmarkHint" disabled><span>Эксперимент: сверка по RGB-опорам</span></label>
+          <p class="movement-hint" id="landmarkHint">Только для нового прохода «Робот». Может замедлять обработку и ложно отклонять правильные позы: RGB и глубина не совмещены. Не подтверждает правильность позы.</p>
         </section>
 
         <section class="card settings-card" id="settingsPanel">
@@ -271,16 +276,18 @@ const sceneHost = $("sceneCanvas");
 const rgbCanvas = $("rgbCanvas");
 const depthCanvas = $("depthCanvas");
 const depthColorLut = new Uint8ClampedArray(256 * 3);
+const pointColorLut = new Float32Array(256 * 3);
+const lutColor = new THREE.Color();
 for (let index = 0; index < 256; index++) {
   const distance = index / 255;
-  const color = new THREE.Color().setHSL(
-    0.52 - distance * 0.36,
-    0.82,
-    0.46 + (1 - distance) * 0.09,
-  );
-  depthColorLut[index * 3] = Math.round(color.r * 255);
-  depthColorLut[index * 3 + 1] = Math.round(color.g * 255);
-  depthColorLut[index * 3 + 2] = Math.round(color.b * 255);
+  lutColor.setHSL(0.52 - distance * 0.36, 0.82, 0.46 + (1 - distance) * 0.09);
+  depthColorLut[index * 3] = Math.round(lutColor.r * 255);
+  depthColorLut[index * 3 + 1] = Math.round(lutColor.g * 255);
+  depthColorLut[index * 3 + 2] = Math.round(lutColor.b * 255);
+  lutColor.setHSL(0.47 + distance * 0.18, 0.72, 0.48 + (1 - distance) * 0.16);
+  pointColorLut[index * 3] = lutColor.r;
+  pointColorLut[index * 3 + 1] = lutColor.g;
+  pointColorLut[index * 3 + 2] = lutColor.b;
 }
 
 const scene = new THREE.Scene();
@@ -310,16 +317,26 @@ const pointMaterial = new THREE.PointsMaterial({
   opacity: 0.96,
 });
 const pointObject = new THREE.Points(pointGeometry, pointMaterial);
+// The buffers are reused and may contain old values beyond drawRange. Avoid
+// computing a bounding sphere from those unused slots on every preview update.
+pointObject.frustumCulled = false;
 scene.add(pointObject);
+let pointCapacity = 0;
+let pointPositions = null;
+let pointColors = null;
 
 let originalPoints = [];
-let frontPoints = [];
+let frontPoints = new Float32Array(0);
 let viewMode = "map";
 let frontTimer = null;
 let frontExpiryTimer = null;
 let frontBusy = false;
 let frontDeadlineMs = 0;
 let frontGeneration = 0;
+const previewClock = new PreviewClock();
+const LIVE_PREVIEW_POLL_MS = 50; // maximum request rate; no overlapping requests
+const SENSOR_PREVIEW_POLL_MS = 100; // direct capture outside a scan
+let liveFeedCleared = true;
 let demoPoints = makeDemoRoom();
 let activeSource = "demo";
 let devices = [];
@@ -390,63 +407,83 @@ function makeDemoRoom() {
 }
 
 function renderPoints() {
-  const maxDepth = Number($("depthRange").value);
-  const palette = $("palette").value;
-  const positions = [];
-  const colors = [];
-  for (const point of viewMode === "front" ? frontPoints : originalPoints) {
-    const [x, y, z, depth = 2] = point;
-    if (Number.isFinite(depth) && depth > maxDepth) continue;
-    positions.push(x, y, z);
-    const color = new THREE.Color();
-    if (palette === "mono") {
-      color.setRGB(0.74, 0.83, 0.78);
-    } else if (palette === "mint") {
-      color.setRGB(0.27, 0.86, 0.63);
-    } else {
-      const t = Math.min(Math.max((Number(depth) || 1) / 5, 0), 1);
-      color.setHSL(0.47 + t * 0.18, 0.72, 0.48 + (1 - t) * 0.16);
-    }
-    colors.push(color.r, color.g, color.b);
+  const points = viewMode === "front" ? frontPoints : originalPoints;
+  const needed = points instanceof Float32Array ? Math.floor(points.length / 4) : points.length;
+  if (needed > pointCapacity || pointPositions === null) {
+    // Disposing before replacing attributes releases their GPU buffers. Grow
+    // geometrically so normal frame-size fluctuations do not reallocate them.
+    if (pointCapacity) pointGeometry.dispose();
+    pointCapacity = Math.max(256, 2 ** Math.ceil(Math.log2(Math.max(1, needed))));
+    pointPositions = new Float32Array(pointCapacity * 3);
+    pointColors = new Float32Array(pointCapacity * 3);
+    pointGeometry.setAttribute("position", new THREE.BufferAttribute(pointPositions, 3).setUsage(THREE.DynamicDrawUsage));
+    pointGeometry.setAttribute("color", new THREE.BufferAttribute(pointColors, 3).setUsage(THREE.DynamicDrawUsage));
   }
-  pointGeometry.setAttribute(
-    "position",
-    new THREE.Float32BufferAttribute(positions, 3),
-  );
-  pointGeometry.setAttribute(
-    "color",
-    new THREE.Float32BufferAttribute(colors, 3),
-  );
-  pointGeometry.computeBoundingSphere();
-  const count = positions.length / 3;
+  const count = fillPointBuffers(points, Number($("depthRange").value), $("palette").value,
+    pointPositions, pointColors, pointColorLut);
+  pointGeometry.setDrawRange(0, count);
+  pointGeometry.getAttribute("position").needsUpdate = true;
+  pointGeometry.getAttribute("color").needsUpdate = true;
   $("pointCount").textContent = count.toLocaleString("ru-RU");
   $("emptyScene").classList.toggle("visible", count === 0);
   updateExportButtons();
 }
 
 function clearFrontView(message = "Нет свежего кадра") {
-  if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
-  frontExpiryTimer = null;
-  frontDeadlineMs = 0;
-  frontPoints = [];
+  const hadPoints = frontPoints.length > 0;
+  frontPoints = new Float32Array(0);
   $("frontViewStatus").textContent = message;
   if (viewMode === "front") {
     $("emptyTitle").textContent = "Нет свежего кадра глубины";
     $("emptyText").textContent = "Подключите датчик и начните физический проход; старые кадры не показываются.";
-    renderPoints();
+    if (hadPoints) renderPoints();
   }
 }
 
-function invalidateFrontView(message) {
-  frontGeneration += 1;
+function clearLivePreview(message) {
+  if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
+  frontExpiryTimer = null;
+  frontDeadlineMs = 0;
+  previewClock.expire();
   clearFrontView(message);
+  if (activeSource !== "demo" && !liveFeedCleared) {
+    drawNoSignal();
+    $("feedState").textContent = "НЕТ СВЕЖЕГО КАДРА";
+    $("rgbDescription").textContent = "Нет свежего RGB-кадра";
+    $("depthDescription").textContent = "Нет свежего кадра глубины";
+    liveFeedCleared = true;
+  }
 }
 
+function invalidateFrontView(message, resetClock = false) {
+  frontGeneration += 1;
+  clearLivePreview(message);
+  if (resetClock) previewClock.reset();
+}
+
+function stopLivePreview(message) {
+  if (frontTimer) clearInterval(frontTimer);
+  frontTimer = null;
+  invalidateFrontView(message);
+}
+
+function ensureLivePreview() {
+  if (frontTimer || activeSource === "demo" || !isScanning || scanPhase !== "capturing") return;
+  frontTimer = setInterval(pollFrontView, LIVE_PREVIEW_POLL_MS);
+  void pollFrontView();
+}
+
+// The capture mailbox is independent of ICP. Poll it in both 3D modes so RGB
+// and depth don't freeze while the map worker is busy. One request at a time;
+// on an overloaded machine the actual preview rate simply drops.
 async function pollFrontView() {
-  if (viewMode !== "front") return;
-  if (frontDeadlineMs && performance.now() >= frontDeadlineMs) clearFrontView("Кадр устарел");
-  if (document.hidden || activeSource === "demo" || !isScanning || scanActionBusy || scanPhase !== "capturing") {
+  if (frontDeadlineMs && performance.now() >= frontDeadlineMs) clearLivePreview("Кадр устарел");
+  if (activeSource === "demo" || !isScanning) {
     clearFrontView("Ожидается физический проход");
+    return;
+  }
+  if (document.hidden || scanActionBusy || scanPhase !== "capturing") {
+    clearLivePreview("Ожидается физический проход");
     return;
   }
   if (frontBusy) return;
@@ -454,24 +491,40 @@ async function pollFrontView() {
   const generation = frontGeneration;
   const started = performance.now();
   try {
-    const data = await apiRequest("/api/scan/front", { timeoutMs: 1000 });
-    if (generation !== frontGeneration || viewMode !== "front") return;
+    const data = await apiRequest("/api/scan/front?color=1", { timeoutMs: 1000 });
+    if (generation !== frontGeneration) return;
     if (document.hidden || activeSource === "demo" || !isScanning || scanActionBusy || scanPhase !== "capturing") {
-      clearFrontView("Ожидается физический проход");
+      clearLivePreview("Ожидается физический проход");
       return;
     }
     const received = performance.now();
-    const deadline = frontViewDeadline(data, started, received);
-    if (deadline === null) { clearFrontView("Нет свежего кадра"); return; }
-    const points = frontDepthToPoints(data);
-    if (!points.length || performance.now() >= deadline) { clearFrontView("Нет свежей глубины"); return; }
-    frontPoints = points;
+    const update = previewClock.observe(data, started, received);
+    if (!update) { clearLivePreview("Нет свежего кадра"); return; }
+    const { deadline, freshFrame, fps } = update;
+    if (freshFrame) {
+      const hasRgb = paintRgb(data.color);
+      const hasDepth = paintDepth(data.depth);
+      if (!hasDepth) { clearLivePreview("Нет свежей глубины"); return; }
+      if (!hasRgb) drawNoSignal(rgbCanvas);
+      $("rgbDescription").textContent = hasRgb ? "RGB; с глубиной не совмещён" : "RGB-поток недоступен";
+      $("depthDescription").textContent = "Последний кадр глубины после чтения";
+      $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
+      $("depthFrameLabel").textContent = "LIVE · DEPTH";
+      liveFeedCleared = false;
+    }
+    if (viewMode === "front" && (freshFrame || !frontPoints.length)) {
+      const points = frontDepthToPackedPoints(data);
+      if (!points.length || performance.now() >= deadline) { clearLivePreview("Нет свежей глубины"); return; }
+      frontPoints = points;
+      $("sceneModeLabel").textContent = "ПЕРЕД КАМЕРОЙ · ОДИН КАДР";
+      renderPoints();
+    }
     frontDeadlineMs = deadline;
     if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
-    // Clear at the deadline, not at the next 150 ms poll. Browser event-loop
-    // stalls can delay timers, so this is still only an informational view.
+    // Clear at the deadline, not the next poll. Event-loop stalls can delay
+    // both painting and expiry: this remains an informational display only.
     frontExpiryTimer = setTimeout(() => {
-      if (generation === frontGeneration && frontDeadlineMs === deadline) clearFrontView("Кадр устарел");
+      if (generation === frontGeneration && frontDeadlineMs === deadline) clearLivePreview("Кадр устарел");
     }, Math.max(0, deadline - performance.now()));
     const age = Math.round(data.captureAgeMs + (received - started));
     const trackingAge = data.tracking?.lastAcceptedAgeMs;
@@ -479,12 +532,12 @@ async function pollFrontView() {
       trackingAge + received - started <= 250;
     const tracking = trackingFresh && data.tracking?.sameFrame ? "поза этого кадра оценена"
       : trackingFresh ? "поза другого кадра; без совмещения" : "глобальная поза не подтверждена";
-    $("frontViewStatus").textContent = `После чтения ≈${age} мс · ${tracking}`;
-    $("sceneModeLabel").textContent = "ПЕРЕД КАМЕРОЙ · ОДИН КАДР";
-    renderPoints();
-    if (performance.now() >= deadline) clearFrontView("Кадр устарел");
+    const previewRate = fps === null ? "—" : fps.toFixed(1);
+    $("frontViewStatus").textContent = `После чтения ≈${age} мс · превью ${previewRate} к/с · ${tracking}`;
+    $("feedState").textContent = `ПРЕВЬЮ · ${previewRate} К/С`;
+    if (performance.now() >= deadline) clearLivePreview("Кадр устарел");
   } catch {
-    if (generation === frontGeneration && viewMode === "front") clearFrontView("Нет ответа датчика");
+    if (generation === frontGeneration) clearLivePreview("Нет ответа датчика");
   } finally {
     frontBusy = false;
   }
@@ -492,13 +545,7 @@ async function pollFrontView() {
 
 function setViewMode(mode) {
   viewMode = mode === "front" ? "front" : "map";
-  frontGeneration += 1;
-  if (frontTimer) clearInterval(frontTimer);
-  frontTimer = null;
-  if (frontExpiryTimer) clearTimeout(frontExpiryTimer);
-  frontExpiryTimer = null;
-  frontPoints = [];
-  frontDeadlineMs = 0;
+  frontPoints = new Float32Array(0);
   $("mapViewButton").setAttribute("aria-pressed", String(viewMode === "map"));
   $("frontViewButton").setAttribute("aria-pressed", String(viewMode === "front"));
   $("frontViewStatus").hidden = viewMode !== "front";
@@ -506,7 +553,8 @@ function setViewMode(mode) {
   if (viewMode === "front") {
     $("sceneModeLabel").textContent = "ПЕРЕД КАМЕРОЙ · ОДИН КАДР";
     clearFrontView("Ожидание свежего кадра");
-    frontTimer = setInterval(pollFrontView, 150);
+    renderPoints();
+    ensureLivePreview();
     void pollFrontView();
   } else {
     $("emptyTitle").textContent = "Облако точек пока пустое";
@@ -521,9 +569,8 @@ $("mapViewButton").onclick = () => setViewMode("map");
 $("frontViewButton").onclick = () => setViewMode("front");
 document.addEventListener("visibilitychange", () => {
   if (poseDeadlineMs && (document.hidden || performance.now() >= poseDeadlineMs)) expirePoseStatus();
-  if (viewMode !== "front") return;
   if (document.hidden) invalidateFrontView("Окно скрыто");
-  else void pollFrontView();
+  else if (isScanning && activeSource !== "demo") { ensureLivePreview(); void pollFrontView(); }
 });
 
 function resizeScene() {
@@ -537,7 +584,7 @@ function resizeScene() {
 new ResizeObserver(resizeScene).observe(sceneHost);
 function animate() {
   requestAnimationFrame(animate);
-  if (viewMode === "front" && frontDeadlineMs && performance.now() >= frontDeadlineMs) clearFrontView("Кадр устарел");
+  if (frontDeadlineMs && performance.now() >= frontDeadlineMs) clearLivePreview("Кадр устарел");
   if (poseDeadlineMs && performance.now() >= poseDeadlineMs) expirePoseStatus();
   controls.update();
   renderer.render(scene, camera);
@@ -965,6 +1012,7 @@ function setTracking(status, speed, warning, title = "", text = "") {
     $("trackedFpsMetric").textContent = "— / —";
     $("acceptedMetric").textContent = "—";
     $("frameChecksMetric").textContent = formatFrameChecks(null);
+    $("landmarkChecksMetric").textContent = formatLandmarkChecks(null);
     $("cpuMetric").textContent = formatCpu(null);
   }
   $("warningBox").hidden = !warning;
@@ -1070,8 +1118,8 @@ function renderDemoFeeds() {
   $("depthFrameLabel").textContent = "DEMO MAP";
 }
 
-function drawNoSignal() {
-  for (const canvas of [rgbCanvas, depthCanvas]) {
+function drawNoSignal(only = null) {
+  for (const canvas of only ? [only] : [rgbCanvas, depthCanvas]) {
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#17241f";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1084,43 +1132,43 @@ function drawNoSignal() {
     ctx.textAlign = "center";
     ctx.fillText("Нет сигнала датчика", canvas.width / 2, canvas.height / 2);
   }
-  $("rgbFrameLabel").textContent = "NO SIGNAL";
-  $("depthFrameLabel").textContent = "NO SIGNAL";
+  if (!only || only === rgbCanvas) $("rgbFrameLabel").textContent = "NO SIGNAL";
+  if (!only || only === depthCanvas) $("depthFrameLabel").textContent = "NO SIGNAL";
 }
 
-function decodeBase64(value) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index++)
-    bytes[index] = binary.charCodeAt(index);
-  return bytes;
+let rgbImageCache = null;
+let depthImageCache = null;
+function feedImage(canvas, frame, cached) {
+  if (!cached || cached.width !== frame.width || cached.height !== frame.height) {
+    cached = new ImageData(new Uint8ClampedArray(frame.width * frame.height * 4), frame.width, frame.height);
+  }
+  if (canvas.width !== frame.width) canvas.width = frame.width;
+  if (canvas.height !== frame.height) canvas.height = frame.height;
+  return cached;
 }
 
 function paintRgb(frame) {
-  if (!frame?.data || !frame.width || !frame.height) return false;
-  const bytes = decodeBase64(frame.data);
-  const rgba = new Uint8ClampedArray(frame.width * frame.height * 4);
+  const bytes = decodePixelFrame(frame, 3);
+  if (bytes === null) return false;
+  rgbImageCache = feedImage(rgbCanvas, frame, rgbImageCache);
+  const rgba = rgbImageCache.data;
   for (let i = 0, j = 0; i < bytes.length; i += 3, j += 4) {
-    rgba[j] = bytes[i];
-    rgba[j + 1] = bytes[i + 1];
-    rgba[j + 2] = bytes[i + 2];
+    rgba[j] = bytes.charCodeAt(i);
+    rgba[j + 1] = bytes.charCodeAt(i + 1);
+    rgba[j + 2] = bytes.charCodeAt(i + 2);
     rgba[j + 3] = 255;
   }
-  rgbCanvas.width = frame.width;
-  rgbCanvas.height = frame.height;
-  rgbCanvas
-    .getContext("2d")
-    .putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+  rgbCanvas.getContext("2d").putImageData(rgbImageCache, 0, 0);
   return true;
 }
 
 function paintDepth(frame) {
-  if (!frame?.data || !frame.width || !frame.height) return false;
-  const bytes = decodeBase64(frame.data);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const rgba = new Uint8ClampedArray(frame.width * frame.height * 4);
+  const bytes = decodePixelFrame(frame, 2);
+  if (bytes === null) return false;
+  depthImageCache = feedImage(depthCanvas, frame, depthImageCache);
+  const rgba = depthImageCache.data;
   for (let pixel = 0; pixel < frame.width * frame.height; pixel++) {
-    const millimetres = view.getUint16(pixel * 2, true);
+    const millimetres = bytes.charCodeAt(pixel * 2) | (bytes.charCodeAt(pixel * 2 + 1) << 8);
     const i = pixel * 4;
     if (!millimetres) {
       rgba[i] = 10;
@@ -1136,11 +1184,7 @@ function paintDepth(frame) {
     rgba[i + 2] = depthColorLut[paletteIndex * 3 + 2];
     rgba[i + 3] = 255;
   }
-  depthCanvas.width = frame.width;
-  depthCanvas.height = frame.height;
-  depthCanvas
-    .getContext("2d")
-    .putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+  depthCanvas.getContext("2d").putImageData(depthImageCache, 0, 0);
   return true;
 }
 
@@ -1209,6 +1253,9 @@ function displaySensorFrame(data) {
   }
   const hasRgb = paintRgb(data.color);
   const hasDepth = paintDepth(data.depth);
+  liveFeedCleared = false;
+  if (!hasRgb) drawNoSignal(rgbCanvas);
+  if (!hasDepth) drawNoSignal(depthCanvas);
   $("rgbDescription").textContent = hasRgb ? "Кадр с Kinect 360" : "RGB-поток недоступен";
   $("depthDescription").textContent = hasDepth ? "Глубина в реальном времени" : "Карта глубины недоступна";
   $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
@@ -1285,7 +1332,7 @@ async function connectSelectedSource({ reconnect = false } = {}) {
     if (profile) { profile.connected = true; profile.state = "connected"; profile.error = ""; profile.hint = ""; }
     updateSourcePanel();
     displaySensorFrame(result.frame);
-    if (!streamTimer) streamTimer = setInterval(pollFrame, 300);
+    if (!streamTimer) streamTimer = setInterval(pollFrame, SENSOR_PREVIEW_POLL_MS);
     if (!reconnect) showToast("Датчик подключён. Перемещайте его медленно.", "success");
     return true;
   } catch (error) {
@@ -1353,6 +1400,7 @@ function updateExportButtons() {
   $("cancelScanButton").hidden = activeSource === "demo" || !isScanning;
   $("cancelScanButton").disabled = !actions.cancel;
   $("scanProfile").disabled = isScanning || scanActionBusy || ["starting", "stopping", "finalizing", "merging"].includes(scanPhase);
+  $("scanVisualLandmarks").disabled = $("scanProfile").disabled || $("scanProfile").value !== "robot";
   const reason = $("scanActionReason");
   reason.textContent = actions.reason;
   reason.hidden = !actions.reason;
@@ -1459,13 +1507,15 @@ async function startPhysicalScan(resumePassId = null) {
   if (!currentScanActions().start || isScanning) return;
   scanActionBusy = true;
   scanGeneration += 1;
-  invalidateFrontView("Запуск прохода");
+  invalidateFrontView("Запуск прохода", true);
   setTracking("idle", null, "", "Подготовка сканирования", "Ожидается первая свежая оценка позы.");
   stopStream();
   updateExportButtons();
   try {
+    const profile = $("scanProfile").value;
     await apiRequest("/api/scan/start", {
-      method: "POST", body: { source: activeSource, profile: $("scanProfile").value,
+      method: "POST", body: { source: activeSource, profile,
+        visualLandmarks: profile === "robot" && $("scanVisualLandmarks").checked,
         ...(resumePassId ? { resumePassId } : {}) },
     });
     scanGeneration += 1;
@@ -1482,8 +1532,11 @@ async function startPhysicalScan(resumePassId = null) {
       "Ожидается первая свежая оценка позы; приложение не управляет роботом.");
     $("sceneModeLabel").textContent = "СКАНИРОВАНИЕ · TSDF";
     startScanPolling();
-    await refreshScan();
-    await loadPasses();
+    // Start the independent mailbox preview immediately, even if the first
+    // processing/status response is slow. Both helpers handle their own errors.
+    ensureLivePreview();
+    void refreshScan();
+    void loadPasses();
   } catch (error) {
     scanGeneration += 1;
     showToast(error.message, "warning");
@@ -1499,7 +1552,7 @@ async function startPhysicalScan(resumePassId = null) {
       isScanning = false;
       // The server closes a failed sensor; a new frame request reports details.
       if (deviceConnected && !streamTimer) {
-        streamTimer = setInterval(pollFrame, 300);
+        streamTimer = setInterval(pollFrame, SENSOR_PREVIEW_POLL_MS);
         void pollFrame();
       }
     }
@@ -1522,13 +1575,14 @@ async function toggleScan() {
   }
   scanActionBusy = true;
   scanGeneration += 1;
-  invalidateFrontView("Остановка прохода");
+  stopLivePreview("Остановка прохода");
   setTracking("idle", null, "", "Остановка прохода", "Ожидается подтверждение моста; робот не управляется программой.");
   updateExportButtons();
   try {
     const result = await apiRequest("/api/scan/stop", { method: "POST", body: {} });
     scanGeneration += 1;
     isScanning = false;
+    stopLivePreview("Проход остановлен");
     scanPhase = result.phase || "idle";
     // ScanRunner releases the handle when capture stops. Reopen the stream
     // explicitly; export stays disabled until that succeeds.
@@ -1542,6 +1596,7 @@ async function toggleScan() {
     await refreshScan();
   } finally {
     scanActionBusy = false;
+    if (isScanning) ensureLivePreview();
     setScanButton();
     renderPasses();
   }
@@ -1551,7 +1606,7 @@ async function cancelScan() {
   if (!isScanning || activeSource === "demo" || scanActionBusy) return;
   scanActionBusy = true;
   scanGeneration += 1;
-  invalidateFrontView("Отмена прохода");
+  stopLivePreview("Отмена прохода");
   setTracking("idle", null, "", "Отмена прохода", "Ожидается подтверждение моста; робот не управляется программой.");
   updateExportButtons();
   try {
@@ -1560,6 +1615,7 @@ async function cancelScan() {
     if (scanTimer) clearInterval(scanTimer);
     scanTimer = null;
     isScanning = false;
+    stopLivePreview("Проход отменён");
     scanPhase = "idle";
     hasScan = false;
     originalPoints = [];
@@ -1577,6 +1633,7 @@ async function cancelScan() {
     await refreshScan();
   } finally {
     scanActionBusy = false;
+    if (isScanning) ensureLivePreview();
     setScanButton();
     renderPasses();
   }
@@ -1588,7 +1645,7 @@ async function refreshScan() {
   const requestStartedMs = window.performance.now();
   const generation = scanGeneration;
   try {
-    const data = await apiRequest("/api/scan");
+    const data = await apiRequest("/api/scan?preview=0");
     if (generation !== scanGeneration) return;
     // Include the whole request time when judging whether status could be old.
     scanStatusUpdatedMs = requestStartedMs;
@@ -1597,23 +1654,18 @@ async function refreshScan() {
     isScanning = Boolean(data.running);
     scanPhase = data.phase || (isScanning ? "capturing" : "idle");
     if (wasRunning && !isScanning) {
-      invalidateFrontView("Проход остановлен");
+      stopLivePreview("Проход остановлен");
       markScanDeviceReleased(data.error || "");
+    } else if (isScanning && scanPhase === "capturing" && !scanActionBusy) {
+      ensureLivePreview();
     }
     hasScan = scanPhase === "ready" && Boolean(data.lastResultId);
     if (Array.isArray(data.points) && (data.points.length > 0 || scanPhase === "ready")) {
       originalPoints = data.points.map(([x, y, z, depth]) => [x, y + 1.25, z, depth]);
-      renderPoints();
+      if (viewMode === "map") renderPoints();
     }
-    if (data.preview) {
-      const hasRgb = paintRgb(data.preview.color);
-      const hasDepth = paintDepth(data.preview.depth);
-      $("rgbDescription").textContent = hasRgb ? "Кадр с Kinect 360" : "RGB-поток недоступен";
-      $("depthDescription").textContent = hasDepth ? "Карта глубины в реальном времени" : "Карта глубины недоступна";
-      $("rgbFrameLabel").textContent = hasRgb ? "LIVE · RGB" : "NO RGB";
-      $("depthFrameLabel").textContent = hasDepth ? "LIVE · DEPTH" : "NO DEPTH";
-      $("feedState").textContent = "ПОТОК АКТИВЕН · СКАНИРОВАНИЕ";
-    }
+    // The status response deliberately omits its old, processing-bound image;
+    // the independent latest-frame request above drives both feed canvases.
     const performance = data.performance;
     $("angularMetric").textContent = formatAngularSpeed(data.angularDegS);
     $("fpsMetric").textContent = `${formatFps(performance?.captureFps)} / ${formatFps(performance?.processingFps)}`;
@@ -1627,6 +1679,8 @@ async function refreshScan() {
     $("acceptedMetric").textContent = Number.isFinite(data.quality?.acceptedRatio)
       ? `${Math.round(data.quality.acceptedRatio * 100)}%` : "—";
     $("frameChecksMetric").textContent = formatFrameChecks(data.quality);
+    $("landmarkChecksMetric").textContent = data.pipeline?.visualLandmarkVeto
+      ? formatLandmarkChecks(data.quality) : "— / —";
     $("cpuMetric").textContent = formatCpu(data.pipeline?.cpu);
     $("frameCount").textContent = String(data.frames || 0);
     $("scanProgressFill").style.width = `${Math.min(100, (Number(data.frames || 0) / 120) * 100)}%`;
@@ -1799,7 +1853,8 @@ function downloadBlob(blob, name) {
 function exportDemo(format) {
   const visible = [];
   const positions = pointGeometry.getAttribute("position")?.array || [];
-  for (let i = 0; i < positions.length; i += 3)
+  const visibleLength = Math.min(positions.length, pointGeometry.drawRange.count * 3);
+  for (let i = 0; i < visibleLength; i += 3)
     visible.push([positions[i], positions[i + 1], positions[i + 2]]);
   if (!visible.length) {
     showToast(
@@ -1866,6 +1921,7 @@ async function exportScan(format) {
   }
 }
 
+$("scanProfile").onchange = updateExportButtons;
 $("sourceSelect").onchange = async (event) => {
   if (isScanning || scanActionBusy || deviceActionBusy || ["finalizing", "merging"].includes(scanPhase)) {
     showToast("Дождитесь окончания текущего прохода перед сменой источника.", "warning");
@@ -1874,7 +1930,7 @@ $("sourceSelect").onchange = async (event) => {
   }
   const nextSource = event.target.value;
   scanGeneration += 1;
-  invalidateFrontView("Источник изменён");
+  invalidateFrontView("Источник изменён", true);
   const previousSource = activeSource;
   const wasConnected = deviceConnected;
   stopStream();

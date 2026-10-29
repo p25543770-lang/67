@@ -1,6 +1,6 @@
 {
   "name": "depth-studio",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "private": true,
   "description": "Experimental depth-camera room scanning and point-cloud viewer.",
   "author": "Depth Studio contributors",

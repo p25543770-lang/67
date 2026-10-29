@@ -1052,6 +1052,18 @@ h1 {
   color: #617b67;
   font-weight: 700;
 }
+.landmark-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  color: #596d60;
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.landmark-option input { margin: 0; accent-color: #659b70; }
+.landmark-option:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
 .setting-row {
   margin-bottom: 17px;
 }

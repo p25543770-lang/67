@@ -191,6 +191,7 @@ jobs:
             'resources\scan_pipeline\process_engine.py',
             'resources\scan_pipeline\frame_validation.py',
             'resources\scan_pipeline\front_view.py',
+            'resources\scan_pipeline\landmarks.py',
             'resources\scan_pipeline\runtime.py',
             'resources\scripts\benchmark-synthetic-fps.py',
             'resources\scripts\benchmark-tracking-stability.py',
@@ -359,6 +360,8 @@ jobs:
             Write-Output "::error title=Installed robot tracking tests::$trace"
             exit $robotExitCode
           }
+          & $python -m unittest discover -s tests -p test_landmarks.py -v
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка экспериментальной проверки RGB-опор.'; exit 1 }
           & $python -m unittest discover -s tests -p test_windows_pythonnet_runtime.py -v
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Ошибка работы с .NET-массивами и IntPtr через pythonnet.'; exit 1 }
           $bench = Join-Path $env:DEPTH_STUDIO_EXPECT_RESOURCES 'scripts\benchmark-synthetic-fps.py'
@@ -394,12 +397,13 @@ jobs:
             if ($rows.Count -ne 2) { Write-Output '::error::Robot benchmark did not report both frame strides.'; exit 1 }
             foreach ($row in $rows) { Write-Output "::notice title=Windows robot offline $($profile)::$row" }
           }
-          $results = & $python $bench --frames 45 --trajectory robot --scene clutter --speed-kmh 7 --yaw-deg-s 20 --profiles robot --front-poll-ms 150
+          $results = & $python $bench --frames 45 --trajectory robot --scene clutter --speed-kmh 7 --yaw-deg-s 20 --profiles robot --front-poll-ms 50 --front-color --status-without-preview --landmarks
           if ($LASTEXITCODE -ne 0) { Write-Output '::error::Robot realtime/front benchmark failed.'; exit 1 }
           $json = $results | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
           if (-not $json) { Write-Output '::error::Robot realtime benchmark returned no result.'; exit 1 }
           $data = $json | ConvertFrom-Json
-          if ($data.hardwareVerified -ne $false -or $data.frontRequests -lt 1 -or $data.trajectory -ne 'robot') {
+          if ($data.hardwareVerified -ne $false -or $data.frontRequests -lt 1 -or $data.trajectory -ne 'robot' -or
+              $data.frontColorRequested -ne $true -or $data.statusPreviewOmitted -ne $true -or $data.landmarkEnabled -ne $true) {
             Write-Output '::error::Robot realtime report is incomplete or claims hardware verification.'; exit 1
           }
           Write-Output "::notice title=Windows robot simulated realtime::$json"
