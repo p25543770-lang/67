@@ -30,13 +30,14 @@ class StubStereo:
             "notForNavigation": True, "notAObstacleDetector": True, "verifiedOnHardware": False,
         }
 
-    def status(self, **_kwargs):
+    def status(self, **kwargs):
+        self.calls.append(("status", kwargs))
         return self._status
 
-    def camera_catalog(self, **_kwargs):
-        self.calls.append(("camera_catalog", {}))
+    def camera_catalog(self, **kwargs):
+        self.calls.append(("camera_catalog", kwargs))
         return {"available": False, "cameras": [], "checked": 6, "errors": [],
-                "verifiedOnHardware": False}
+                "verifiedOnHardware": False, "pending": False, "needsScan": True}
 
     def start_session(self, payload):
         self.calls.append(("start_session", payload))
@@ -118,6 +119,30 @@ class StereoApiTestCase(unittest.TestCase):
                 return error.code, {"error": raw.decode("utf-8", "replace")}
 
 
+class ScanStubStereo(StubStereo):
+    """Сервис с фоновым поиском камер."""
+
+    def __init__(self, status=None):
+        super().__init__(status)
+        self.scan_calls = []
+        self.probe_calls = []
+        self.cancel_calls = 0
+
+    def start_camera_scan(self, **kwargs):
+        self.scan_calls.append(kwargs)
+        return {"jobId": "job-1", "running": True, "checked": 0, "total": kwargs.get("max_index"),
+                "foundIndices": []}
+
+    def cancel_camera_scan(self):
+        self.cancel_calls += 1
+        return {"jobId": "job-1", "running": False, "cancelled": True}
+
+    def probe_camera_index(self, index, **kwargs):
+        self.probe_calls.append((index, kwargs))
+        return {"index": index, "ok": False, "reason": "open_failed", "attempts": [],
+                "verifiedOnHardware": False}
+
+
 class StereoRoutesTests(StereoApiTestCase):
     def test_status_route_reports_missing_calibration(self):
         code, body = self.get("/api/stereo")
@@ -129,7 +154,39 @@ class StereoRoutesTests(StereoApiTestCase):
         code, body = self.get("/api/stereo/cameras")
         self.assertEqual(code, 200)
         self.assertFalse(body["available"])
-        self.assertIn(("camera_catalog", {}), self.stub.calls)
+        self.assertIn(("camera_catalog", {"max_index": 6}), self.stub.calls)
+
+    def test_status_forwards_version_query_parameters(self):
+        code, _body = self.get("/api/stereo?depth=0&preview=0&timings=0"
+                               "&previewA=7&previewB=8&depthVersion=9")
+        self.assertEqual(code, 200)
+        method, kwargs = self.stub.calls[-1]
+        self.assertEqual(method, "status")
+        self.assertFalse(kwargs["include_depth"])
+        self.assertFalse(kwargs["include_preview"])
+        self.assertFalse(kwargs["include_timings"])
+        self.assertEqual(kwargs["known_preview"], {"a": 7, "b": 8})
+        self.assertEqual(kwargs["known_depth"], 9)
+
+    def test_status_defaults_stay_backward_compatible(self):
+        # Как и раньше: глубина включена, предпросмотр — только по запросу.
+        self.get("/api/stereo")
+        _method, kwargs = self.stub.calls[-1]
+        self.assertTrue(kwargs["include_depth"])
+        self.assertFalse(kwargs["include_preview"])
+        self.assertIsNone(kwargs["known_preview"])
+        self.assertIsNone(kwargs["known_depth"])
+
+        self.get("/api/stereo?preview=1")
+        _method, kwargs = self.stub.calls[-1]
+        self.assertTrue(kwargs["include_preview"])
+
+    def test_broken_version_parameters_are_ignored(self):
+        code, _body = self.get("/api/stereo?previewA=abc&depthVersion=zzz")
+        self.assertEqual(code, 200)
+        _method, kwargs = self.stub.calls[-1]
+        self.assertIsNone(kwargs["known_preview"])
+        self.assertIsNone(kwargs["known_depth"])
 
     def test_start_requires_cameras(self):
         code, body = self.post("/api/stereo/start", {})
@@ -213,6 +270,58 @@ class StereoRoutesTests(StereoApiTestCase):
                                     headers={"X-Depth-Studio-Tilt": "1"})
         self.assertEqual(code, 200)
         self.assertEqual(calls, ["kinect_v1_sdk"])
+
+class StereoCameraScanTests(StereoApiTestCase):
+    """Поиск камер больше не выполняется внутри GET: только фоновый job."""
+
+    def setUp(self):
+        self.stub = ScanStubStereo()
+        self._patch = mock.patch.object(server, "_stereo", lambda: self.stub)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self._service_patch = mock.patch.object(server, "stereo_service", self.stub)
+        self._service_patch.start()
+        self.addCleanup(self._service_patch.stop)
+
+    def test_scan_starts_a_background_job(self):
+        code, body = self.post("/api/stereo/cameras/scan", {"maxIndex": 8})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["jobId"], "job-1")
+        self.assertEqual(self.stub.scan_calls[-1]["max_index"], 8)
+        self.assertEqual(self.stub.scan_calls[-1]["width"], 640)
+        self.assertEqual(self.stub.scan_calls[-1]["height"], 480)
+
+    def test_scan_respects_the_index_limit(self):
+        code, body = self.post("/api/stereo/cameras/scan", {"maxIndex": 99})
+        self.assertEqual(code, 400)
+        self.assertIn("maxIndex", body["error"])
+        self.assertFalse(self.stub.scan_calls)
+
+    def test_scan_can_be_cancelled(self):
+        code, body = self.post("/api/stereo/cameras/scan/cancel", {})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["cancelled"])
+        self.assertEqual(self.stub.cancel_calls, 1)
+
+    def test_probe_requires_an_index(self):
+        code, body = self.post("/api/stereo/cameras/probe", {"index": "0"})
+        self.assertEqual(code, 400)
+        self.assertIn("целым", body["error"])
+        code, _body = self.post("/api/stereo/cameras/probe", {"index": True})
+        self.assertEqual(code, 400)
+
+    def test_probe_runs_one_index(self):
+        code, body = self.post("/api/stereo/cameras/probe", {"index": 2})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["index"], 2)
+        self.assertEqual(self.stub.probe_calls[-1][0], 2)
+
+    def test_catalog_never_scans_synchronously(self):
+        code, body = self.get("/api/stereo/cameras")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["needsScan"])
+        self.assertFalse(body["pending"])
+        self.assertFalse(self.stub.scan_calls)
 
 
 if __name__ == "__main__":

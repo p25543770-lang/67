@@ -19,6 +19,9 @@ class ColorFrame:
     captured_at_epoch: float
     sequence_number: int | None = None
     warning: str = ""
+    # Сколько кадров было выброшено из очереди SDK, чтобы отдать самый свежий.
+    # Ноль означает «очереди не было»; счётчик не сглаживается.
+    queue_dropped: int = 0
 
 
 @dataclass

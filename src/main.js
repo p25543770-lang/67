@@ -9,14 +9,22 @@ import {
   calibrationStateLabel,
   calibrationSteps,
   cameraMetricLines,
+  cameraScanLines,
+  cameraStateLabel,
   decodeDepthFrame,
   depthMetricLines,
+  depthPlaceholder,
   depthToRgba,
   formatDepthMm,
   formatMs,
+  kinectSelectState,
   normalizeViewMode,
   pairMetricLines,
+  previewPlan,
+  stereoPollQuery,
+  stereoStartState,
   stereoWarningLines,
+  timingLines,
 } from "./stereo-view.js";
 import { mapRequestQuery, shouldApplyScanPoints } from "./map-request.js";
 import { decodePixelFrame } from "./pixel-frames.js";
@@ -144,8 +152,15 @@ document.querySelector("#app").innerHTML = `
               <label for="stereoKinectSelect">Kinect RGB<select id="stereoKinectSelect"></select></label>
               <label for="stereoUsbSelect">USB-камера<select id="stereoUsbSelect"></select></label>
               <button class="button-secondary" id="stereoRefreshCameras" type="button">Найти USB-камеры</button>
+              <button class="button-secondary" id="stereoCancelScan" type="button" hidden>Отменить поиск</button>
               <button class="button-primary" id="stereoStart" type="button">Запустить стерео</button>
               <button class="button-secondary" id="stereoStop" type="button" disabled>Остановить</button>
+            </div>
+            <p class="stereo-note" id="stereoStartReason" aria-live="polite"></p>
+            <div class="stereo-controls stereo-scan-row">
+              <label>Индекс вручную<input id="stereoManualIndex" type="number" min="0" max="31" step="1" value="0"></label>
+              <button class="button-secondary" id="stereoProbeIndex" type="button">Проверить индекс</button>
+              <span class="stereo-note" id="stereoScanProgress" aria-live="polite"></span>
             </div>
             <div class="stereo-grid">
               <div class="stereo-cell">
@@ -164,6 +179,7 @@ document.querySelector("#app").innerHTML = `
                 <div class="stereo-canvas-wrap">
                   <canvas id="stereoCanvasDepth" width="320" height="240" aria-label="Стереоглубина"></canvas>
                   <span class="stereo-canvas-label" id="stereoLabelDepth">Глубина</span>
+                  <span class="stereo-canvas-note" id="stereoDepthNote" aria-live="polite">нет калибровки</span>
                 </div>
               </div>
             </div>
@@ -706,6 +722,9 @@ document.addEventListener("visibilitychange", () => {
   if (poseDeadlineMs && (document.hidden || performance.now() >= poseDeadlineMs)) expirePoseStatus();
   if (document.hidden) invalidateFrontView("Окно скрыто");
   else if (isScanning && activeSource !== "demo") { ensureLivePreview(); void pollFrontView(); }
+  // Скрытое окно не опрашивает стереомост: иначе base64 копится впустую.
+  if (document.hidden) stopStereoPolling();
+  else if (viewMode === "stereo") startStereoPolling();
 });
 
 function resizeScene() {
@@ -2525,14 +2544,24 @@ $("envLogBtn").onclick = revealSetupLog;
 /* ------------------------------------------------------------------------ */
 /* Стереорежим: Kinect RGB + USB-камера                                      */
 /* ------------------------------------------------------------------------ */
-const STEREO_POLL_MS = 500;
+// Опрос статуса: не чаще 4 раз/с, без наложенных запросов. Превью и глубина
+// пересылаются только при изменении версии, поэтому 300 мс — это дешёвый
+// запрос на несколько килобайт, а не 200 КБ base64 на каждые 500 мс.
+const STEREO_POLL_MS = 300;
+const STEREO_TIMINGS_EVERY = 10;
 let stereoStatus = null;
 let stereoPollTimer = null;
 let stereoBusy = false;
 let stereoGeneration = 0;
+let stereoInFlight = null;
+let stereoPollCount = 0;
 let stereoCameras = null;
+let stereoScanTimer = null;
+let stereoVersions = { previewVersions: {}, depthVersion: null };
 let stereoManual = { viewId: null, pointsA: [], pointsB: [], enabled: false };
-let stereoPreviewKeys = { a: "", b: "" };
+let stereoPreviewImages = { a: null, b: null };
+let stereoDepthCache = { version: null, rgba: null };
+let stereoLastStatusText = "";
 
 function stereoBoardPayload() {
   return {
@@ -2546,19 +2575,22 @@ function stereoBoardPayload() {
 function renderStereoSelects() {
   const kinect = $("stereoKinectSelect");
   const usb = $("stereoUsbSelect");
-  const kinectAvailable = activeSource === "kinect_v1_sdk" && deviceConnected;
+  const kinectState = kinectSelectState(stereoStatus, stereoCameras?.kinect);
   kinect.innerHTML = "";
   const kinectOption = document.createElement("option");
   kinectOption.value = "kinect_rgb";
-  kinectOption.textContent = kinectAvailable ? "Kinect 360 RGB (подключён)" : "Kinect 360 RGB (не подключён)";
+  kinectOption.textContent = kinectState.label;
   kinect.append(kinectOption);
-  kinect.disabled = !kinectAvailable;
+  kinect.disabled = kinectState.disabled;
+  const previousIndex = Number(usb.value);
   usb.innerHTML = "";
   const cameras = stereoCameras?.cameras || [];
   if (!cameras.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = stereoCameras ? "USB-камеры не найдены" : "Нажмите «Найти USB-камеры»";
+    option.textContent = stereoCameras
+      ? (stereoCameras.pending ? "Идёт поиск USB-камер…" : "USB-камеры не найдены")
+      : "Нажмите «Найти USB-камеры»";
     usb.append(option);
   } else {
     cameras.forEach((camera) => {
@@ -2567,10 +2599,32 @@ function renderStereoSelects() {
       option.textContent = `${camera.label || `USB-камера #${camera.index}`} · ${camera.width || "?"}×${camera.height || "?"}`;
       usb.append(option);
     });
+    if (Number.isInteger(previousIndex) && cameras.some((camera) => camera.index === previousIndex)) {
+      usb.value = String(previousIndex);
+    }
   }
-  const active = Boolean(stereoStatus?.session?.active);
-  $("stereoStart").disabled = stereoBusy || active || !kinectAvailable || !cameras.length;
-  $("stereoStop").disabled = stereoBusy || !active;
+  const sessionCameras = stereoStatus?.session?.cameras;
+  if (sessionCameras && stereoStatus?.session?.active) {
+    const usbSpec = [sessionCameras.a, sessionCameras.b].find((spec) => spec && spec.kind === "usb");
+    if (usbSpec && Number.isInteger(usbSpec.index)) usb.value = String(usbSpec.index);
+  }
+  usb.disabled = Boolean(stereoStatus?.session?.active) || Boolean(stereoScanTimer);
+  const startState = stereoStartState(stereoStatus, {
+    busy: stereoBusy,
+    kinect: kinectState,
+    cameras: stereoCameras,
+  });
+  $("stereoStart").disabled = startState.disabled;
+  $("stereoStart").title = startState.reason || "";
+  $("stereoStartReason").textContent = startState.reason || "";
+  $("stereoStop").disabled = stereoBusy || !stereoStatus?.session?.active;
+  $("stereoStop").title = stereoStatus?.session?.active ? "" : "Стереорежим не запущен.";
+  const scanning = Boolean(stereoCameras?.pending || stereoCameras?.scan?.running);
+  $("stereoCancelScan").hidden = !scanning;
+  $("stereoRefreshCameras").disabled = stereoBusy || Boolean(stereoStatus?.session?.active);
+  $("stereoRefreshCameras").title = stereoStatus?.session?.active
+    ? "Сначала остановите стереорежим: он уже занимает камеры."
+    : "Перебрать индексы 0–5 в фоне (бюджет 3 с), не блокируя интерфейс.";
 }
 
 function stereoCameraLabel(kind) {
@@ -2588,36 +2642,51 @@ function drawStereoImage(canvas, image) {
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
 }
 
-function drawStereoDepth(depthPayload) {
+const stereoDepthBuffer = document.createElement("canvas");
+
+function drawStereoDepth(status) {
   const canvas = $("stereoCanvasDepth");
   const context = canvas.getContext("2d");
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  if (!depthPayload) return;
-  const depth = decodeDepthFrame(depthPayload.depth);
-  if (!depth) return;
-  const rgba = depthToRgba(depth, {
-    minMm: Math.round(Number(stereoStatus?.session?.depthConfig?.minDepthM || 0.5) * 1000),
-    maxMm: Math.round(Number(stereoStatus?.session?.depthConfig?.maxDepthM || 4) * 1000),
-  });
-  if (!rgba) return;
-  const image = new ImageData(rgba.data, rgba.width, rgba.height);
-  const buffer = document.createElement("canvas");
-  buffer.width = rgba.width;
-  buffer.height = rgba.height;
-  buffer.getContext("2d").putImageData(image, 0, 0);
+  const payload = status?.depth;
+  const note = $("stereoDepthNote");
+  const placeholder = depthPlaceholder(status);
+  note.hidden = !placeholder;
+  note.textContent = placeholder || "";
+  if (!payload?.depth) {
+    // Пустой холст без объяснения выглядит как сбой: чистим и подписываем причину.
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  const version = Number(status?.depthVersion ?? 0);
+  if (stereoDepthCache.version !== version || !stereoDepthCache.rgba) {
+    const decoded = decodeDepthFrame(payload.depth);
+    if (!decoded) return;
+    const rgba = depthToRgba(decoded, {
+      minMm: Math.round(Number(stereoStatus?.session?.depthConfig?.minDepthM || 0.5) * 1000),
+      maxMm: Math.round(Number(stereoStatus?.session?.depthConfig?.maxDepthM || 4) * 1000),
+    });
+    if (!rgba) return;
+    stereoDepthCache = { version, rgba };
+  }
+  const rgba = stereoDepthCache.rgba;
+  stereoDepthBuffer.width = rgba.width;
+  stereoDepthBuffer.height = rgba.height;
+  const buffer = stereoDepthBuffer.getContext("2d");
+  buffer.putImageData(new ImageData(rgba.data, rgba.width, rgba.height), 0, 0);
   context.imageSmoothingEnabled = false;
-  context.drawImage(buffer, 0, 0, canvas.width, canvas.height);
+  context.drawImage(stereoDepthBuffer, 0, 0, canvas.width, canvas.height);
 }
 
 function setStereoPreview(role, preview) {
   if (!preview?.data || stereoManual.enabled) return;
-  const key = `${preview.frameId}:${preview.width}x${preview.height}`;
-  if (stereoPreviewKeys[role] === key) return;
-  stereoPreviewKeys[role] = key;
-  const image = new Image();
-  image.onload = () => {
-    drawStereoImage($(role === "a" ? "stereoCanvasA" : "stereoCanvasB"), image);
-  };
+  // Image переиспользуется: новый объект на каждый ответ давал лишние загрузки
+  // и мигание холста.
+  let image = stereoPreviewImages[role];
+  if (!image) {
+    image = new Image();
+    stereoPreviewImages[role] = image;
+    image.onload = () => drawStereoImage($(role === "a" ? "stereoCanvasA" : "stereoCanvasB"), image);
+  }
   image.src = `data:image/jpeg;base64,${preview.data}`;
 }
 
@@ -2636,133 +2705,35 @@ function renderStereoDiagnostics(status) {
   const metrics = status?.metrics;
   const cameraA = cameraMetricLines(metrics, "a");
   const cameraB = cameraMetricLines(metrics, "b");
-  fillDefinitionList($("stereoDiagA"), cameraA.available ? cameraA.lines : [["Состояние", "нет данных"]]);
-  fillDefinitionList($("stereoDiagB"), cameraB.available ? cameraB.lines : [["Состояние", "нет данных"]]);
+  const idle = [["Состояние", "нет данных"]];
+  fillDefinitionList($("stereoDiagA"), cameraA.available ? cameraA.lines : idle);
+  fillDefinitionList($("stereoDiagB"), cameraB.available ? cameraB.lines : idle);
   const lines = [...pairMetricLines(metrics), ...depthMetricLines(status?.depth)];
   if (status?.depthError) lines.unshift(["Ошибка глубины", status.depthError]);
+  lines.push(...timingLines(status?.timings, ["kinect_capture", "usb_read", "status", "compute_stereo_depth"]));
   fillDefinitionList($("stereoDiagPairs"), lines.length ? lines : [["Состояние", "глубина не вычисляется"]]);
   $("stereoLabelA").textContent = stereoCameraLabel("a");
   $("stereoLabelB").textContent = stereoCameraLabel("b");
   $("stereoLabelDepth").textContent = status?.depth ? "Стереоглубина (после калибровки)" : "Глубина недоступна";
 }
 
-function renderStereoCalibration(status) {
-  const calibration = status?.calibration || {};
-  const label = calibrationStateLabel(calibration.state);
-  const stateElement = $("stereoCalibrationState");
-  stateElement.textContent = label.title;
-  stateElement.dataset.tone = label.tone;
-  const reasons = [];
-  (calibration.reasons || []).forEach((reason) => reasons.push(reason));
-  if (status?.calibrationLoadError) reasons.push(`Не удалось прочитать сохранённую калибровку: ${status.calibrationLoadError}`);
-  const list = $("stereoReasons");
-  list.innerHTML = "";
-  reasons.forEach((reason) => {
-    const item = document.createElement("li");
-    item.textContent = reason;
-    list.append(item);
-  });
-  const steps = calibrationSteps(status);
-  const stepsList = $("stereoSteps");
-  stepsList.innerHTML = "";
-  steps.forEach((step) => {
-    const item = document.createElement("li");
-    item.textContent = step;
-    stepsList.append(item);
-  });
-  const quality = calibration.summary?.quality;
-  const qualityLines = [];
-  if (quality?.valid) {
-    qualityLines.push(
-      `Качество: ${quality.views} пар, ошибка камер ${quality.boardRmsPx.a.toFixed(2)}/${quality.boardRmsPx.b.toFixed(2)} px, ` +
-        `стерео ${quality.stereoRmsPx.toFixed(2)} px, эпиполярная медиана ${quality.epipolarMedianPx.toFixed(2)} px, ` +
-        `базис ${(quality.baselineM * 1000).toFixed(0)} мм, шаг глубины на 1 м ${formatDepthMm(quality.depthResolutionAt1mMm)}.`,
+function renderStereoScanProgress() {
+  const { lines, busy } = cameraScanLines(stereoCameras);
+  $("stereoScanProgress").textContent = lines.slice(0, 2).join(" · ");
+  const found = stereoCameras?.cameras?.length || 0;
+  if (!busy && stereoCameras && !stereoCameras.__announced && !stereoCameras.needsScan) {
+    stereoCameras.__announced = true;
+    showToast(
+      found ? `Найдено USB-камер: ${found}.` : "USB-камеры не найдены. Проверьте индекс вручную и другие приложения.",
+      found ? "success" : "warning",
     );
-  }
-  (quality?.warnings || []).forEach((warning) => qualityLines.push(`Внимание: ${warning}`));
-  $("stereoQuality").textContent = qualityLines.join(" ");
-  const active = Boolean(status?.session?.active);
-  const views = status?.views || {};
-  $("stereoCapture").disabled = stereoBusy || !active;
-  $("stereoResetViews").disabled = stereoBusy || !active || !(views.count || 0);
-  $("stereoCalibrate").disabled = stereoBusy || !active || (views.count || 0) < (views.required || 5);
-  $("stereoClearCalibration").disabled = stereoBusy;
-  const manual = $("stereoManualHint");
-  manual.hidden = !views.pendingManual || !manual.textContent;
-}
-
-function renderStereo(status) {
-  stereoStatus = status;
-  const active = Boolean(status?.session?.active);
-  const summary = [];
-  if (!active) {
-    summary.push("Стереорежим не запущен. Выберите Kinect RGB и USB-камеру и нажмите «Запустить стерео».");
-  } else {
-    const errors = Object.entries(status?.session?.errors || {});
-    summary.push(
-      errors.length
-        ? errors.map(([role, error]) => `${role.toUpperCase()}: ${error.message}`).join(" ")
-        : "Обе камеры доставляют кадры.",
-    );
-    if (status.depthEnabled) summary.push("Глубина вычисляется по принятым парам.");
-    else summary.push(status.depthDisabledReason || "Глубина не вычисляется.");
-    if (status.session.tiltReadable) {
-      summary.push(`Наклон Kinect: ${status.session.tiltAngle ?? "—"}°.`);
-    } else if (status.session.kinectRole) {
-      summary.push("Угол Kinect не читается: глубина выключена, пока положение мотора не подтверждено.");
-    }
-  }
-  $("stereoSummary").textContent = summary.join(" ");
-  renderStereoDiagnostics(status);
-  renderStereoCalibration(status);
-  renderStereoSelects();
-  if (status?.previews) {
-    setStereoPreview("a", status.previews.a);
-    setStereoPreview("b", status.previews.b);
-  }
-  if (status?.depth) drawStereoDepth(status);
-}
-
-async function pollStereo(generation = stereoGeneration) {
-  if (viewMode !== "stereo" || generation !== stereoGeneration) return;
-  try {
-    const status = await apiRequest("/api/stereo?depth=1&preview=1", { timeoutMs: 8000 });
-    if (generation !== stereoGeneration) return;
-    renderStereo(status);
-  } catch (error) {
-    if (generation === stereoGeneration) {
-      $("stereoSummary").textContent = error.message;
-    }
-  }
-}
-
-function startStereoPolling() {
-  stopStereoPolling();
-  stereoGeneration += 1;
-  const generation = stereoGeneration;
-  void refreshStereoSessions(generation);
-  stereoPollTimer = setInterval(() => void pollStereo(generation), STEREO_POLL_MS);
-}
-
-function stopStereoPolling() {
-  if (stereoPollTimer) clearInterval(stereoPollTimer);
-  stereoPollTimer = null;
-  stereoGeneration += 1;
-}
-
-async function refreshStereoSessions(generation = stereoGeneration) {
-  try {
-    const status = await apiRequest("/api/stereo?depth=0&preview=1", { timeoutMs: 8000 });
-    if (generation !== stereoGeneration) return;
-    renderStereo(status);
-  } catch (error) {
-    if (generation === stereoGeneration) $("stereoSummary").textContent = error.message;
   }
 }
 
 async function stereoCommand(path, body = {}) {
   if (stereoBusy) return null;
   stereoBusy = true;
+  renderStereoSelects();
   try {
     const response = await apiRequest(path, {
       method: "POST",
@@ -2778,28 +2749,84 @@ async function stereoCommand(path, body = {}) {
 
 $("stereoRefreshCameras").onclick = async () => {
   if (stereoBusy) return;
-  stereoBusy = true;
+  if (stereoStatus?.session?.active) {
+    showToast("Сначала остановите стереорежим: он уже занимает камеры.", "warning");
+    return;
+  }
+  const generation = stereoGeneration;
   try {
-    stereoCameras = await apiRequest("/api/stereo/cameras", { timeoutMs: 30000 });
+    // Поиск идёт в фоне: мост отвечает сразу и отдаёт job-id с прогрессом.
+    const response = await apiRequest("/api/stereo/cameras/scan", {
+      method: "POST",
+      body: { maxIndex: 6 },
+      timeoutMs: 5000,
+    });
+    stereoCameras = { ...(stereoCameras || {}), pending: true, scan: response.scan, needsScan: false };
+    stereoCameras.__announced = false;
     renderStereoSelects();
-    const found = stereoCameras.cameras?.length || 0;
-    showToast(found ? `Найдено USB-камер: ${found}.` : "USB-камеры не найдены. Проверьте подключение и другие приложения.", found ? "success" : "warning");
-    (stereoCameras.errors || []).forEach((error) => showToast(error, "warning"));
+    renderStereoScanProgress();
+    scheduleStereoScanPoll(generation);
   } catch (error) {
     showToast(error.message, "warning");
-  } finally {
-    stereoBusy = false;
+  }
+};
+
+$("stereoCancelScan").onclick = async () => {
+  try {
+    await apiRequest("/api/stereo/cameras/scan/cancel", { method: "POST", body: {}, timeoutMs: 5000 });
+    showToast("Поиск USB-камер отменяется.", "info");
+  } catch (error) {
+    showToast(error.message, "warning");
+  }
+};
+
+$("stereoProbeIndex").onclick = async () => {
+  const index = Number($("stereoManualIndex").value);
+  if (!Number.isInteger(index) || index < 0 || index > 31) {
+    showToast("Индекс USB-камеры должен быть целым 0–31.", "warning");
+    return;
+  }
+  try {
+    const response = await apiRequest("/api/stereo/cameras/probe", {
+      method: "POST",
+      body: { index },
+      timeoutMs: 8000,
+    });
+    if (response.ok) {
+      const camera = {
+        index,
+        label: response.label || `USB-камера #${index}`,
+        width: response.width,
+        height: response.height,
+        backend: response.backend,
+      };
+      const existing = stereoCameras?.cameras || [];
+      stereoCameras = {
+        ...(stereoCameras || {}),
+        available: true,
+        cameras: [...existing.filter((item) => item.index !== index), camera]
+          .sort((left, right) => left.index - right.index),
+        needsScan: false,
+        __announced: true,
+      };
+      renderStereoSelects();
+      showToast(`Индекс ${index}: камера открылась (${camera.width}×${camera.height}).`, "success");
+    } else {
+      showToast(`Индекс ${index}: ${response.message || "камера не открылась"}. ${response.hint || ""}`.trim(), "warning");
+    }
+  } catch (error) {
+    showToast(error.message, "warning");
   }
 };
 
 $("stereoStart").onclick = async () => {
   const index = Number($("stereoUsbSelect").value);
   if (!Number.isInteger(index)) {
-    showToast("Выберите USB-камеру.", "warning");
+    showToast("Выберите USB-камеру: список пуст, нажмите «Найти USB-камеры».", "warning");
     return;
   }
   try {
-    await stereoCommand("/api/stereo/start", {
+    const status = await stereoCommand("/api/stereo/start", {
       cameras: [
         { kind: "kinect_rgb", source: "kinect_v1_sdk" },
         { kind: "usb", index },
@@ -2807,7 +2834,13 @@ $("stereoStart").onclick = async () => {
       minDepthM: 0.5,
       maxDepthM: 4.0,
     });
-    showToast("Стереорежим запущен.", "success");
+    const errors = status?.session?.errors || {};
+    if (Object.keys(errors).length) {
+      // Частичный успех: сессия живёт, но ошибка камеры не прячется.
+      showToast(Object.values(errors).map((error) => error.message).join(" "), "warning");
+    } else {
+      showToast("Стереорежим запущен.", "success");
+    }
   } catch (error) {
     showToast(error.message, "warning");
   }
@@ -2955,6 +2988,194 @@ $("stereoClearCalibration").onclick = async () => {
   }
 };
 
+/* --- Опрос и отрисовка стереопанели ---------------------------------------- */
+// Источник истины — ответ /api/stereo: активна ли сессия, какие камеры в ней,
+// какие ошибки. Интерфейс ничего не додумывает: если мост молчит, панель
+// показывает «нет ответа моста», но не рисует кадры из кэша как свежие.
+
+function renderStereoSummary(status) {
+  const session = status?.session;
+  const element = $("stereoSummary");
+  if (!session?.active) {
+    element.textContent = stereoCameras?.pending
+      ? "Идёт поиск USB-камер…"
+      : "Стереорежим не запущен.";
+    return;
+  }
+  const errors = Object.values(session.errors || {}).map((error) => error.message);
+  const uptime = formatMs(session.uptimeMs);
+  const states = session.streamStates || {};
+  const stateText = ["a", "b"]
+    .map((role) => `${role.toUpperCase()}: ${cameraStateLabel(states[role])}`)
+    .join(", ");
+  element.textContent = errors.length
+    ? `Сессия активна ${uptime}. ${stateText}. Ошибка: ${errors.join(" ")}`
+    : `Сессия активна ${uptime}. ${stateText}.`;
+}
+
+function renderStereoCalibration(status) {
+  const state = calibrationStateLabel(status?.calibration?.state);
+  const badge = $("stereoCalibrationState");
+  badge.textContent = state.title;
+  badge.dataset.tone = state.tone;
+  const steps = calibrationSteps(status);
+  const list = $("stereoSteps");
+  list.innerHTML = "";
+  steps.forEach((text) => {
+    const item = document.createElement("li");
+    item.textContent = text;
+    list.append(item);
+  });
+  const reasons = $("stereoReasons");
+  reasons.innerHTML = "";
+  (status?.depthEnabled ? [] : status?.calibration?.reasons || []).forEach((reason) => {
+    const item = document.createElement("li");
+    item.textContent = reason;
+    reasons.append(item);
+  });
+  const quality = $("stereoQuality");
+  const detail = status?.quality || status?.calibration?.quality;
+  if (!detail) {
+    quality.textContent = status?.depthEnabled
+      ? "Глубина включена; метки времени программные."
+      : "Качество калибровки не подтверждено.";
+  } else {
+    const rms = typeof detail.rmsPx === "number" ? `RMS ${detail.rmsPx.toFixed(2)} px` : "RMS неизвестен";
+    quality.textContent = `${rms}; пар: ${detail.pairs ?? "—"}. ${
+      status?.depthEnabled ? "Глубина включена." : "Глубина не включена: проверка качества не пройдена."
+    }`;
+  }
+}
+
+function renderStereo(status) {
+  stereoStatus = status || null;
+  if (!stereoStatus?.session?.active) {
+    // Номера кадров начинаются заново в каждой сессии: старые версии нельзя
+    // передавать в новую, иначе первый кадр придёт «без изменений» и без base64.
+    stereoVersions = { previewVersions: {}, depthVersion: null };
+  }
+  const plan = previewPlan(stereoVersions, stereoStatus);
+  stereoVersions = plan.next;
+  if (plan.redraw.a) setStereoPreview("a", stereoStatus?.previews?.a);
+  if (plan.redraw.b) setStereoPreview("b", stereoStatus?.previews?.b);
+  if (plan.redraw.depth || !stereoStatus?.depth) drawStereoDepth(stereoStatus);
+  renderStereoSelects();
+  renderStereoDiagnostics(stereoStatus);
+  renderStereoScanProgress();
+  renderStereoCalibration(stereoStatus);
+  renderStereoSummary(stereoStatus);
+  const active = Boolean(stereoStatus?.session?.active);
+  const views = stereoStatus?.views || {};
+  $("stereoCapture").disabled = !active || stereoBusy;
+  $("stereoResetViews").disabled = !active || stereoBusy || !views.count;
+  $("stereoCalibrate").disabled = !active || stereoBusy || (views.count || 0) < (views.required || 5);
+}
+
+function stereoStatusUrl(withTimings) {
+  return stereoPollQuery({
+    previewVersions: stereoVersions.previewVersions,
+    depthVersion: stereoVersions.depthVersion,
+    timings: withTimings,
+  });
+}
+
+async function refreshStereoSessions(generation = stereoGeneration) {
+  try {
+    const status = await apiRequest(stereoStatusUrl(false));
+    if (generation !== stereoGeneration) return null;
+    renderStereo(status);
+    return status;
+  } catch (error) {
+    if (generation === stereoGeneration) {
+      // Мост не ответил: состояние сессии неизвестно, поэтому панель говорит об
+      // этом прямо и продолжает опрос — после восстановления всё придёт из /api/stereo.
+      $("stereoSummary").textContent = `Нет ответа моста: ${error.message}. Повторяю опрос…`;
+    }
+    return null;
+  }
+}
+
+async function pollStereo(generation) {
+  if (stereoInFlight || document.hidden) return;
+  const controller = new AbortController();
+  stereoInFlight = controller;
+  stereoPollCount += 1;
+  try {
+    const withTimings = stereoPollCount % STEREO_TIMINGS_EVERY === 1;
+    const status = await apiRequest(stereoStatusUrl(withTimings), {
+      timeoutMs: 4000,
+      signal: controller.signal,
+    });
+    if (generation !== stereoGeneration) return;
+    renderStereo(status);
+  } catch (error) {
+    if (generation === stereoGeneration && !controller.signal.aborted) {
+      stereoLastStatusText = `Нет ответа моста: ${error.message}`;
+      $("stereoSummary").textContent = `${stereoLastStatusText}. Повторяю опрос…`;
+    }
+  } finally {
+    if (stereoInFlight === controller) stereoInFlight = null;
+  }
+}
+
+function startStereoPolling() {
+  stopStereoPolling();
+  const generation = stereoGeneration;
+  void refreshStereoSessions(generation);
+  void loadStereoCameras({ silent: true });
+  stereoPollTimer = setInterval(() => void pollStereo(generation), STEREO_POLL_MS);
+}
+
+function stopStereoPolling() {
+  if (stereoPollTimer) clearInterval(stereoPollTimer);
+  stereoPollTimer = null;
+  if (stereoScanTimer) clearTimeout(stereoScanTimer);
+  stereoScanTimer = null;
+  if (stereoInFlight) {
+    stereoInFlight.abort();
+    stereoInFlight = null;
+  }
+  stereoGeneration += 1;
+}
+
+async function loadStereoCameras({ silent = false } = {}) {
+  try {
+    const catalog = await apiRequest("/api/stereo/cameras");
+    stereoCameras = { ...catalog, __announced: Boolean(silent) || catalog.pending };
+    renderStereoSelects();
+    renderStereoScanProgress();
+    return catalog;
+  } catch (error) {
+    if (error.code === "session_active") {
+      // Активная сессия занимает камеры: каталог в этот момент недоступен, и это
+      // не ошибка для пользователя — список остаётся прежним.
+      return null;
+    }
+    if (!silent) showToast(error.message, "warning");
+    return null;
+  }
+}
+
+function scheduleStereoScanPoll(generation = stereoGeneration) {
+  if (stereoScanTimer) clearTimeout(stereoScanTimer);
+  stereoScanTimer = setTimeout(async () => {
+    stereoScanTimer = null;
+    if (generation !== stereoGeneration) return;
+    const catalog = await loadStereoCameras({ silent: true });
+    if (!catalog) return;
+    if (catalog.pending) {
+      // Поиск идёт в фоне: каждый опрос — мгновенный ответ из состояния job-а.
+      stereoCameras.__announced = false;
+      renderStereoScanProgress();
+      scheduleStereoScanPoll(generation);
+      return;
+    }
+    stereoCameras.__announced = false;
+    renderStereoScanProgress();
+    renderStereoSelects();
+  }, 300);
+}
+
 function initStereoUi() {
   const list = $("stereoWarnings");
   stereoWarningLines().forEach((line) => {
@@ -2963,6 +3184,8 @@ function initStereoUi() {
     list.append(item);
   });
   renderStereoSelects();
+  // Каталог читается из кэша процесса: это мгновенный ответ, устройства не открываются.
+  void loadStereoCameras({ silent: true });
 }
 
 function initEnvironmentUi() {

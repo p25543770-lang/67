@@ -14,6 +14,7 @@ import importlib.machinery
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -78,15 +79,49 @@ class FakeStream:
         return self.frames.pop(0) if self.frames else None
 
 
+class FreshColorStream(FakeStream):
+    """Поток, который всегда отдаёт свежий кадр, но очередь после чтения пуста.
+
+    Захват в адаптере читает один кадр и сразу опустошает очередь
+    (``drain_color``), поэтому «бесконечный» список кадров здесь не подходит:
+    на пустом запросе поток подкладывает ровно один кадр и возвращает ``None``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending = 0
+
+    def OpenNextFrame(self, timeout_ms):
+        self.timeouts.append(timeout_ms)
+        if self.pending:
+            self.pending -= 1
+            return FakeFrame(color_pixels())
+        self.pending = 1
+        return None
+
+
 class FakeSensor:
-    def __init__(self, depth_frames=None, color_frames=None, *, fail_start=False):
+    def __init__(self, depth_frames=None, color_frames=None, *, fail_start=False,
+                 angle=5, angle_delay_s=0.0, endless_color=False):
         self.DepthStream = FakeStream(depth_frames)
-        self.ColorStream = FakeStream(color_frames)
+        self.ColorStream = FreshColorStream() if endless_color else FakeStream(color_frames)
         self.started = False
         self.stopped = False
         self.disposed = False
         self.IsRunning = False
         self.fail_start = fail_start
+        self.MinElevationAngle = -27
+        self.MaxElevationAngle = 27
+        self._angle = angle
+        self.angle_delay_s = angle_delay_s
+        self.angle_reads = 0
+
+    @property
+    def ElevationAngle(self):
+        self.angle_reads += 1
+        if self.angle_delay_s:
+            time.sleep(self.angle_delay_s)
+        return self._angle
 
     def Start(self):
         if self.fail_start:
@@ -382,6 +417,56 @@ class SensorLifecycleTests(unittest.TestCase):
             env.adapter.close()
         # Второй кадр не должен читаться чаще, чем 1/10 с.
         self.assertTrue(any(seconds >= 0.09 for seconds in slept), slept)
+
+
+@REQUIRES_NUMPY
+class TiltIsolationTests(unittest.TestCase):
+    """Чтение угла .NET не должно отнимать кадры у RGB-потока."""
+
+    def test_slow_angle_read_does_not_block_color_capture(self):
+        sensor = FakeSensor(endless_color=True, angle=7, angle_delay_s=0.3)
+        with AdapterEnvironment(sensors=[sensor]) as env:
+            env.adapter.tilt_poll_interval_s = 0.05
+            first = env.adapter.capture_color_only()
+            self.assertIsNotNone(first)
+            started = time.monotonic()
+            frames = [env.adapter.capture_color_only() for _ in range(3)]
+            elapsed = time.monotonic() - started
+        self.assertTrue(all(frame is not None for frame in frames))
+        # Три кадра при «залипшем» на 300 мс чтении угла: захват идёт своим темпом.
+        self.assertLess(elapsed, 0.5)
+
+    def test_angle_is_cached_and_polled_at_most_once_per_interval(self):
+        sensor = FakeSensor(endless_color=True, angle=9)
+        with AdapterEnvironment(sensors=[sensor]) as env:
+            env.adapter.tilt_poll_interval_s = 0.15
+            env.adapter.capture_color_only()
+            for _ in range(5):
+                time.sleep(0.1)
+                env.adapter.capture_color_only()
+            cached = env.adapter.tilt_angle_cached()
+            fresh_reads_before = sensor.angle_reads
+            angle = env.adapter.tilt_angle_fresh()
+            fresh_reads_after = sensor.angle_reads
+            env.adapter.close()
+        self.assertEqual(cached["angle"], 9)
+        self.assertIsNotNone(cached["ageMs"])
+        self.assertLess(cached["ageMs"], 2000)
+        self.assertEqual(cached["pollIntervalMs"], 150.0)
+        # За ~0.5 с при интервале 150 мс фоновых чтений не больше четырёх.
+        self.assertLessEqual(fresh_reads_before, 5, f"фоновых чтений угла: {fresh_reads_before}")
+        self.assertEqual(angle, 9)
+        self.assertEqual(fresh_reads_after - fresh_reads_before, 1, "fresh читает .NET напрямую")
+
+    def test_cached_angle_is_reported_before_the_first_poll(self):
+        sensor = FakeSensor(color_frames=[FakeFrame(color_pixels())], angle=3)
+        with AdapterEnvironment(sensors=[sensor]) as env:
+            env.adapter.tilt_poll_interval_s = 5.0
+            env.adapter.capture_color_only()
+            cached = env.adapter.tilt_angle_cached()
+        self.assertIsNone(cached["angle"])
+        self.assertIsNone(cached["ageMs"])
+        self.assertEqual(cached["error"], "")
 
 
 class MissingComponentsTests(unittest.TestCase):

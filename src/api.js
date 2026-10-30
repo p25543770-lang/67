@@ -9,9 +9,16 @@ export function requestTimeout(path) {
 }
 
 export async function apiRequest(path, options = {}) {
-  const { timeoutMs = requestTimeout(path), ...fetchOptions } = options;
+  // signal позволяет вызывающему отменить запрос (например, при уходе из
+  // стереорежима или скрытии окна), не дожидаясь таймаута.
+  const { timeoutMs = requestTimeout(path), signal: externalSignal, ...fetchOptions } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const forwardAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
   try {
     const response = await fetch(path, {
       cache: "no-store",
@@ -57,5 +64,8 @@ export async function apiRequest(path, options = {}) {
     throw new Error("Python-мост Depth Studio недоступен. Деморежим работает без него; чтобы подключить датчик, завершите настройку среды Depth Studio.");
   } finally {
     clearTimeout(timer);
+    if (externalSignal && typeof externalSignal.removeEventListener === "function") {
+      externalSignal.removeEventListener("abort", forwardAbort);
+    }
   }
 }

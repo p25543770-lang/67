@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -216,6 +217,89 @@ class StereoServiceTests(unittest.TestCase):
         self.assertIsNone(status["depth"])
         self.assertIn("Калибровка", status["depthDisabledReason"])
 
+    def _freeze_streams(self, service, usb):
+        """Остановить обе камеры, чтобы номера кадров перестали расти."""
+        deadline = time.monotonic() + 3.0
+        self.adapter.fail_after = self.adapter.count + 1
+        usb["camera"].fail_after = usb["camera"].count + 1
+        while time.monotonic() < deadline:
+            metrics = service.status(include_preview=False)["metrics"] or {}
+            states = {role: (metrics.get(role) or {}).get("state") for role in ("a", "b")}
+            if all(state not in (None, "streaming", "starting") for state in states.values()):
+                return
+            time.sleep(0.05)
+
+    def test_unchanged_preview_is_not_sent_again(self):
+        usb = {}
+
+        def factory(index, **_kwargs):
+            usb["camera"] = FakeUsb(index, self.right_frames, pose=self.pose)
+            return usb["camera"]
+
+        service = self.make_service(usb_factory=factory)
+        self.start(service)
+        time.sleep(0.3)
+        self._freeze_streams(service, usb)
+
+        first = service.status(include_depth=True, include_preview=True)
+        previews = first["previews"]
+        self.assertTrue((previews["a"] or {}).get("data"), "первый ответ должен содержать JPEG")
+        versions = dict(first["previewVersions"])
+
+        same = service.status(include_depth=True, include_preview=True, known_preview=versions)
+        self.assertTrue(same["previews"]["a"]["unchanged"])
+        self.assertIsNone(same["previews"]["a"]["data"])
+        self.assertEqual(same["previews"]["a"]["version"], versions["a"])
+        self.assertEqual(same["previews"]["b"]["version"], versions["b"])
+        # Версия не менялась — повторной кодировки и base64 в ответе нет.
+        self.assertNotIn("contentRect", same["previews"]["a"])
+
+        stale = service.status(include_depth=True, include_preview=True,
+                               known_preview={"a": 0, "b": 0})
+        self.assertTrue(stale["previews"]["a"]["data"])
+
+    def test_preview_can_be_switched_off(self):
+        service = self.make_service()
+        self.start(service)
+        time.sleep(0.2)
+        status = service.status(include_depth=False, include_preview=False)
+        self.assertIsNone(status["previews"])
+        self.assertFalse(status["depthEnabled"])
+        self.assertNotIn("previews", json.dumps(status["session"]))
+
+    def test_timings_are_opt_in_and_report_capture_costs(self):
+        service = self.make_service()
+        self.start(service)
+        time.sleep(0.3)
+        without = service.status(include_depth=False, include_preview=False, include_timings=False)
+        self.assertNotIn("timings", without)
+        with_timings = service.status(include_depth=False, include_preview=False)
+        timings = with_timings["timings"]
+        self.assertIn("kinect_capture", timings)
+        self.assertIn("usb_read", timings)
+        self.assertIn("status", timings)
+        for entry in timings.values():
+            self.assertIn("p50Ms", entry)
+            self.assertIn("p95Ms", entry)
+            self.assertIn("count", entry)
+
+    def test_honesty_flags_stay_false(self):
+        service = self.make_service()
+        self.start(service)
+        status = service.status(include_depth=False)
+        self.assertFalse(status["verifiedOnHardware"])
+        self.assertFalse(status["hardwareSync"])
+        self.assertFalse(status["exposureTimestamps"])
+        self.assertFalse(status["kinectDepthMerged"])
+        self.assertTrue(status["notForNavigation"])
+        self.assertTrue(status["notAObstacleDetector"])
+        metrics = status["metrics"]
+        self.assertFalse(metrics["pairs"]["hardwareSync"])
+        self.assertFalse(metrics["pairs"]["exposureTimestamps"])
+        self.assertFalse(metrics["clock"]["exposureTimestamps"])
+        self.assertEqual(metrics["a"]["timestampSource"], "software_receipt_time")
+        self.assertFalse(metrics["a"]["exposureTimestamp"])
+
     def test_camera_failure_disables_depth_and_is_reported(self):
         usb = {}
 
@@ -243,11 +327,33 @@ class StereoServiceTests(unittest.TestCase):
         self.assertIsNone(status["depth"])
         self.assertIn("camera_unavailable", status["calibration"]["state"])
 
-    def test_missing_frames_are_counted_not_hidden(self):
+    def test_camera_without_frames_is_reported_while_the_other_keeps_working(self):
+        """Частичный успех: сессия живая, ошибка конкретной камеры видна."""
         service = self.make_service(kinect=FakeAdapter(self.left_frames, fail_after=0))
+        status = self.start(service)
+        self.assertTrue(status["session"]["active"])
+        self.assertIn("a", status["session"]["errors"])
+        self.assertEqual(status["session"]["errors"]["a"]["code"], "kinect_color_failed")
+        self.assertNotIn("b", status["session"]["errors"])
+        deadline = time.monotonic() + 2.0
+        frames = 0
+        while time.monotonic() < deadline:
+            metrics = service.status(include_depth=False)["metrics"]
+            frames = (metrics or {}).get("b", {}).get("frames") or 0
+            if frames > 3:
+                break
+            time.sleep(0.05)
+        self.assertGreater(frames, 3, "вторая камера должна продолжать отдавать кадры")
+        self.assertFalse(service.status()["depthEnabled"])
+
+    def test_no_frames_from_both_cameras_is_a_concrete_error(self):
+        usb_factory = lambda index, **_kwargs: FakeUsb(index, self.right_frames, fail_after=0)
+        service = self.make_service(kinect=FakeAdapter(self.left_frames, fail_after=0),
+                                    usb_factory=usb_factory)
         with self.assertRaises(StereoError) as context:
             self.start(service)
-        self.assertIn(context.exception.code, {"kinect_color_failed", "no_frame"})
+        self.assertIn(context.exception.code,
+                      {"kinect_color_failed", "camera_read_failed", "no_frame", "camera_unavailable"})
         self.assertIsNone(service._session)
 
     def test_partial_calibration_is_refused(self):
