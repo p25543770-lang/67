@@ -20,6 +20,12 @@ CLOCK_JUMP_THRESHOLD_S = 0.050
 CLOCK_SETTLE_S = 1.0
 
 
+def _ms(value: float | None) -> float | None:
+    """Миллисекунды с одним знаком после запятой — короче JSON без потери смысла."""
+
+    return None if value is None else round(float(value), 1)
+
+
 def _percentile(values: list[float], percent: float) -> float | None:
     if not values:
         return None
@@ -42,12 +48,16 @@ class CameraTiming:
     last_epoch: float | None = None
     last_sequence: int | None = None
     intervals: deque[float] = field(default_factory=lambda: deque(maxlen=MAX_INTERVALS))
+    # Кадры, выброшенные из очереди SDK, чтобы отдать самый свежий. Это
+    # отдельный счётчик: он не маскируется и не складывается с interval_gaps.
+    queue_dropped: int = 0
+    queue_drop_events: int = 0
     brightness: float | None = None
     auto_exposure: bool | None = None
     exposure_raw: float | None = None
 
     def observe(self, monotonic: float, epoch: float, *, sequence: int | None = None,
-                brightness: float | None = None) -> dict[str, Any]:
+                brightness: float | None = None, queue_dropped: int = 0) -> dict[str, Any]:
         if not math.isfinite(float(monotonic)) or not math.isfinite(float(epoch)):
             raise ValueError("Некорректная временная метка кадра.")
         interval = None
@@ -74,6 +84,9 @@ class CameraTiming:
                     # отрицательный пропуск.
                     self.sequence_gaps += 0
             self.last_sequence = sequence
+        if queue_dropped:
+            self.queue_dropped += int(queue_dropped)
+            self.queue_drop_events += 1
         self.frames += 1
         self.last_monotonic = float(monotonic)
         self.last_epoch = float(epoch)
@@ -95,15 +108,25 @@ class CameraTiming:
         return {
             "name": self.name,
             "frames": self.frames,
-            "fps": None if fps is None else float(fps),
+            "fps": None if fps is None else round(float(fps), 1),
             "nominalFps": float(self.nominal_fps),
-            "intervalMedianMs": None if median is None else float(median) * 1000.0,
-            "intervalP95Ms": None if p95 is None else float(p95) * 1000.0,
-            "intervalMaxMs": None if maximum is None else float(maximum) * 1000.0,
-            "lastFrameAgeMs": age,
+            "intervalMedianMs": _ms(None if median is None else median * 1000.0),
+            "intervalP95Ms": _ms(None if p95 is None else p95 * 1000.0),
+            "intervalMaxMs": _ms(None if maximum is None else maximum * 1000.0),
+            "lastFrameAgeMs": _ms(age),
             "intervalGaps": int(self.interval_gaps),
             "sequenceGaps": int(self.sequence_gaps),
             "sequenceAvailable": bool(self.sequence_available),
+            # Разбивка пропусков: очередь SDK отдельно от пропущенных интервалов.
+            "queueDropped": int(self.queue_dropped),
+            "queueDropEvents": int(self.queue_drop_events),
+            "droppedBreakdown": {
+                # Расшифровка одна на весь ответ (limits.droppedBreakdownNote), чтобы
+                # не повторять её для каждой камеры на каждом опросе.
+                "sdkQueueDropped": int(self.queue_dropped),
+                "intervalGaps": int(self.interval_gaps),
+                "sequenceGaps": int(self.sequence_gaps),
+            },
             "brightness": self.brightness,
             "autoExposure": self.auto_exposure,
             "exposureRaw": self.exposure_raw,
@@ -203,10 +226,10 @@ class ClockGuard:
             "stable": self.stable(now),
             "jumps": int(self.jumps),
             "lastJumpMs": None if self.last_jump_monotonic is None else float(self.last_jump_monotonic) * 1000.0,
-            "offsetChangeMs": float(self.offset_change) * 1000.0,
+            "offsetChangeMs": _ms(float(self.offset_change) * 1000.0),
             "method": "epoch_for_pairing_monotonic_for_intervals",
             "exposureTimestamps": False,
-            "note": "Метки — время получения кадра программным путём, не физическая экспозиция.",
+            "note": "Время получения кадра, не экспозиция.",
         }
 
 

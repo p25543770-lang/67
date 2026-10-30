@@ -6,6 +6,7 @@ Open3D and sensor SDKs are loaded lazily so health works without them.
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 # Set the OpenMP/BLAS defaults before NumPy/Open3D are imported. An explicit
@@ -52,10 +54,39 @@ operation_lock = threading.RLock()
 capture_lock = threading.RLock()
 state_lock = threading.RLock()
 probe_results = {}
+# Прогресс долгих команд с датчиком: /api/devices отдаёт его, пока операция идёт.
+device_progress = {}
 connected_source = None
 scan_runner = None
 scan_start_pending = None
 stereo_service = None
+# Тело меньше этого порога сжимать бессмысленно: выигрыш меньше заголовков.
+GZIP_MIN_BYTES = 2048
+# POST-команды, которым не нужен operation_lock (не трогают датчик глубины).
+STEREO_UNLOCKED_POST_PATHS = frozenset({
+    "/api/stereo/cameras/scan",
+    "/api/stereo/cameras/scan/cancel",
+    "/api/stereo/cameras/probe",
+})
+
+
+def _int_param(source, key, default, minimum, maximum):
+    """Целое число из query-строки или JSON; вне диапазона — ошибка запроса."""
+    raw = source.get(key, default)
+    if isinstance(raw, (list, tuple)):
+        # parse_qs отдаёт списки, JSON-тело — скалярные значения.
+        raw = raw[0] if raw else default
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"Параметр {key} должен быть целым числом.")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Параметр {key} должен быть целым числом.") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"Параметр {key} должен быть в диапазоне {minimum}–{maximum}.")
+    return value
 
 
 def _optional_modules():
@@ -380,8 +411,34 @@ def _ensure_no_stereo(operation):
 def _devices_response():
     with state_lock:
         probes = dict(probe_results)
+        progress = dict(device_progress) if device_progress else None
     return {"devices": catalog(probes), "demoAvailable": True,
-            "preferredSource": preferred_source(probes)}
+            "preferredSource": preferred_source(probes),
+            "progress": progress,
+            "stereoSession": _stereo_active()}
+
+
+def _set_progress(operation, step, total=None, detail=""):
+    """Отметить шаг долгой команды, чтобы интерфейс видел движение, а не тишину."""
+    with state_lock:
+        device_progress.clear()
+        device_progress.update({
+            "operation": operation,
+            "step": step,
+            "index": int(total or 0),
+            "detail": str(detail or ""),
+            "startedAt": device_progress.get("startedAt") or _iso_now(),
+            "updatedAt": _iso_now(),
+        })
+
+
+def _clear_progress():
+    with state_lock:
+        device_progress.clear()
+
+
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _probe_devices():
@@ -392,48 +449,56 @@ def _probe_devices():
     _ensure_no_stereo("Обнаружение устройств")
     with capture_lock:
         _ensure_no_capture()
-        for sensor_id, adapter in list(ADAPTERS.items()):
-            if not adapter.implemented:
-                continue
-            family = device_family(sensor_id)
-            with state_lock:
-                current = connected_source
-            if current and current != sensor_id and device_family(current) == family:
-                with state_lock:
-                    probe_results[sensor_id] = {"state": "not_checked", "connected": False,
-                                                "error": "Датчик уже открыт другим адаптером. Отключите его перед выбором этого источника."}
-                continue
-            if family in found_families:
-                with state_lock:
-                    probe_results[sensor_id] = {"state": "not_checked", "connected": False,
-                                                "error": "Датчик обнаружен другим адаптером. Для проверки этого варианта выберите его и подключите."}
-                continue
-            if not adapter.dependencies_available():
-                error = adapter.dependency_error()
-                print(f"[Depth Studio] Обнаружение: источник={sensor_id}, компоненты недоступны: {error}", flush=True)
-                with state_lock:
-                    probe_results[sensor_id] = {"state": "driver_missing", "connected": False,
-                                                "error": error}
-                continue
-            was_connected = current == sensor_id
-            try:
-                frame = adapter.capture()
-                _validate_frame(frame)
-                detected.append(sensor_id)
-                found_families[family] = sensor_id
-                with state_lock:
-                    probe_results[sensor_id] = {"state": "connected" if was_connected else "detected",
-                                                "connected": was_connected, "error": "", "hint": "", "code": ""}
-            except Exception as exc:  # noqa: BLE001 - точная ошибка важна для диагностики
-                _record_sensor_error(sensor_id, "Обнаружение", exc)
-                _close_adapter(adapter)
-            else:
-                if not was_connected:
-                    _close_adapter(adapter)
+        sources = [sensor_id for sensor_id, adapter in ADAPTERS.items() if adapter.implemented]
+        try:
+            for position, sensor_id in enumerate(sources, start=1):
+                adapter = ADAPTERS[sensor_id]
+                _set_progress("probe", sensor_id, position, f"Проверка {position} из {len(sources)}")
+                _probe_one(sensor_id, adapter, detected, found_families)
+        finally:
+            _clear_progress()
     response = _devices_response()
     response["detected"] = detected
     response["connected"] = [d["id"] for d in response["devices"] if d.get("connected")]
     return response
+
+
+def _probe_one(sensor_id, adapter, detected, found_families):
+    """Проверить один источник. Выделено, чтобы GET /api/devices видел прогресс."""
+    family = device_family(sensor_id)
+    with state_lock:
+        current = connected_source
+    if current and current != sensor_id and device_family(current) == family:
+        with state_lock:
+            probe_results[sensor_id] = {"state": "not_checked", "connected": False,
+                                        "error": "Датчик уже открыт другим адаптером. Отключите его перед выбором этого источника."}
+        return
+    if family in found_families:
+        with state_lock:
+            probe_results[sensor_id] = {"state": "not_checked", "connected": False,
+                                        "error": "Датчик обнаружен другим адаптером. Для проверки этого варианта выберите его и подключите."}
+        return
+    if not adapter.dependencies_available():
+        error = adapter.dependency_error()
+        print(f"[Depth Studio] Обнаружение: источник={sensor_id}, компоненты недоступны: {error}", flush=True)
+        with state_lock:
+            probe_results[sensor_id] = {"state": "driver_missing", "connected": False, "error": error}
+        return
+    was_connected = current == sensor_id
+    try:
+        frame = adapter.capture()
+        _validate_frame(frame)
+        detected.append(sensor_id)
+        found_families.setdefault(family, sensor_id)
+        with state_lock:
+            probe_results[sensor_id] = {"state": "connected" if was_connected else "detected",
+                                        "connected": was_connected, "error": "", "hint": "", "code": ""}
+    except Exception as exc:  # noqa: BLE001 - точная ошибка важна для диагностики
+        _record_sensor_error(sensor_id, "Обнаружение", exc)
+        _close_adapter(adapter)
+    else:
+        if not was_connected:
+            _close_adapter(adapter)
 
 
 class DeviceOpenTimeout(RuntimeError):
@@ -473,6 +538,7 @@ def _connect_device(source_id, deadline=None):
             with state_lock:
                 connected_source = None
                 probe_results[previous] = {"state": "detected", "connected": False, "error": ""}
+        _set_progress("connect", source_id, 1, "Открытие датчика и первый кадр")
         try:
             if not adapter.dependencies_available():
                 raise RuntimeError(adapter.dependency_error())
@@ -486,6 +552,8 @@ def _connect_device(source_id, deadline=None):
                                  "driver_missing" if not adapter.dependencies_available() else "no_device")
             _close_adapter(adapter)
             raise
+        finally:
+            _clear_progress()
         with state_lock:
             connected_source = source_id
             probe_results[source_id] = {"state": "connected", "connected": True, "error": "", "hint": "", "code": ""}
@@ -697,11 +765,34 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(url.query)
                 include_depth = query.get("depth", [""])[0] != "0"
                 include_preview = query.get("preview", [""])[0] == "1"
-                self.respond(200, _stereo().status(include_depth=include_depth,
-                                                   include_preview=include_preview))
+                include_timings = query.get("timings", [""])[0] != "0"
+                known_preview = {}
+                for role, key in (("a", "previewA"), ("b", "previewB")):
+                    raw = query.get(key, [None])[0]
+                    try:
+                        if raw is not None and raw != "":
+                            known_preview[role] = int(raw)
+                    except (TypeError, ValueError):
+                        known_preview.pop(role, None)
+                known_depth = None
+                raw_depth_version = query.get("depthVersion", [None])[0]
+                try:
+                    if raw_depth_version not in (None, ""):
+                        known_depth = int(raw_depth_version)
+                except (TypeError, ValueError):
+                    known_depth = None
+                payload = _stereo().status(include_depth=include_depth,
+                                           include_preview=include_preview,
+                                           include_timings=include_timings,
+                                           known_preview=known_preview or None,
+                                           known_depth=known_depth)
+                self.respond(200, payload, compress=True)
             elif url.path == "/api/stereo/cameras":
-                with operation_lock:
-                    self.respond(200, _stereo().camera_catalog())
+                # Поиск камер больше не выполняется внутри GET: ответ мгновенный
+                # (кэш или «ещё не искали»), а перебор идёт отдельным job-ом.
+                query = parse_qs(url.query)
+                max_index = _int_param(query, "maxIndex", 6, 1, 32)
+                self.respond(200, _stereo().camera_catalog(max_index=max_index))
             elif url.path == "/api/scan/passes":
                 self.respond(200, {"passes": _runner().list_passes(), "verifiedOnHardware": False})
             elif url.path == "/api/export":
@@ -733,6 +824,10 @@ class Handler(BaseHTTPRequestHandler):
             tilt_deadline = time.monotonic() + DEVICE_TILT_DEADLINE if url.path == "/api/devices/tilt" else None
             if url.path == "/api/scan/start":
                 response = _start_scan_with_pending(payload)
+            elif url.path in STEREO_UNLOCKED_POST_PATHS:
+                # Поиск/проверка USB-камер не трогают датчик глубины, поэтому не
+                # занимают operation_lock: иначе мост «замирает» на время поиска.
+                response = self._device_or_scan_command(url.path, payload, connect_deadline, tilt_deadline)
             else:
                 with operation_lock:
                     response = self._device_or_scan_command(url.path, payload, connect_deadline, tilt_deadline)
@@ -771,6 +866,23 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scan/merge":
             response = _runner().merge(payload.get("passIds", []),
                                        remove_floor=bool(payload.get("removeFloor", False)))
+        elif path == "/api/stereo/cameras/scan":
+            response = _stereo().start_camera_scan(
+                max_index=_int_param(payload, "maxIndex", 6, 1, 32),
+                width=_int_param(payload, "width", 640, 160, 4096),
+                height=_int_param(payload, "height", 480, 120, 2160),
+            )
+        elif path == "/api/stereo/cameras/scan/cancel":
+            response = _stereo().cancel_camera_scan()
+        elif path == "/api/stereo/cameras/probe":
+            index = payload.get("index")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ValueError("Индекс USB-камеры должен быть целым числом 0–31.")
+            response = _stereo().probe_camera_index(
+                index,
+                width=_int_param(payload, "width", 640, 160, 4096),
+                height=_int_param(payload, "height", 480, 120, 2160),
+            )
         elif path == "/api/stereo/start":
             response = _stereo().start_session(payload)
         elif path == "/api/stereo/stop":
@@ -807,17 +919,30 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError("Некорректный JSON в запросе.") from exc
 
-    def respond(self, status, data):
+    def respond(self, status, data, *, compress=False):
         body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        encoding = ""
+        if compress and len(body) > GZIP_MIN_BYTES and self._accepts_gzip():
+            # gzip из стандартной библиотеки: новой зависимости нет. Base64 JPEG
+            # почти не сжимается, а карта глубины uint16 сжимается в 2–3 раза.
+            body = gzip.compress(body, 5)
+            encoding = "gzip"
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+                self.send_header("Vary", "Accept-Encoding")
             self.end_headers()
             self.wfile.write(body)
         except ConnectionError:
             pass  # client timed out or closed the window
+
+    def _accepts_gzip(self):
+        header = (self.headers.get("Accept-Encoding") or "").lower()
+        return "gzip" in header
 
     def log_message(self, fmt, *args):
         # The single-frame view can be polled several times per second. Avoid

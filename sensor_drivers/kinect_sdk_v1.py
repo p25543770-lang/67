@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from typing import Any
 
 from .base import ColorFrame, SensorAdapter, SensorFrame, requirement
@@ -364,6 +365,23 @@ class _SdkSession:
         finally:
             _dispose(frame)
 
+    def drain_color(self) -> int:
+        """Выбросить устаревшие RGB-кадры, оставив самый свежий в SDK.
+
+        ``OpenNextFrame(0)`` забирает самый старый кадр из очереди SDK. Читатель,
+        который на 400 мс отвлёкся, потом получает старые кадры пачкой. Здесь
+        очередь опустошается до последнего кадра *без копирования пикселей*:
+        старые кадры только освобождаются. Возвращает число выброшенных кадров,
+        чтобы пропуски были видны в счётчиках, а не исчезали молча.
+        """
+        dropped = 0
+        while True:
+            frame = self.sensor.ColorStream.OpenNextFrame(0)
+            if frame is None:
+                return dropped
+            _dispose(frame)
+            dropped += 1
+
     def close(self) -> None:
         """Stop the sensor and release every handle, ignoring individual failures."""
         if self.closed:
@@ -434,6 +452,24 @@ class KinectSdkV1Adapter(SensorAdapter):
         self._sleep = sleep
         self._wall_clock = wall_clock
         self._lock = threading.RLock()
+        # Открытие устройства сериализуется отдельно: подсчёт ссылок на
+        # «нативное использование» не даёт закрыть сенсор под работающим
+        # чтением кадра.
+        self._open_lock = threading.Lock()
+        self._native_condition = threading.Condition()
+        self._native_use = 0
+        self._close_pending: _SdkSession | None = None
+        self._tilt_lock = threading.Lock()
+        self._tilt_cache: dict[str, Any] | None = None
+        self._tilt_cache_at: float | None = None
+        self._tilt_cache_error = ""
+        self._tilt_poll_stop: threading.Event | None = None
+        self._tilt_poll_thread: threading.Thread | None = None
+        self.tilt_poll_interval_s = 1.0
+        # Честный счётчик выброшенных из очереди SDK кадров (не сглаживание).
+        self.color_queue_dropped = 0
+        self.capture_calls = 0
+        self._close_epoch = 0
         self._session: _SdkSession | None = None
         self._last_capture: float | None = None
         self._last_color_warning = ""
@@ -598,11 +634,128 @@ class KinectSdkV1Adapter(SensorAdapter):
         return session
 
     def _session_for_capture(self) -> _SdkSession:
-        with self._lock:
-            if self._session is None or self._session.closed:
-                self._session = self._open_session()
+        """Получить открытую сессию, не удерживая общий лок на время чтения.
+
+        В CPython чтение ссылки и булева атрибута атомарно, поэтому горячий путь
+        (кадр за кадром) обходится без блокировки. Открытие устройства
+        сериализуется ``_open_lock``: два потока не откроют сенсор дважды.
+        """
+        session = self._session
+        if session is not None and not session.closed:
+            return session
+        with self._open_lock:
+            session = self._session
+            if session is not None and not session.closed:
+                return session
+            with self._lock:
+                self._session = None
                 self._last_capture = None
-            return self._session
+                epoch = self._close_epoch
+            session = self._open_session()
+            with self._lock:
+                if epoch != self._close_epoch:
+                    # Сенсор закрыли, пока он открывался: только что полученный
+                    # дескриптор нельзя оставлять висеть.
+                    session.close()
+                    raise KinectSdkUnavailable(
+                        "closed_during_open",
+                        "Kinect был закрыт во время открытия.",
+                        "Подключите датчик снова.",
+                    )
+                self._session = session
+                self._last_capture = None
+                self._start_tilt_poller_locked(session)
+            return session
+
+    @contextmanager
+    def _native_session(self):
+        """Сессия на время .NET-вызова; ``close()`` ждёт окончания вызова."""
+        session = self._session_for_capture()
+        with self._native_condition:
+            self._native_use += 1
+        try:
+            yield session
+        finally:
+            pending: _SdkSession | None = None
+            with self._native_condition:
+                self._native_use -= 1
+                if self._native_use <= 0 and self._close_pending is not None:
+                    pending, self._close_pending = self._close_pending, None
+                self._native_condition.notify_all()
+            if pending is not None:
+                pending.close()
+
+    # ------------------------------------------------------------ угол мотора
+    def _start_tilt_poller_locked(self, session: _SdkSession) -> None:
+        """Фоновое чтение угла не чаще ``tilt_poll_interval_s``.
+
+        .NET-вызов ``ElevationAngle`` может блокироваться, поэтому он не должен
+        выполняться в потоке захвата кадров. Здесь он живёт в отдельном потоке и
+        только обновляет кэш; кадровый цикл читает последнее значение.
+        """
+        self._tilt_poll_stop = threading.Event()
+        stop = self._tilt_poll_stop
+        thread = threading.Thread(target=self._tilt_poll_loop, args=(session, stop), daemon=True,
+                                  name="kinect-tilt-poll")
+        self._tilt_poll_thread = thread
+        thread.start()
+
+    def _stop_tilt_poller_locked(self) -> None:
+        stop, self._tilt_poll_stop = self._tilt_poll_stop, None
+        self._tilt_poll_thread = None
+        if stop is not None:
+            stop.set()
+
+    def _tilt_poll_loop(self, session: _SdkSession, stop: threading.Event) -> None:
+        while not stop.wait(self.tilt_poll_interval_s):
+            if session.closed or self._session is not session:
+                return
+            self._refresh_tilt_cache(session)
+
+    def _refresh_tilt_cache(self, session: _SdkSession) -> None:
+        try:
+            with self._tilt_lock:
+                status = self._tilt_status_locked(session.sensor)
+        except Exception as exc:  # noqa: BLE001 - кэш угла не должен ронять сессию
+            self._tilt_cache_error = str(exc)
+            return
+        self._tilt_cache = status
+        self._tilt_cache_at = self._clock()
+        self._tilt_cache_error = ""
+
+    def tilt_angle_cached(self) -> dict[str, Any]:
+        """Последний прочитанный угол и его возраст. Устройство не открывается."""
+        now = self._clock()
+        angle = None
+        cache = self._tilt_cache
+        if cache is not None and isinstance(cache.get("angle"), int):
+            angle = int(cache["angle"])
+        return {
+            "angle": angle,
+            "ageMs": None if self._tilt_cache_at is None else max(0.0, now - self._tilt_cache_at) * 1000.0,
+            "error": self._tilt_cache_error,
+            "pollIntervalMs": self.tilt_poll_interval_s * 1000.0,
+        }
+
+    def tilt_angle_fresh(self) -> int | None:
+        """Прямое чтение угла из SDK для калибровки (не кэш).
+
+        Калибровка привязывается к положению мотора, поэтому здесь нельзя
+        подставлять значение, прочитанное секунду назад: читаем .NET напрямую.
+        Блокировка только ``_tilt_lock`` — захват кадров ею не пользуется.
+        """
+        session = self._session
+        if session is None or session.closed:
+            return None
+        try:
+            with self._tilt_lock:
+                status = self._tilt_status_locked(session.sensor)
+        except Exception:  # noqa: BLE001 - вызывающий сам решает, что делать
+            return None
+        self._tilt_cache = status
+        self._tilt_cache_at = self._clock()
+        angle = status.get("angle")
+        return int(angle) if isinstance(angle, int) and not isinstance(angle, bool) else None
 
     def _throttle(self) -> None:
         # The 30-FPS SDK stream already blocks until a new depth frame exists.
@@ -642,7 +795,7 @@ class KinectSdkV1Adapter(SensorAdapter):
 
     def tilt_scan_wait(self):
         """Minimum pause after a command; not proof that the motor has stopped."""
-        with self._lock:
+        with self._tilt_lock:
             return self._tilt_timing_locked(self._clock())[1]
 
     def _tilt_status_locked(self, sensor, *, allow_read_error=False):
@@ -666,13 +819,15 @@ class KinectSdkV1Adapter(SensorAdapter):
                 "verifiedOnHardware": False}
 
     def tilt_status(self):
-        with self._lock:
+        # _tilt_lock, а не _lock: чтение угла (.NET) не должно сериализоваться с
+        # захватом кадров; достаточно не пересекаться с другой командой мотору.
+        with self._tilt_lock:
             return self._tilt_status_locked(self._tilt_session_locked().sensor)
 
     def set_tilt(self, angle, *, deadline=None):
         if isinstance(angle, bool) or not isinstance(angle, int) or not TILT_MIN_DEG <= angle <= TILT_MAX_DEG:
             raise ValueError("Угол должен быть целым числом от −27° до +27°.")
-        with self._lock:
+        with self._tilt_lock:
             sensor = self._tilt_session_locked().sensor
             status = self._tilt_status_locked(sensor)
             if not status["minAngle"] <= angle <= status["maxAngle"]:
@@ -709,11 +864,26 @@ class KinectSdkV1Adapter(SensorAdapter):
                     "commandSent": True, "targetAngle": angle}
 
     def close(self) -> None:
+        """Закрыть сенсор, не обрывая уже начатый .NET-вызов.
+
+        Если захват кадра прямо сейчас выполняется в другом потоке, сенсор
+        закрывается им же сразу после вызова: иначе ``Dispose()`` под работающим
+        ``OpenNextFrame`` — это гонка на нативных дескрипторах.
+        """
         with self._lock:
             session, self._session = self._session, None
+            self._close_epoch += 1
+            self._stop_tilt_poller_locked()
+            self._tilt_cache = None
+            self._tilt_cache_at = None
+            self._last_color_warning = ""
+        with self._native_condition:
+            if session is not None and self._native_use > 0:
+                self._close_pending = session
+                session = None
+            self._native_condition.notify_all()
         if session is not None:
             session.close()
-        self._last_color_warning = ""
 
     def __enter__(self) -> "KinectSdkV1Adapter":
         return self
@@ -743,9 +913,8 @@ class KinectSdkV1Adapter(SensorAdapter):
         only reads a colour frame. The software timestamps are taken immediately
         after ``OpenNextFrame`` returns and are not physical exposure timestamps.
         """
-        with self._lock:
-            try:
-                session = self._session_for_capture()
+        try:
+            with self._native_session() as session:
                 self._throttle()
                 color = session.grab_color(self.frame_timeout)
                 captured_at = self._clock()
@@ -757,6 +926,11 @@ class KinectSdkV1Adapter(SensorAdapter):
                         "Проверьте USB и питание, закройте другие Kinect-приложения и повторите.",
                     )
                 width, height, color_bytes, frame_number = color
+                # Очередь SDK: после паузы в чтении копятся старые кадры. Забираем
+                # только самый свежий, а число выброшенных показываем в счётчике.
+                dropped = session.drain_color()
+                if dropped:
+                    self.color_queue_dropped += dropped
                 rgb = color_bytes_to_rgb(color_bytes, width, height)
                 if rgb is None:
                     raise KinectSdkUnavailable(
@@ -764,14 +938,16 @@ class KinectSdkV1Adapter(SensorAdapter):
                         "Kinect вернул RGB-кадр неизвестного формата.",
                         "Проверьте подключение датчика и повторите.",
                     )
-                return ColorFrame(rgb, captured_at, captured_at_epoch, frame_number)
-            except KinectSdkUnavailable as exc:
-                if exc.code != "color_timeout":
-                    self.close()
-                raise
-            except Exception as exc:  # noqa: BLE001
+                self.capture_calls += 1
+                return ColorFrame(rgb, captured_at, captured_at_epoch, frame_number,
+                                  queue_dropped=dropped)
+        except KinectSdkUnavailable as exc:
+            if exc.code != "color_timeout":
                 self.close()
-                raise RuntimeError(f"Не удалось прочитать RGB Kinect: {exc}") from exc
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.close()
+            raise RuntimeError(f"Не удалось прочитать RGB Kinect: {exc}") from exc
 
     def identity(self) -> dict[str, Any]:
         """Identity of the currently open sensor, without opening it implicitly."""
@@ -787,55 +963,21 @@ class KinectSdkV1Adapter(SensorAdapter):
             return {"source": "kinect_v1_sdk", "uniqueId": unique, "open": True}
 
     def tilt_angle(self) -> int | None:
-        """Current SDK elevation, or None. Never opens a device."""
-        try:
-            status = self.tilt_status()
-            angle = status.get("angle")
-            return int(angle) if isinstance(angle, int) and not isinstance(angle, bool) else None
-        except Exception:  # noqa: BLE001 - вызывающий сам решает, что делать
-            return None
+        """Последний угол из кэша (не чаще 1 Гц). Устройство не открывается.
+
+        Раньше это был прямой .NET-вызов под тем же локом, что и захват кадра:
+        монитор стереорежима раз в секунду останавливал кадровый поток. Для
+        калибровки, где нужен именно текущий угол, есть :meth:`tilt_angle_fresh`.
+        """
+        cached = self.tilt_angle_cached()["angle"]
+        if cached is not None:
+            return cached
+        return self.tilt_angle_fresh()
 
     def _capture(self, *, include_points: bool) -> SensorFrame:
         try:
-            session = self._session_for_capture()
-            self._throttle()
-            depth = session.grab_depth(self.frame_timeout)
-            if depth is None:
-                raise KinectSdkUnavailable(
-                    "frame_timeout",
-                    "Kinect не вернул кадр глубины за отведённое время.",
-                    "Проверьте питание и USB, закройте другие Kinect-приложения и повторите.",
-                )
-            width, height, depth_bytes, frame_number = depth
-            # Measure the depth instant, not the later RGB wait/conversion time.
-            captured_at = self._clock()
-            color = None
-            color_warning = ""
-            try:
-                color = session.grab_color(self.color_timeout)
-                if color is None:
-                    color_warning = "Kinect не вернул RGB-кадр. Проверьте USB и закройте другие приложения Kinect; глубина доступна, но цвет может отсутствовать."
-            except Exception as exc:  # noqa: BLE001 - глубина остаётся полезной без RGB
-                color_warning = f"Не удалось прочитать RGB-кадр Kinect: {exc}. Проверьте USB и SDK; глубина доступна, но цвет может отсутствовать."
-            if color_warning != self._last_color_warning:
-                if color_warning:
-                    print(f"[Depth Studio] {color_warning}", flush=True)
-                elif self._last_color_warning:
-                    print("[Depth Studio] RGB-поток Kinect восстановлен.", flush=True)
-                self._last_color_warning = color_warning
-            frame = depth_and_color_to_frame(
-                depth_bytes,
-                width,
-                height,
-                color[2] if color else None,
-                color[0] if color else None,
-                color[1] if color else None,
-                captured_at=captured_at,
-                include_points=include_points,
-            )
-            frame.warning = color_warning
-            frame.sequence_number = frame_number
-            return frame
+            with self._native_session() as session:
+                return self._capture_with_session(session, include_points=include_points)
         except KinectSdkUnavailable as exc:
             # Таймаут кадра не повод переоткрывать сенсор: следующая попытка может удаться.
             if exc.code != "frame_timeout":
@@ -848,6 +990,45 @@ class KinectSdkV1Adapter(SensorAdapter):
             self.close()
             raise RuntimeError(f"Не удалось прочитать Kinect через SDK 1.8: {exc}") from exc
 
+    def _capture_with_session(self, session: "_SdkSession", *, include_points: bool) -> SensorFrame:
+        self._throttle()
+        depth = session.grab_depth(self.frame_timeout)
+        if depth is None:
+            raise KinectSdkUnavailable(
+                "frame_timeout",
+                "Kinect не вернул кадр глубины за отведённое время.",
+                "Проверьте питание и USB, закройте другие Kinect-приложения и повторите.",
+            )
+        width, height, depth_bytes, frame_number = depth
+        # Measure the depth instant, not the later RGB wait/conversion time.
+        captured_at = self._clock()
+        color = None
+        color_warning = ""
+        try:
+            color = session.grab_color(self.color_timeout)
+            if color is None:
+                color_warning = "Kinect не вернул RGB-кадр. Проверьте USB и закройте другие приложения Kinect; глубина доступна, но цвет может отсутствовать."
+        except Exception as exc:  # noqa: BLE001 - глубина остаётся полезной без RGB
+            color_warning = f"Не удалось прочитать RGB-кадр Kinect: {exc}. Проверьте USB и SDK; глубина доступна, но цвет может отсутствовать."
+        if color_warning != self._last_color_warning:
+            if color_warning:
+                print(f"[Depth Studio] {color_warning}", flush=True)
+            elif self._last_color_warning:
+                print("[Depth Studio] RGB-поток Kinect восстановлен.", flush=True)
+            self._last_color_warning = color_warning
+        frame = depth_and_color_to_frame(
+            depth_bytes,
+            width,
+            height,
+            color[2] if color else None,
+            color[0] if color else None,
+            color[1] if color else None,
+            captured_at=captured_at,
+            include_points=include_points,
+        )
+        frame.warning = color_warning
+        frame.sequence_number = frame_number
+        return frame
 
 def create_adapter() -> KinectSdkV1Adapter:
     return KinectSdkV1Adapter()
