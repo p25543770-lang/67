@@ -239,6 +239,11 @@ jobs:
             'resources\scan_pipeline\process_engine.py',
             'resources\scan_pipeline\frame_validation.py',
             'resources\scan_pipeline\front_view.py',
+            'resources\scan_pipeline\stereo_calibration.py',
+            'resources\scan_pipeline\stereo_depth.py',
+            'resources\scan_pipeline\stereo_service.py',
+            'resources\scan_pipeline\stereo_timing.py',
+            'resources\sensor_drivers\usb_camera.py',
             'resources\scan_pipeline\landmarks.py',
             'resources\scan_pipeline\runtime.py',
             'resources\scripts\benchmark-synthetic-fps.py',
@@ -357,6 +362,9 @@ jobs:
           if (-not $data.environment.packages.open3d.available) { $failures += "Open3D недоступен: $($data.environment.packages.open3d.error)" }
           # pythonnet — мост к .NET для адаптера Kinect 360 через Microsoft Kinect SDK.
           if (-not $data.environment.packages.pythonnet.available) { $failures += "pythonnet недоступен: $($data.environment.packages.pythonnet.error)" }
+          # OpenCV нужен только стереорежиму (Kinect RGB + USB-камера). Проверяем,
+          # что колесо действительно установилось и cv2 импортируется.
+          if (-not $data.environment.packages.cv2.available) { $failures += "OpenCV (cv2) недоступен: $($data.environment.packages.cv2.error)" }
           if (-not $data.bridge.environment.isolated) { $failures += 'мост запущен не из среды Depth Studio' }
           if ($data.setup.cached) { $failures += 'первый запуск не должен считаться кэшированным' }
           if ($data.systemPathPython.Count -gt 0) { $failures += "в PATH приложения остались каталоги Python: $($data.systemPathPython -join ', ')" }
