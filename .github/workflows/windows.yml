@@ -40,7 +40,10 @@ jobs:
       - name: Install test and lock validator dependencies
         # NumPy нужен тестам адаптера Kinect SDK: они проверяют реальное
         # преобразование кадра глубины и облака точек, без железа и SDK.
-        run: python -m pip install --quiet packaging numpy
+        # OpenCV (закреплённая версия) нужен стереотестам: калибровка,
+        # ректификация и SGBM проверяются на синтетической паре кадров.
+        # Если cv2 не импортируется, эти тесты помечаются пропущенными.
+        run: python -m pip install --quiet packaging numpy opencv-python==4.11.0.86
       - name: Windows dependency lock is complete and installable
         run: npm run check:python-lock
       - name: Python bridge tests
@@ -121,7 +124,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
-      - run: python -m pip install --quiet packaging numpy
+      - run: python -m pip install --quiet packaging numpy opencv-python==4.11.0.86
       - run: npm run check:python-lock
       - name: Python bridge tests on Windows
         shell: pwsh

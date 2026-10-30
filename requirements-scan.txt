@@ -9,6 +9,11 @@
 #   python -m pip install --only-binary=:all: --require-hashes -r requirements-scan.lock.txt
 numpy==1.26.4
 open3d==0.18.0
+# OpenCV нужен только для стереорежима: захват UVC-камеры (Logitech C930e),
+# поиск шахматной доски, ректификация и StereoSGBM. Обычные режимы Kinect
+# работают без него; отсутствие cv2 — предупреждение, а не отказ запуска.
+# 4.11.0.86 — последняя ветка, совместимая с numpy==1.26.4 (4.12 требует numpy>=2).
+opencv-python==4.11.0.86
 # pythonnet bridges Python to .NET, so the Kinect 360 adapter can use the
 # officially installed Microsoft Kinect SDK 1.8 without replacing the Kinect USB
 # driver. Pure-Python wheel; brings clr-loader, cffi and pycparser (pinned in the

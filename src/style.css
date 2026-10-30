@@ -2031,3 +2031,42 @@ input[type="range"] {
 .tilt-controls input[type="range"] { flex: 1 1 120px; accent-color: #317353; min-width: 110px; }
 .tilt-controls button { font-size: 10px; padding: 7px 10px; }
 .tilt-note { color: #6c786b; font-size: 10px; line-height: 1.45; margin: 6px 0 0; }
+
+/* Стереорежим: Kinect RGB + USB-камера. Панель повторяет оформление блока
+   наклона, но показывает две камеры и карту глубины рядом. */
+.stereo-panel { padding: 13px 18px 16px; border-bottom: 1px solid #dce8de; background: #f5faf6; }
+.stereo-panel[hidden] { display: none; }
+.stereo-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin: 12px 0 10px; }
+.stereo-controls label { display: flex; flex-direction: column; gap: 4px; color: #3f5b4b; font-size: 10px; }
+.stereo-controls select { min-width: 150px; padding: 6px 8px; border: 1px solid #cfdcd2; border-radius: 7px; background: #fff; color: #274b3a; font-size: 11px; }
+.stereo-controls button { font-size: 10px; padding: 7px 10px; }
+.stereo-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 10px 0; }
+.stereo-cell { min-width: 0; }
+.stereo-canvas-wrap { position: relative; border: 1px solid #d5e2d8; border-radius: 8px; background: #0f1a14; overflow: hidden; }
+.stereo-canvas-wrap canvas { display: block; width: 100%; height: auto; aspect-ratio: 4 / 3; cursor: crosshair; }
+.stereo-canvas-label { position: absolute; left: 8px; bottom: 6px; color: #d9ece0; font-size: 9px; letter-spacing: .04em; text-shadow: 0 1px 2px rgba(0, 0, 0, .6); }
+.stereo-diagnostics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 10px 0 4px; border-top: 1px dashed #d8e4da; }
+.stereo-diag-column h4 { margin: 0 0 6px; color: #274b3a; font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
+.stereo-diag-column dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; margin: 0; font-size: 10px; }
+.stereo-diag-column dt { color: #6c786b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stereo-diag-column dd { margin: 0; color: #274b3a; text-align: right; font-variant-numeric: tabular-nums; }
+.stereo-calibration { margin-top: 10px; padding-top: 10px; border-top: 1px dashed #d8e4da; }
+.stereo-calibration-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.stereo-calibration-head h4 { margin: 0; color: #274b3a; font-size: 11px; }
+.stereo-state { font-size: 10px; font-weight: 700; color: #6c786b; }
+.stereo-state[data-tone="ok"] { color: #2f7a4f; }
+.stereo-state[data-tone="warn"] { color: #8c6b35; }
+.stereo-state[data-tone="bad"] { color: #a33f39; }
+.stereo-steps { margin: 8px 0; padding-left: 18px; color: #4d5f52; font-size: 10px; line-height: 1.5; }
+.stereo-board { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.stereo-board label { display: flex; flex-direction: column; gap: 3px; color: #3f5b4b; font-size: 10px; }
+.stereo-board input, .stereo-board select { width: 84px; padding: 5px 6px; border: 1px solid #cfdcd2; border-radius: 6px; background: #fff; color: #274b3a; font-size: 11px; }
+.stereo-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.stereo-buttons button { font-size: 10px; padding: 7px 10px; }
+.stereo-note { color: #6c786b; font-size: 10px; line-height: 1.45; margin: 6px 0 0; }
+.stereo-reasons { margin: 6px 0; padding-left: 18px; color: #8c4a35; font-size: 10px; line-height: 1.45; }
+.stereo-reasons:empty { display: none; }
+.stereo-warnings { margin: 10px 0 0; padding-left: 18px; color: #718779; font-size: 9.5px; line-height: 1.5; }
+@media (max-width: 900px) {
+  .stereo-grid, .stereo-diagnostics { grid-template-columns: minmax(0, 1fr); }
+}

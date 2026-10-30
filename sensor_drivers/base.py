@@ -6,6 +6,22 @@ from typing import Any
 
 
 @dataclass
+class ColorFrame:
+    """RGB-only frame used by the stereo pipeline.
+
+    This is deliberately not a :class:`SensorFrame`: no depth is captured or
+    implied. ``captured_at_point`` and ``captured_at_epoch`` are software times
+    taken after the driver returned the frame. They are NOT exposure times.
+    """
+
+    color_rgb: Any
+    captured_at_point: float
+    captured_at_epoch: float
+    sequence_number: int | None = None
+    warning: str = ""
+
+
+@dataclass
 class SensorFrame:
     """One sensor capture container in camera coordinates.
 
