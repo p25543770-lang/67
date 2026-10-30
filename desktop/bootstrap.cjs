@@ -66,7 +66,7 @@ const STEP_DEFINITIONS = [
   },
   {
     id: "packages",
-    title: "NumPy и Open3D",
+    title: "NumPy, Open3D и OpenCV",
     detail: "Закреплённые версии из python-lock.json",
   },
   {
@@ -90,7 +90,7 @@ const PYTHON_PROBE_SCRIPT = [
   "  'machine': platform.machine(),",
   "  'packages': {},",
   "}",
-  "for name in ('numpy', 'open3d', 'pythonnet', 'freenect'):",
+  "for name in ('numpy', 'open3d', 'pythonnet', 'freenect', 'cv2'):",
   "  entry = {'available': False, 'version': None, 'error': None}",
   "  try:",
   "    module = __import__(name)",
@@ -1324,6 +1324,19 @@ async function runSetup(rawOptions = {}) {
       });
       logger.warn(`Open3D недоступен: ${probeData.packages.open3d.error}`);
     }
+    if (!probeData.packages?.cv2?.available) {
+      // OpenCV нужен только стереорежиму. Остальные режимы и деморежим
+      // работают без него, поэтому здесь предупреждение, а не отказ установки.
+      warnings.push({
+        code: "opencv_unavailable",
+        message:
+          "OpenCV не импортируется: стереорежим (Kinect RGB + USB-камера) недоступен, остальные режимы работают.",
+        hint:
+          "OpenCV входит в установщик Depth Studio. Нажмите «Восстановить среду», чтобы переустановить пакеты; " +
+          "если пакет установлен, но не загружается, проверьте Microsoft Visual C++ 2015–2022 Redistributable (x64).",
+      });
+      logger.warn(`OpenCV недоступен: ${probeData.packages?.cv2?.error || "нет данных"}`);
+    }
     const packagesState = {};
     for (const [name, entry] of Object.entries(probeData.packages)) {
       packagesState[name] = { available: Boolean(entry.available), version: entry.version || null, error: entry.error || null };
@@ -1347,6 +1360,12 @@ async function runSetup(rawOptions = {}) {
       { id: "numpy", title: "NumPy", available: Boolean(packagesState.numpy?.available), version: packagesState.numpy?.version || null },
       { id: "open3d", title: "Open3D", available: Boolean(packagesState.open3d?.available), version: packagesState.open3d?.version || null },
       {
+        id: "cv2",
+        title: "OpenCV (cv2)",
+        available: Boolean(packagesState.cv2?.available),
+        version: packagesState.cv2?.version || null,
+      },
+      {
         id: "pythonnet",
         title: "pythonnet",
         available: Boolean(packagesState.pythonnet?.available),
@@ -1369,7 +1388,7 @@ async function runSetup(rawOptions = {}) {
     sensorNotes.push(
       missingPython.length
         ? `Компоненты Python: отсутствуют ${missingPython.join(", ")}.`
-        : "Компоненты Python: NumPy, Open3D и pythonnet доступны.",
+        : "Компоненты Python: NumPy, Open3D, OpenCV и pythonnet доступны.",
     );
 
     if (opts.platform === "win32" && !kinectSdk.available) {

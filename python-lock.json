@@ -385,6 +385,16 @@
       "direct": true
     },
     {
+      "name": "opencv-python",
+      "version": "4.11.0.86",
+      "filename": "opencv_python-4.11.0.86-cp37-abi3-win_amd64.whl",
+      "sha256": "085ad9b77c18853ea66283e98affefe2de8cc4c1f43eda4c100cf9b2721142ec",
+      "allowedHashes": [
+        "085ad9b77c18853ea66283e98affefe2de8cc4c1f43eda4c100cf9b2721142ec"
+      ],
+      "direct": true
+    },
+    {
       "name": "packaging",
       "version": "26.3",
       "filename": "packaging-26.3-py3-none-any.whl",
@@ -669,6 +679,7 @@
   "requirements": [
     "numpy==1.26.4",
     "open3d==0.18.0",
+    "opencv-python==4.11.0.86",
     "pythonnet==3.2.1"
   ]
 }

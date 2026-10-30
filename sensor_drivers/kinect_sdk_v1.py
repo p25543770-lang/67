@@ -35,7 +35,7 @@ import time
 from collections import deque
 from typing import Any
 
-from .base import SensorAdapter, SensorFrame, requirement
+from .base import ColorFrame, SensorAdapter, SensorFrame, requirement
 
 SDK_ASSEMBLY_NAME = "Microsoft.Kinect.dll"
 SDK_RELATIVE_PATH = os.path.join("Microsoft SDKs", "Kinect", "v1.8", "Assemblies", SDK_ASSEMBLY_NAME)
@@ -190,6 +190,18 @@ def depth_pixels_to_metres(raw: Any) -> Any:
     return millimetres / 1000.0
 
 
+def color_bytes_to_rgb(color_bytes: bytes, color_width: int, color_height: int) -> Any:
+    """Convert SDK BGRA bytes to an RGB uint8 array without touching depth."""
+    import numpy as np
+
+    cw = int(color_width or DEFAULT_WIDTH)
+    ch = int(color_height or DEFAULT_HEIGHT)
+    if not color_bytes or len(color_bytes) < cw * ch * 4:
+        return None
+    bgra = np.frombuffer(color_bytes, dtype=np.uint8, count=cw * ch * 4).reshape(ch, cw, 4)
+    return np.ascontiguousarray(bgra[:, :, 2::-1])
+
+
 def depth_and_color_to_frame(
     depth_raw: Any,
     width: int,
@@ -223,14 +235,7 @@ def depth_and_color_to_frame(
     # these or other undocumented >4 m SDK values into fabricated points.
     depth_mm[depth_mm > int(MAX_DEPTH_M * 1000)] = 0
 
-    color_rgb = None
-    if color_bytes:
-        cw = int(color_width or DEFAULT_WIDTH)
-        ch = int(color_height or DEFAULT_HEIGHT)
-        if len(color_bytes) >= cw * ch * 4:
-            bgra = np.frombuffer(color_bytes, dtype=np.uint8, count=cw * ch * 4).reshape(ch, cw, 4)
-            # ColorImageFrame даёт BGRA; приложению нужен RGB.
-            color_rgb = np.ascontiguousarray(bgra[:, :, 2::-1])
+    color_rgb = color_bytes_to_rgb(color_bytes, color_width, color_height) if color_bytes else None
 
     points = None
     if include_points:
@@ -347,13 +352,15 @@ class _SdkSession:
         finally:
             _dispose(frame)
 
-    def grab_color(self, timeout: float) -> tuple[int, int, bytes] | None:
+    def grab_color(self, timeout: float) -> tuple[int, int, bytes, int | None] | None:
         frame = self._read_frame(self.sensor.ColorStream, timeout)
         if frame is None:
             return None
         try:
             width, height = self._frame_size(frame, DEFAULT_WIDTH, DEFAULT_HEIGHT)
-            return width, height, self._copy_pixels(frame, 1, width * height * 4)
+            number = getattr(frame, "FrameNumber", None)
+            number = int(number) if number is not None else None
+            return width, height, self._copy_pixels(frame, 1, width * height * 4), number
         finally:
             _dispose(frame)
 
@@ -417,6 +424,7 @@ class KinectSdkV1Adapter(SensorAdapter):
         env: dict[str, str] | None = None,
         clock=time.monotonic,
         sleep=time.sleep,
+        wall_clock=time.time,
     ) -> None:
         self.max_fps = max(1.0, float(max_fps))
         self.frame_timeout = max(0.05, float(frame_timeout))
@@ -424,6 +432,7 @@ class KinectSdkV1Adapter(SensorAdapter):
         self._env = env
         self._clock = clock
         self._sleep = sleep
+        self._wall_clock = wall_clock
         self._lock = threading.RLock()
         self._session: _SdkSession | None = None
         self._last_capture: float | None = None
@@ -726,6 +735,65 @@ class KinectSdkV1Adapter(SensorAdapter):
         # preview cloud for every captured frame wastes time, especially when a
         # later frame replaces it in the mailbox.
         return self._capture(include_points=False)
+
+    def capture_color_only(self) -> ColorFrame:
+        """RGB-only capture for the stereo pipeline; never returns depth.
+
+        The Kinect SDK session may keep the depth stream enabled, but this method
+        only reads a colour frame. The software timestamps are taken immediately
+        after ``OpenNextFrame`` returns and are not physical exposure timestamps.
+        """
+        with self._lock:
+            try:
+                session = self._session_for_capture()
+                self._throttle()
+                color = session.grab_color(self.frame_timeout)
+                captured_at = self._clock()
+                captured_at_epoch = self._wall_clock()
+                if color is None:
+                    raise KinectSdkUnavailable(
+                        "color_timeout",
+                        "Kinect не вернул RGB-кадр за отведённое время.",
+                        "Проверьте USB и питание, закройте другие Kinect-приложения и повторите.",
+                    )
+                width, height, color_bytes, frame_number = color
+                rgb = color_bytes_to_rgb(color_bytes, width, height)
+                if rgb is None:
+                    raise KinectSdkUnavailable(
+                        "color_invalid",
+                        "Kinect вернул RGB-кадр неизвестного формата.",
+                        "Проверьте подключение датчика и повторите.",
+                    )
+                return ColorFrame(rgb, captured_at, captured_at_epoch, frame_number)
+            except KinectSdkUnavailable as exc:
+                if exc.code != "color_timeout":
+                    self.close()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.close()
+                raise RuntimeError(f"Не удалось прочитать RGB Kinect: {exc}") from exc
+
+    def identity(self) -> dict[str, Any]:
+        """Identity of the currently open sensor, without opening it implicitly."""
+        with self._lock:
+            session = self._session
+            if session is None or session.closed:
+                return {"source": "kinect_v1_sdk", "uniqueId": None, "open": False}
+            try:
+                unique = getattr(session.sensor, "UniqueKinectId", None)
+                unique = str(unique) if unique else None
+            except Exception:  # noqa: BLE001
+                unique = None
+            return {"source": "kinect_v1_sdk", "uniqueId": unique, "open": True}
+
+    def tilt_angle(self) -> int | None:
+        """Current SDK elevation, or None. Never opens a device."""
+        try:
+            status = self.tilt_status()
+            angle = status.get("angle")
+            return int(angle) if isinstance(angle, int) and not isinstance(angle, bool) else None
+        except Exception:  # noqa: BLE001 - вызывающий сам решает, что делать
+            return None
 
     def _capture(self, *, include_points: bool) -> SensorFrame:
         try:

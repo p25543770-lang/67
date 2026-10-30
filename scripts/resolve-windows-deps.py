@@ -217,7 +217,7 @@ def resolve(pinned: dict[str, str]) -> dict[str, str]:
     return chosen
 
 
-DIRECT_REQUIREMENTS = ("numpy", "open3d", "pythonnet")
+DIRECT_REQUIREMENTS = ("numpy", "open3d", "opencv-python", "pythonnet")
 
 
 def build_lock(chosen: dict[str, str], wheels: dict[str, dict], previous: dict) -> dict:

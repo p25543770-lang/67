@@ -39,6 +39,12 @@ STATE_FILE = os.environ.get("DEPTH_STUDIO_STATE", "")
 REQUIRE_APP_ENV = os.environ.get("DEPTH_STUDIO_REQUIRE_APP_ENV") == "1"
 INSTANCE = os.environ.get("DEPTH_STUDIO_INSTANCE", "")
 SETUP_STEPS = ("prepare", "python", "packages", "verify", "sensors")
+# Ошибки выбора/состояния стереорежима — вина запроса, а не сбоя среды.
+STEREO_REQUEST_ERROR_CODES = {
+    "invalid_request", "invalid_camera", "invalid_cameras", "invalid_points", "invalid_depth",
+    "duplicate_camera", "session_active", "calibrating", "few_views", "no_pair", "pair_skew",
+    "board_changed", "too_many_views", "no_pending_view", "no_session", "invalid_board",
+}
 
 # All commands that change the device/scan are serialized. The capture lock is
 # shared with ScanRunner and protects the device against concurrent frame reads.
@@ -49,11 +55,12 @@ probe_results = {}
 connected_source = None
 scan_runner = None
 scan_start_pending = None
+stereo_service = None
 
 
 def _optional_modules():
     result = {}
-    for module in ("numpy", "open3d", "freenect", "clr"):
+    for module in ("numpy", "open3d", "freenect", "clr", "cv2"):
         try:
             result[module] = find_spec(module) is not None
         except (ImportError, ValueError):
@@ -69,6 +76,7 @@ def _module_versions():
         ("open3d", "open3d"),
         ("freenect", "freenect"),
         ("pythonnet", "clr"),
+        ("opencv-python", "cv2"),
     ):
         try:
             if find_spec(module) is None:
@@ -117,6 +125,10 @@ def _environment_info():
         warnings.append("setup_state_missing")
     if not packages.get("open3d"):
         warnings.append("open3d_unavailable")
+    if not packages.get("cv2"):
+        # Only the stereo mode needs OpenCV. The rest of the application keeps
+        # working, so this is a warning rather than a fatal setup error.
+        warnings.append("opencv_unavailable")
     return {
         "executable": executable,
         "prefix": prefix,
@@ -326,6 +338,45 @@ def _ensure_no_capture():
                 raise RuntimeError("Сначала завершите или отмените сканирование.")
 
 
+def _stereo_root():
+    return _scan_root().parent / "stereo"
+
+
+def _stereo():
+    """Лениво создать стереосервис: /api/health не должен тянуть OpenCV."""
+    global stereo_service
+    with state_lock:
+        if stereo_service is None:
+            from scan_pipeline.stereo_service import StereoService
+            stereo_service = StereoService(_stereo_root(), capture_lock=capture_lock,
+                                           ensure_no_capture=_ensure_no_capture,
+                                           get_adapter=_adapter_for,
+                                           get_connected_source=lambda: _connected_source())
+        return stereo_service
+
+
+def _connected_source():
+    with state_lock:
+        return connected_source
+
+
+def _stereo_if_any():
+    with state_lock:
+        return stereo_service
+
+
+def _stereo_active():
+    service = _stereo_if_any()
+    return bool(service is not None and service.active())
+
+
+def _ensure_no_stereo(operation):
+    """Не открывать и не закрывать датчик, пока стереорежим его использует."""
+    if _stereo_active():
+        raise RuntimeError(f"{operation}: сначала остановите стереорежим. "
+                           "Он использует Kinect RGB и USB-камеру одновременно с этим действием.")
+
+
 def _devices_response():
     with state_lock:
         probes = dict(probe_results)
@@ -338,6 +389,7 @@ def _probe_devices():
     global connected_source
     detected = []
     found_families = {}
+    _ensure_no_stereo("Обнаружение устройств")
     with capture_lock:
         _ensure_no_capture()
         for sensor_id, adapter in list(ADAPTERS.items()):
@@ -407,6 +459,7 @@ def _deadline_expired(deadline):
 def _connect_device(source_id, deadline=None):
     global connected_source
     adapter = _adapter_for(source_id)
+    _ensure_no_stereo("Подключение источника")
     with capture_lock:
         _ensure_no_capture()
         if _deadline_expired(deadline):
@@ -441,6 +494,7 @@ def _connect_device(source_id, deadline=None):
 
 def _disconnect_device(source_id):
     global connected_source
+    _ensure_no_stereo("Отключение источника")
     with capture_lock:
         _ensure_no_capture()
         with state_lock:
@@ -455,6 +509,7 @@ def _disconnect_device(source_id):
 
 def _capture_connected(source_id, deadline=None, *, include_color=False):
     adapter = _adapter_for(source_id)
+    _ensure_no_stereo("Чтение кадра датчика")
     with capture_lock:
         _ensure_no_capture()
         with state_lock:
@@ -508,7 +563,14 @@ def _set_tilt(payload, deadline=None):
         if _deadline_expired(deadline):
             raise RuntimeError("Запрос наклона устарел; команда мотору не отправлена.")
         adapter = _tilt_adapter(source_id)
-        return {"ok": True, "source": source_id, **adapter.set_tilt(payload.get("angle"), deadline=deadline)}
+        result = {"ok": True, "source": source_id, **adapter.set_tilt(payload.get("angle"), deadline=deadline)}
+        # Мотор Kinect меняет взаимное положение камер стереопары. Даже если
+        # команда не изменила угол, заранее объявленная калибровка становится
+        # недостоверной: проверить это без нового замера нельзя.
+        service = _stereo_if_any()
+        if service is not None:
+            service.on_tilt_command(source_id)
+        return result
 
 
 def _validate_tilt_request(headers):
@@ -631,6 +693,15 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/scan/front":
                 include_color = parse_qs(url.query).get("color", [""])[0] == "1"
                 self.respond(200, _front_snapshot(include_color=include_color))
+            elif url.path == "/api/stereo":
+                query = parse_qs(url.query)
+                include_depth = query.get("depth", [""])[0] != "0"
+                include_preview = query.get("preview", [""])[0] == "1"
+                self.respond(200, _stereo().status(include_depth=include_depth,
+                                                   include_preview=include_preview))
+            elif url.path == "/api/stereo/cameras":
+                with operation_lock:
+                    self.respond(200, _stereo().camera_catalog())
             elif url.path == "/api/scan/passes":
                 self.respond(200, {"passes": _runner().list_passes(), "verifiedOnHardware": False})
             elif url.path == "/api/export":
@@ -672,7 +743,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self.respond(400, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
         except Exception as exc:  # noqa: BLE001
-            self.respond(503, {"error": str(exc), "code": getattr(exc, "code", ""), "hint": getattr(exc, "hint", "")})
+            code = getattr(exc, "code", "")
+            status = 400 if code in STEREO_REQUEST_ERROR_CODES else 503
+            self.respond(status, {"error": str(exc), "code": code, "hint": getattr(exc, "hint", "")})
 
     def _device_or_scan_command(self, path, payload, connect_deadline=None, tilt_deadline=None):
         if path == "/api/devices/probe":
@@ -698,6 +771,24 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scan/merge":
             response = _runner().merge(payload.get("passIds", []),
                                        remove_floor=bool(payload.get("removeFloor", False)))
+        elif path == "/api/stereo/start":
+            response = _stereo().start_session(payload)
+        elif path == "/api/stereo/stop":
+            response = _stereo().stop_session()
+        elif path == "/api/stereo/views":
+            board = payload.get("board")
+            response = _stereo().capture_calibration_view(board if isinstance(board, dict) else None)
+        elif path == "/api/stereo/views/manual":
+            response = _stereo().manual_points(str(payload.get("viewId", "")),
+                                               payload.get("pointsA"), payload.get("pointsB"))
+        elif path == "/api/stereo/views/reset":
+            response = _stereo().reset_views()
+        elif path == "/api/stereo/calibrate":
+            response = _stereo().calibrate()
+        elif path == "/api/stereo/calibration/clear":
+            response = _stereo().clear_calibration()
+        elif path == "/api/stereo/calibration/invalidate":
+            response = _stereo().invalidate(str(payload.get("reason", "user_reported")))
         else:
             return None
         return response
